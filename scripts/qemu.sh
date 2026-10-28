@@ -3,7 +3,8 @@
 #
 #   scripts/qemu.sh <kernel.elf> [opções extras do QEMU]
 #
-# Variáveis: FERRUGEM_DISPLAY=none roda sem janela (só a serial no terminal).
+# Variáveis: FERRUGEM_DISPLAY=none roda sem janela (só a serial no terminal);
+# FERRUGEM_DISCO=arquivo escolhe o disco (padrão: target/disco.img, se existir).
 set -euo pipefail
 
 kernel="$1"
@@ -13,6 +14,13 @@ shift
 # plano com os endereços físicos no próprio cabeçalho.
 out="$(dirname "$kernel")/ferrugem.bin"
 objcopy -O binary "$kernel" "$out"
+
+# O disco ext2 (criado por scripts/disco.sh) vira a raiz do sistema.
+disco="${FERRUGEM_DISCO:-$(dirname "$0")/../target/disco.img}"
+drive=()
+if [[ -f "$disco" ]]; then
+    drive=(-drive "file=$disco,format=raw,if=ide")
+fi
 
 display=()
 if [[ "${FERRUGEM_DISPLAY:-}" == "none" ]]; then
@@ -25,5 +33,6 @@ exec qemu-system-x86_64 \
     -serial stdio \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -no-reboot \
+    "${drive[@]}" \
     "${display[@]}" \
     "$@"

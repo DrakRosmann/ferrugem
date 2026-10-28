@@ -22,6 +22,13 @@ fn main() {
     let mut programs = build_rust_programs(&root);
     programs.extend(build_c_programs(&root, &out));
 
+    // Uma cópia numa pasta fixa, para o scripts/disco.sh pôr no /bin do disco.
+    let installed = root.join("target/programas");
+    fs::create_dir_all(&installed).unwrap();
+    for (name, path) in &programs {
+        fs::copy(path, installed.join(name)).unwrap();
+    }
+
     let mut code = String::from("pub static PROGRAMS: &[(&str, &[u8])] = &[\n");
     for (name, path) in &programs {
         writeln!(code, "    ({name:?}, include_bytes!({:?})),", path.display().to_string()).unwrap();

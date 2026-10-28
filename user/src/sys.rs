@@ -10,6 +10,7 @@ pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_FSTAT: u64 = 5;
+pub const SYS_LSTAT: u64 = 6;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_MUNMAP: u64 = 11;
@@ -31,16 +32,22 @@ pub const SYS_WAIT4: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_FCNTL: u64 = 72;
+pub const SYS_TRUNCATE: u64 = 76;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_MKDIR: u64 = 83;
+pub const SYS_RENAME: u64 = 82;
 pub const SYS_RMDIR: u64 = 84;
+pub const SYS_LINK: u64 = 86;
 pub const SYS_UNLINK: u64 = 87;
+pub const SYS_SYMLINK: u64 = 88;
+pub const SYS_READLINK: u64 = 89;
 pub const SYS_SETPGID: u64 = 109;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_GETPGID: u64 = 121;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
+pub const SYS_UTIMENSAT: u64 = 280;
 
 pub type Errno = i32;
 pub type Result<T> = core::result::Result<T, Errno>;
@@ -49,7 +56,9 @@ pub const ENOENT: Errno = 2;
 pub const EINTR: Errno = 4;
 pub const EBADF: Errno = 9;
 pub const ECHILD: Errno = 10;
+pub const EISDIR: Errno = 21;
 pub const EPIPE: Errno = 32;
+pub const EXDEV: Errno = 18;
 
 /// # Safety
 /// Os argumentos precisam fazer sentido para a syscall `number`.
@@ -106,16 +115,22 @@ pub fn strerror(errno: Errno) -> &'static str {
         12 => "memória insuficiente",
         13 => "permissão negada",
         14 => "endereço inválido",
+        16 => "recurso ocupado",
         17 => "arquivo já existe",
+        18 => "entre sistemas de arquivos diferentes",
         20 => "não é um diretório",
         21 => "é um diretório",
         22 => "argumento inválido",
         24 => "arquivos abertos demais",
         25 => "não é um terminal",
+        27 => "arquivo grande demais",
+        28 => "não há espaço no disco",
         29 => "busca inválida",
+        30 => "sistema de arquivos só de leitura",
         32 => "pipe quebrado",
         38 => "função não implementada",
         39 => "diretório não está vazio",
+        40 => "links simbólicos demais",
         _ => "erro desconhecido",
     }
 }
@@ -186,24 +201,39 @@ pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFIFO: u32 = 0o010000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
 
+#[derive(Default)]
 pub struct Stat {
+    pub dev: u64,
     pub ino: u64,
+    pub nlink: u64,
     pub mode: u32,
     pub size: u64,
+    /// Última modificação, em segundos desde 1970.
+    pub mtime: u64,
 }
 
 impl Stat {
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
     }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
+    }
 }
 
 fn parse_stat(raw: &[u8; 144]) -> Stat {
+    let u64_at = |offset: usize| u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap());
     Stat {
-        ino: u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+        dev: u64_at(0),
+        ino: u64_at(8),
+        nlink: u64_at(16),
         mode: u32::from_le_bytes(raw[24..28].try_into().unwrap()),
-        size: u64::from_le_bytes(raw[48..56].try_into().unwrap()),
+        size: u64_at(48),
+        mtime: u64_at(88),
     }
 }
 
@@ -211,6 +241,14 @@ pub fn stat(path: &str) -> Result<Stat> {
     let path = cstring(path);
     let mut raw = [0u8; 144];
     call(SYS_STAT, [path.as_ptr() as u64, raw.as_mut_ptr() as u64, 0, 0, 0, 0])?;
+    Ok(parse_stat(&raw))
+}
+
+/// Como `stat`, mas sem seguir um link simbólico no fim do caminho.
+pub fn lstat(path: &str) -> Result<Stat> {
+    let path = cstring(path);
+    let mut raw = [0u8; 144];
+    call(SYS_LSTAT, [path.as_ptr() as u64, raw.as_mut_ptr() as u64, 0, 0, 0, 0])?;
     Ok(parse_stat(&raw))
 }
 
@@ -240,6 +278,35 @@ pub fn read_dir(fd: u64) -> Result<Vec<String>> {
     }
 }
 
+/// Copia o conteúdo e as permissões de um arquivo regular para `to`
+/// (criado ou substituído).
+pub fn copy_file(from: &str, to: &str) -> Result<()> {
+    let info = stat(from)?;
+    if info.is_dir() {
+        return Err(EISDIR);
+    }
+    let source = open(from, O_RDONLY, 0)?;
+    let result = open(to, O_WRONLY | O_CREAT | O_TRUNC, info.mode & 0o777).and_then(|target| {
+        let mut buf = [0u8; 4096];
+        let result = loop {
+            let n = read(source, &mut buf);
+            if n < 0 {
+                break Err(-n as Errno);
+            }
+            if n == 0 {
+                break Ok(());
+            }
+            if let Err(errno) = write_all(target, &buf[..n as usize]) {
+                break Err(errno);
+            }
+        };
+        let _ = close(target);
+        result
+    });
+    let _ = close(source);
+    result
+}
+
 pub fn mkdir(path: &str) -> Result<()> {
     let path = cstring(path);
     call(SYS_MKDIR, [path.as_ptr() as u64, 0o755, 0, 0, 0, 0]).map(|_| ())
@@ -253,6 +320,43 @@ pub fn rmdir(path: &str) -> Result<()> {
 pub fn unlink(path: &str) -> Result<()> {
     let path = cstring(path);
     call(SYS_UNLINK, [path.as_ptr() as u64, 0, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Muda o tamanho do arquivo (cortando o fim ou completando com zeros).
+pub fn truncate(path: &str, size: u64) -> Result<()> {
+    let path = cstring(path);
+    call(SYS_TRUNCATE, [path.as_ptr() as u64, size, 0, 0, 0, 0]).map(|_| ())
+}
+
+pub fn rename(old: &str, new: &str) -> Result<()> {
+    let (old, new) = (cstring(old), cstring(new));
+    call(SYS_RENAME, [old.as_ptr() as u64, new.as_ptr() as u64, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Link físico: `new` passa a ser outro nome de `old`.
+pub fn link(old: &str, new: &str) -> Result<()> {
+    let (old, new) = (cstring(old), cstring(new));
+    call(SYS_LINK, [old.as_ptr() as u64, new.as_ptr() as u64, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Link simbólico `path` apontando para `target`.
+pub fn symlink(target: &str, path: &str) -> Result<()> {
+    let (target, path) = (cstring(target), cstring(path));
+    call(SYS_SYMLINK, [target.as_ptr() as u64, path.as_ptr() as u64, 0, 0, 0, 0]).map(|_| ())
+}
+
+pub fn readlink(path: &str) -> Result<String> {
+    let path = cstring(path);
+    let mut buf = [0u8; 1024];
+    let n = call(SYS_READLINK, [path.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0])?;
+    Ok(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// Marca o arquivo como modificado agora.
+pub fn touch_now(path: &str) -> Result<()> {
+    const AT_FDCWD: u64 = -100i64 as u64;
+    let path = cstring(path);
+    call(SYS_UTIMENSAT, [AT_FDCWD, path.as_ptr() as u64, 0, 0, 0, 0]).map(|_| ())
 }
 
 pub fn chdir(path: &str) -> Result<()> {
@@ -504,6 +608,30 @@ pub fn sched_yield() {
 pub fn sleep_ms(ms: u64) -> Result<()> {
     let request = [ms / 1000, (ms % 1000) * 1_000_000];
     call(SYS_NANOSLEEP, [request.as_ptr() as u64, 0, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Segundos desde 1970-01-01 00:00 UTC (a hora de parede).
+pub fn time() -> u64 {
+    const CLOCK_REALTIME: u64 = 0;
+    let mut time = [0u64; 2];
+    unsafe { syscall(SYS_CLOCK_GETTIME, [CLOCK_REALTIME, time.as_mut_ptr() as u64, 0, 0, 0, 0]) };
+    time[0]
+}
+
+/// (ano, mês, dia, hora, minuto, segundo) em UTC.
+pub fn civil_time(seconds: u64) -> (i64, u32, u32, u32, u32, u32) {
+    // Algoritmo `civil_from_days` de Howard Hinnant.
+    let days = (seconds / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = year_of_era + era * 400 + if month <= 2 { 1 } else { 0 };
+    let rest = seconds % 86_400;
+    (year, month, day, (rest / 3600) as u32, (rest / 60 % 60) as u32, (rest % 60) as u32)
 }
 
 /// Milissegundos de um relógio monotônico.

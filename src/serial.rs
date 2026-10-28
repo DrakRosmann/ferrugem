@@ -1,6 +1,7 @@
 //! Porta serial COM1 (UART 16550): saída de log e entrada alternativa ao teclado.
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cpu::{inb, outb};
 use crate::input;
@@ -36,8 +37,17 @@ pub fn enable_rx_interrupt() {
     }
 }
 
+/// A recepção foi pausada porque a fila de entrada encheu.
+static THROTTLED: AtomicBool = AtomicBool::new(false);
+
 pub fn handle_irq() {
     while unsafe { inb(COM1 + 5) } & 1 != 0 {
+        if !input::has_room() {
+            // Deixa os bytes na UART e para de ouvir até a fila esvaziar.
+            THROTTLED.store(true, Ordering::Relaxed);
+            unsafe { outb(COM1 + 1, 0x00) };
+            return;
+        }
         let byte = unsafe { inb(COM1) };
         // Terminais mandam CR no Enter e DEL no backspace.
         let byte = match byte {
@@ -46,6 +56,14 @@ pub fn handle_irq() {
             b => b,
         };
         input::push(byte);
+    }
+}
+
+/// Chamado quando a fila de entrada abre espaço: volta a receber (a UART
+/// gera a interrupção na hora se já houver bytes esperando).
+pub fn resume_rx() {
+    if THROTTLED.swap(false, Ordering::Relaxed) {
+        enable_rx_interrupt();
     }
 }
 

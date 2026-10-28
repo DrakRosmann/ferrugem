@@ -13,9 +13,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::pipe::PipeEnd;
 use crate::sync::SpinLock;
-use crate::syscall::{EBADF, EINVAL, EISDIR, EMFILE, ENOTDIR, ESPIPE, Errno};
+use crate::syscall::{EBADF, EINVAL, EISDIR, EMFILE, ENOTDIR, ENXIO, ESPIPE, Errno};
 use crate::tty;
-use crate::vfs::{Device, NodeKind, NodeRef};
+use crate::vfs::{DT_DIR, Device, Kind, NodeRef, S_IFCHR, S_IFIFO};
 
 pub const O_ACCMODE: u32 = 3;
 pub const O_RDONLY: u32 = 0;
@@ -47,28 +47,25 @@ pub struct OpenFile {
 
 /// Os campos do `struct stat` do Linux que fazem sentido aqui.
 pub struct Stat {
+    pub dev: u64,
     pub ino: u64,
     pub mode: u32,
     pub size: u64,
     pub rdev: u64,
     pub nlink: u64,
+    pub mtime: u64,
 }
 
-pub const S_IFIFO: u32 = 0o010000;
-pub const S_IFCHR: u32 = 0o020000;
-pub const S_IFDIR: u32 = 0o040000;
-pub const S_IFREG: u32 = 0o100000;
-
 pub fn node_stat(node: &NodeRef) -> Stat {
-    let (kind, rdev) = match &node.kind {
-        NodeKind::File(_) => (S_IFREG, 0),
-        NodeKind::Directory(_) => (S_IFDIR, 0),
-        NodeKind::Device(Device::Null) => (S_IFCHR, 1 << 8 | 3),
-        NodeKind::Device(Device::Zero) => (S_IFCHR, 1 << 8 | 5),
-        NodeKind::Device(Device::Tty) => (S_IFCHR, 5 << 8),
-    };
-    let nlink = if node.is_dir() { 2 } else { 1 };
-    Stat { ino: node.ino, mode: kind | node.mode, size: node.size(), rdev, nlink }
+    Stat {
+        dev: node.dev(),
+        ino: node.ino(),
+        mode: node.mode(),
+        size: node.size(),
+        rdev: node.rdev(),
+        nlink: node.nlink(),
+        mtime: node.mtime(),
+    }
 }
 
 impl OpenFile {
@@ -78,12 +75,13 @@ impl OpenFile {
     }
 
     /// Abre um nó da árvore (dispositivos viram o arquivo do dispositivo).
-    pub fn open_node(node: NodeRef, path: String, flags: u32) -> Arc<Self> {
-        let kind = match node.kind {
-            NodeKind::Device(device) => FileKind::Device(device),
+    pub fn open_node(node: NodeRef, path: String, flags: u32) -> Result<Arc<Self>, Errno> {
+        let kind = match node.kind() {
+            Kind::Device(device) => FileKind::Device(device),
+            Kind::Special => return Err(ENXIO),
             _ => FileKind::Node { node, path },
         };
-        Self::new(kind, flags)
+        Ok(Self::new(kind, flags))
     }
 
     pub fn console() -> Arc<Self> {
@@ -129,17 +127,15 @@ impl OpenFile {
             return Err(EBADF);
         }
         match &self.kind {
-            FileKind::Node { node, .. } => match &node.kind {
-                NodeKind::File(data) => {
-                    let data = data.lock();
-                    let mut offset = self.offset.lock();
-                    let start = (*offset as usize).min(data.len());
-                    let end = start.saturating_add(max).min(data.len());
-                    *offset = end as u64;
-                    Ok(data[start..end].to_vec())
-                }
-                _ => Err(EISDIR),
-            },
+            FileKind::Node { node, .. } => {
+                let mut offset = self.offset.lock();
+                let remaining = node.size().saturating_sub(*offset);
+                let mut data = vec![0; (max as u64).min(remaining).min(1 << 20) as usize];
+                let n = node.read_at(*offset, &mut data)?;
+                data.truncate(n);
+                *offset += n as u64;
+                Ok(data)
+            }
             FileKind::Pipe(end) if !end.is_writer() => end.read(max, self.nonblocking()),
             FileKind::Pipe(_) => Err(EBADF),
             FileKind::Device(Device::Null) => Ok(Vec::new()),
@@ -153,24 +149,15 @@ impl OpenFile {
             return Err(EBADF);
         }
         match &self.kind {
-            FileKind::Node { node, .. } => match &node.kind {
-                NodeKind::File(data) => {
-                    let mut data = data.lock();
-                    let mut offset = self.offset.lock();
-                    if self.flags() & O_APPEND != 0 {
-                        *offset = data.len() as u64;
-                    }
-                    let start = *offset as usize;
-                    let end = start + bytes.len();
-                    if data.len() < end {
-                        data.resize(end, 0);
-                    }
-                    data[start..end].copy_from_slice(bytes);
-                    *offset = end as u64;
-                    Ok(bytes.len())
+            FileKind::Node { node, .. } => {
+                let mut offset = self.offset.lock();
+                if self.flags() & O_APPEND != 0 {
+                    *offset = node.size();
                 }
-                _ => Err(EISDIR),
-            },
+                let n = node.write_at(*offset, bytes)?;
+                *offset += n as u64;
+                Ok(n)
+            }
             FileKind::Pipe(end) if end.is_writer() => end.write(bytes, self.nonblocking()),
             FileKind::Pipe(_) => Err(EBADF),
             FileKind::Device(Device::Null | Device::Zero) => Ok(bytes.len()),
@@ -178,11 +165,19 @@ impl OpenFile {
         }
     }
 
-    pub fn truncate(&self) {
-        if let FileKind::Node { node, .. } = &self.kind
-            && let NodeKind::File(data) = &node.kind
-        {
-            data.lock().clear();
+    pub fn truncate(&self, size: u64) -> Result<(), Errno> {
+        match &self.kind {
+            FileKind::Node { node, .. } if node.is_dir() => Err(EISDIR),
+            FileKind::Node { node, .. } if self.writable() => node.truncate(size),
+            _ => Err(EINVAL),
+        }
+    }
+
+    /// O nó da árvore, para arquivos e diretórios.
+    pub fn node(&self) -> Option<&NodeRef> {
+        match &self.kind {
+            FileKind::Node { node, .. } => Some(node),
+            _ => None,
         }
     }
 
@@ -206,14 +201,9 @@ impl OpenFile {
     pub fn stat(&self) -> Stat {
         match &self.kind {
             FileKind::Node { node, .. } => node_stat(node),
-            FileKind::Pipe(_) => Stat { ino: 0, mode: S_IFIFO | 0o600, size: 0, rdev: 0, nlink: 1 },
+            FileKind::Pipe(_) => Stat { dev: 0, ino: 0, mode: S_IFIFO | 0o600, size: 0, rdev: 0, nlink: 1, mtime: 0 },
             FileKind::Device(device) => {
-                let rdev = match device {
-                    Device::Null => 1 << 8 | 3,
-                    Device::Zero => 1 << 8 | 5,
-                    Device::Tty => 5 << 8,
-                };
-                Stat { ino: 0, mode: S_IFCHR | 0o666, size: 0, rdev, nlink: 1 }
+                Stat { dev: 0, ino: 0, mode: S_IFCHR | 0o666, size: 0, rdev: device.rdev(), nlink: 1, mtime: 0 }
             }
         }
     }
@@ -221,18 +211,10 @@ impl OpenFile {
     /// Próximas entradas de um diretório, como (inode, tipo DT_*, nome). A
     /// posição do arquivo conta entradas já lidas; `advance` a avança.
     pub fn dir_entries(&self) -> Result<Vec<(u64, u8, String)>, Errno> {
-        const DT_CHR: u8 = 2;
-        const DT_DIR: u8 = 4;
-        const DT_REG: u8 = 8;
         let FileKind::Node { node, .. } = &self.kind else { return Err(ENOTDIR) };
-        let mut entries = vec![(node.ino, DT_DIR, String::from(".")), (node.ino, DT_DIR, String::from(".."))];
-        for (name, child) in node.list()? {
-            let kind = match child.kind {
-                NodeKind::File(_) => DT_REG,
-                NodeKind::Directory(_) => DT_DIR,
-                NodeKind::Device(_) => DT_CHR,
-            };
-            entries.push((child.ino, kind, name));
+        let mut entries = vec![(node.ino(), DT_DIR, String::from(".")), (node.ino(), DT_DIR, String::from(".."))];
+        for entry in node.entries()? {
+            entries.push((entry.ino, entry.dtype, entry.name));
         }
         let skip = *self.offset.lock() as usize;
         Ok(entries.into_iter().skip(skip).collect())

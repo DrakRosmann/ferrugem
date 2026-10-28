@@ -18,6 +18,14 @@ Formato dos testes:
 Nas linhas esperadas, `*` casa com qualquer trecho (útil para pids e tempos).
 Espaços no fim das linhas e as cores (sequências ANSI) são ignorados.
 
+Cada arquivo roda com uma cópia nova do disco de teste (um ext2 criado por
+scripts/disco.sh). No fim, o sistema é desligado e o `e2fsck` verifica o
+disco: qualquer inconsistência deixada pelo ext2 do kernel é uma falha.
+Diretivas:
+
+    @reiniciar     desliga e dá boot de novo no mesmo disco
+    @sem-disco     (no início) roda sem disco, com a raiz em memória
+
 Uso: scripts/testar.py [--gravar] [tests/arquivo.txt...]
   --gravar  só mostra a saída real de cada comando (para escrever testes)
 """
@@ -25,8 +33,10 @@ Uso: scripts/testar.py [--gravar] [tests/arquivo.txt...]
 import codecs
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -34,6 +44,8 @@ RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNEL = os.path.join(RAIZ, "target/x86_64-unknown-none/release/ferrugem")
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 PROMPT = re.compile(r"ferrugem:[^\n]*\$ $")
+MONITOR = re.compile(r"ferrugem> $")
+DISCO_TESTE = os.path.join(RAIZ, "target/teste-disco.img")
 PANICO = "PÂNICO DO KERNEL"
 TECLAS = {"<Ctrl+C>": "\x03", "<Ctrl+Z>": "\x1a", "<Ctrl+D>": "\x04", "<Ctrl+\\>": "\x1c"}
 TEMPO_BOOT = 60
@@ -47,10 +59,11 @@ class Falha(Exception):
 class Maquina:
     """O QEMU rodando o kernel, com a serial ligada a este processo."""
 
-    def __init__(self, imagem):
+    def __init__(self, imagem, disco=None):
+        extras = ["-drive", f"file={disco},format=raw,if=ide"] if disco else []
         self.qemu = subprocess.Popen(
             ["qemu-system-x86_64", "-kernel", imagem, "-m", "128M", "-serial", "stdio",
-             "-display", "none", "-no-reboot", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"],
+             "-display", "none", "-no-reboot", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"] + extras,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         # Texto cru (com as cores): o QEMU escreve a serial byte a byte, e
@@ -104,18 +117,36 @@ class Maquina:
         self.qemu.stdin.write(texto.encode())
         self.qemu.stdin.flush()
 
+    def desligar(self):
+        """Sai do sh e desliga pelo monitor, para o disco ficar marcado
+        como desmontado direito."""
+        self.digitar("exit\r")
+        self.esperar(lambda t: MONITOR.search(t), TEMPO_COMANDO, "o monitor do kernel")
+        self.lido = len(self.saida)
+        self.digitar("desligar\r")
+        try:
+            self.qemu.wait(TEMPO_COMANDO)
+        except subprocess.TimeoutExpired:
+            raise Falha("o sistema não desligou")
+
     def encerrar(self):
         self.qemu.kill()
         self.qemu.wait()
 
 
 def ler_testes(caminho):
-    """Lista de (linha, comando, teclas, linhas esperadas)."""
+    """Lista de (linha, comando, teclas, linhas esperadas); o comando
+    None marca um `@reiniciar`. Devolve também se o arquivo usa disco."""
     casos = []
+    disco = True
     with open(caminho, encoding="utf-8") as arquivo:
         for numero, linha in enumerate(arquivo, 1):
             linha = linha.rstrip("\n")
-            if linha.startswith("$ "):
+            if linha == "@sem-disco":
+                disco = False
+            elif linha == "@reiniciar":
+                casos.append((numero, None, [], []))
+            elif linha.startswith("$ "):
                 casos.append((numero, linha[2:], [], []))
             elif linha.startswith("#"):
                 continue
@@ -129,7 +160,15 @@ def ler_testes(caminho):
     for _, _, _, esperado in casos:
         while esperado and not esperado[-1].strip():
             esperado.pop()  # linhas vazias no fim só separam os casos
-    return casos
+    return casos, disco
+
+
+def verificar_disco(disco):
+    """O e2fsck (sem alterar nada) precisa achar o disco consistente."""
+    resultado = subprocess.run(["e2fsck", "-fn", disco], capture_output=True, text=True,
+                               env=dict(os.environ, LC_ALL="C"))
+    if resultado.returncode != 0:
+        raise Falha(f"e2fsck achou problemas no disco:\n{resultado.stdout}{resultado.stderr}")
 
 
 def casa(real, esperado):
@@ -154,12 +193,26 @@ def comparar(esperado, real):
 
 
 def rodar_arquivo(caminho, imagem, gravar):
-    casos = ler_testes(caminho)
-    maquina = Maquina(imagem)
+    casos, usa_disco = ler_testes(caminho)
+    pasta = tempfile.mkdtemp(prefix="ferrugem-teste-")
+    disco = None
+    if usa_disco:
+        disco = os.path.join(pasta, "disco.img")
+        shutil.copy(DISCO_TESTE, disco)
+    maquina = Maquina(imagem, disco)
     falhas = 0
     try:
         maquina.esperar_prompt(TEMPO_BOOT)
         for numero, comando, teclas, esperado in casos:
+            if comando is None:
+                if gravar:
+                    print("@reiniciar")
+                maquina.desligar()
+                if disco:
+                    verificar_disco(disco)
+                maquina = Maquina(imagem, disco)
+                maquina.esperar_prompt(TEMPO_BOOT)
+                continue
             maquina.digitar(comando + "\r")
             for tecla in teclas:
                 # Dá tempo ao comando de começar antes da tecla.
@@ -178,12 +231,16 @@ def rodar_arquivo(caminho, imagem, gravar):
             if diferenca:
                 falhas += 1
                 print(f"\n✗ {caminho}:{numero}: $ {comando}\n{diferenca}")
+        maquina.desligar()
+        if disco:
+            verificar_disco(disco)
     except Falha as erro:
         print(f"\n✗ {caminho}: {erro}")
         falhas += 1
     finally:
         maquina.encerrar()
-    return len(casos), falhas
+        shutil.rmtree(pasta)
+    return sum(1 for caso in casos if caso[1] is not None), falhas
 
 
 def main():
@@ -196,6 +253,8 @@ def main():
 
     imagem = KERNEL + ".bin"
     subprocess.run(["objcopy", "-O", "binary", KERNEL, imagem], check=True)
+    subprocess.run([os.path.join(RAIZ, "scripts/disco.sh"), DISCO_TESTE], check=True, stdout=subprocess.DEVNULL,
+                   env=dict(os.environ, FERRUGEM_DISCO_NOVO="1", FERRUGEM_DISCO_MB="32"))
 
     total = falhas = 0
     for caminho in arquivos:

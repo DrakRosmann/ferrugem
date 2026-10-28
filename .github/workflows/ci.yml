@@ -10,6 +10,11 @@ jobs:
   testes:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      matrix:
+        # Tamanhos de bloco do ext2: cada um muda a estrutura do disco.
+        bloco: [1024, 4096]
+    name: testes (blocos de ${{ matrix.bloco }} bytes)
     steps:
       - uses: actions/checkout@v4
 
@@ -18,12 +23,14 @@ jobs:
         with:
           targets: x86_64-unknown-none
 
-      - name: QEMU
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
+      - name: QEMU e e2fsprogs (mkfs.ext2, e2fsck)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 e2fsprogs
 
       - name: Compilar
         run: cargo build --release
 
       - name: Testes no QEMU
         run: python3 scripts/testar.py
+        env:
+          FERRUGEM_BLOCO: ${{ matrix.bloco }}
 

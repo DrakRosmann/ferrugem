@@ -1,0 +1,4 @@
+Bem-vindo ao FerrugemOS!
+Este sistema está num disco ext2: o que você gravar aqui continua lá depois de desligar.
+No sh, experimente: ls /bin, cat leiame.txt | grep sistema, yes | head -n 3,
+sleep 100 & e depois jobs, fg (Ctrl+Z suspende, Ctrl+C interrompe).

@@ -5,6 +5,7 @@ use core::arch::asm;
 use crate::cpu::{self, inb, outb, outw};
 
 pub fn reboot() -> ! {
+    crate::vfs::unmount_all(); // marca os discos como desmontados direito
     cpu::cli();
     unsafe {
         // Pede ao controlador do teclado (8042) para pulsar a linha de reset.
@@ -18,6 +19,7 @@ pub fn reboot() -> ! {
 }
 
 pub fn shutdown() -> ! {
+    crate::vfs::unmount_all();
     cpu::cli();
     unsafe {
         outw(0x604, 0x2000); // ACPI do QEMU (máquinas pc e q35)

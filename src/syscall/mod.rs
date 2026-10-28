@@ -26,6 +26,7 @@ pub const ENOENT: Errno = 2;
 pub const ESRCH: Errno = 3;
 pub const EINTR: Errno = 4;
 pub const EIO: Errno = 5;
+pub const ENXIO: Errno = 6;
 pub const E2BIG: Errno = 7;
 pub const ENOEXEC: Errno = 8;
 pub const EBADF: Errno = 9;
@@ -34,19 +35,25 @@ pub const EAGAIN: Errno = 11;
 pub const ENOMEM: Errno = 12;
 pub const EACCES: Errno = 13;
 pub const EFAULT: Errno = 14;
+pub const EBUSY: Errno = 16;
 pub const EEXIST: Errno = 17;
+pub const EXDEV: Errno = 18;
 pub const ENODEV: Errno = 19;
 pub const ENOTDIR: Errno = 20;
 pub const EISDIR: Errno = 21;
 pub const EINVAL: Errno = 22;
 pub const EMFILE: Errno = 24;
 pub const ENOTTY: Errno = 25;
+pub const EFBIG: Errno = 27;
+pub const ENOSPC: Errno = 28;
 pub const ESPIPE: Errno = 29;
+pub const EROFS: Errno = 30;
 pub const EPIPE: Errno = 32;
 pub const ERANGE: Errno = 34;
 pub const ENAMETOOLONG: Errno = 36;
 pub const ENOSYS: Errno = 38;
 pub const ENOTEMPTY: Errno = 39;
+pub const ELOOP: Errno = 40;
 
 pub type SysResult = Result<i64, Errno>;
 
@@ -142,11 +149,19 @@ const SYS_WAIT4: u64 = 61;
 const SYS_KILL: u64 = 62;
 const SYS_UNAME: u64 = 63;
 const SYS_FCNTL: u64 = 72;
+const SYS_FSYNC: u64 = 74;
+const SYS_FDATASYNC: u64 = 75;
+const SYS_TRUNCATE: u64 = 76;
+const SYS_FTRUNCATE: u64 = 77;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
 const SYS_MKDIR: u64 = 83;
+const SYS_RENAME: u64 = 82;
 const SYS_RMDIR: u64 = 84;
+const SYS_LINK: u64 = 86;
 const SYS_UNLINK: u64 = 87;
+const SYS_SYMLINK: u64 = 88;
+const SYS_READLINK: u64 = 89;
 const SYS_GETUID: u64 = 102;
 const SYS_GETGID: u64 = 104;
 const SYS_GETEUID: u64 = 107;
@@ -158,6 +173,7 @@ const SYS_SETSID: u64 = 112;
 const SYS_GETPGID: u64 = 121;
 const SYS_GETSID: u64 = 124;
 const SYS_ARCH_PRCTL: u64 = 158;
+const SYS_SYNC: u64 = 162;
 const SYS_GETTID: u64 = 186;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_SET_TID_ADDRESS: u64 = 218;
@@ -167,9 +183,15 @@ const SYS_OPENAT: u64 = 257;
 const SYS_MKDIRAT: u64 = 258;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_UNLINKAT: u64 = 263;
+const SYS_RENAMEAT: u64 = 264;
+const SYS_LINKAT: u64 = 265;
+const SYS_SYMLINKAT: u64 = 266;
+const SYS_READLINKAT: u64 = 267;
 const SYS_FACCESSAT: u64 = 269;
+const SYS_UTIMENSAT: u64 = 280;
 const SYS_DUP3: u64 = 292;
 const SYS_PIPE2: u64 = 293;
+const SYS_RENAMEAT2: u64 = 316;
 
 pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
     let number = frame.rax;
@@ -184,7 +206,8 @@ pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
         SYS_OPENAT => fs::openat(a[0] as i64, a[1], a[2], a[3]),
         SYS_CLOSE => fs::close(a[0]),
         SYS_LSEEK => fs::lseek(a[0], a[1], a[2]),
-        SYS_STAT | SYS_LSTAT => fs::fstatat(fs::AT_FDCWD, a[0], a[1], 0),
+        SYS_STAT => fs::fstatat(fs::AT_FDCWD, a[0], a[1], 0),
+        SYS_LSTAT => fs::fstatat(fs::AT_FDCWD, a[0], a[1], fs::AT_SYMLINK_NOFOLLOW),
         SYS_FSTAT => fs::fstat(a[0], a[1]),
         SYS_NEWFSTATAT => fs::fstatat(a[0] as i64, a[1], a[2], a[3]),
         SYS_GETDENTS64 => fs::getdents64(a[0], a[1], a[2]),
@@ -197,13 +220,27 @@ pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
         SYS_IOCTL => fs::ioctl(a[0], a[1], a[2]),
         SYS_GETCWD => fs::getcwd(a[0], a[1]),
         SYS_CHDIR => fs::chdir(a[0]),
-        SYS_MKDIR => fs::mkdirat(fs::AT_FDCWD, a[0]),
-        SYS_MKDIRAT => fs::mkdirat(a[0] as i64, a[1]),
+        SYS_MKDIR => fs::mkdirat(fs::AT_FDCWD, a[0], a[1]),
+        SYS_MKDIRAT => fs::mkdirat(a[0] as i64, a[1], a[2]),
         SYS_RMDIR => fs::unlinkat(fs::AT_FDCWD, a[0], fs::AT_REMOVEDIR),
         SYS_UNLINK => fs::unlinkat(fs::AT_FDCWD, a[0], 0),
         SYS_UNLINKAT => fs::unlinkat(a[0] as i64, a[1], a[2]),
         SYS_ACCESS => fs::faccessat(fs::AT_FDCWD, a[0]),
         SYS_FACCESSAT => fs::faccessat(a[0] as i64, a[1]),
+        SYS_RENAME => fs::renameat(fs::AT_FDCWD, a[0], fs::AT_FDCWD, a[1], 0),
+        SYS_RENAMEAT => fs::renameat(a[0] as i64, a[1], a[2] as i64, a[3], 0),
+        SYS_RENAMEAT2 => fs::renameat(a[0] as i64, a[1], a[2] as i64, a[3], a[4]),
+        SYS_LINK => fs::linkat(fs::AT_FDCWD, a[0], fs::AT_FDCWD, a[1]),
+        SYS_LINKAT => fs::linkat(a[0] as i64, a[1], a[2] as i64, a[3]),
+        SYS_SYMLINK => fs::symlinkat(a[0], fs::AT_FDCWD, a[1]),
+        SYS_SYMLINKAT => fs::symlinkat(a[0], a[1] as i64, a[2]),
+        SYS_READLINK => fs::readlinkat(fs::AT_FDCWD, a[0], a[1], a[2]),
+        SYS_READLINKAT => fs::readlinkat(a[0] as i64, a[1], a[2], a[3]),
+        SYS_TRUNCATE => fs::truncate(a[0], a[1]),
+        SYS_FTRUNCATE => fs::ftruncate(a[0], a[1]),
+        SYS_UTIMENSAT => fs::utimensat(a[0] as i64, a[1], a[2], a[3]),
+        // Cada escrita já vai direto para o disco: não há o que sincronizar.
+        SYS_SYNC | SYS_FSYNC | SYS_FDATASYNC => Ok(0),
 
         // Processos e sinais (proc.rs)
         SYS_FORK | SYS_VFORK => proc::fork(frame),
@@ -369,12 +406,12 @@ fn arch_prctl(code: u64, addr: u64) -> SysResult {
 }
 
 fn clock_gettime(clock: u64, out: u64) -> SysResult {
-    // Sem relógio de parede ainda: todos os relógios contam desde o boot.
+    // REALTIME é a hora de parede (do RTC); os outros contam desde o boot.
     const CLOCKS: [u64; 4] = [0, 1, 4, 7]; // REALTIME, MONOTONIC, MONOTONIC_RAW, BOOTTIME
     if !CLOCKS.contains(&clock) {
         return Err(EINVAL);
     }
-    let ms = timer::uptime_ms();
+    let ms = if clock == 0 { crate::rtc::now_ms() } else { timer::uptime_ms() };
     let mut time = [0u8; 16];
     time[..8].copy_from_slice(&(ms / 1000).to_le_bytes());
     time[8..].copy_from_slice(&((ms % 1000) * 1_000_000).to_le_bytes());

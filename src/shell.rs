@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::console;
 use crate::cpu;
 use crate::elf;
+use crate::ext2;
 use crate::heap;
 use crate::input;
 use crate::memory;
@@ -135,6 +136,7 @@ fn execute(line: &str, boot: &BootInfo) {
         "anexar" | "append" => write_file(rest, true),
         "rm" => rm(&args),
         "cpu" => cpu_info(),
+        "df" | "montagens" => df(),
         "cores" | "colors" => colors(),
         "dormir" | "sleep" => sleep(&args),
         "int3" => unsafe { core::arch::asm!("int3") },
@@ -148,7 +150,14 @@ fn execute(line: &str, boot: &BootInfo) {
 /// Executa um programa (de /bin, ou um caminho) como processo de usuário.
 /// Com `&` no fim, roda em segundo plano.
 fn run_program(name: &str, args: &[&str]) {
-    let path = if name.contains('/') { vfs::normalize(MONITOR_CWD, name) } else { format!("/bin/{name}") };
+    let path = if name.contains('/') {
+        match vfs::lookup(MONITOR_CWD, name, true) {
+            Ok(resolved) => resolved.path,
+            Err(_) => return error(format_args!("não encontrado: {name}")),
+        }
+    } else {
+        format!("/bin/{name}")
+    };
     if !vfs::read_file("/", &path).is_ok_and(|data| elf::is_elf(&data)) {
         return error(format_args!("comando desconhecido: {name} (digite 'ajuda')"));
     }
@@ -225,6 +234,7 @@ fn help() {
         ("escrever <arq> <txt>", "cria ou substitui um arquivo"),
         ("anexar <arq> <txt>", "acrescenta uma linha a um arquivo"),
         ("rm <arq>", "apaga um arquivo"),
+        ("df", "sistemas de arquivos montados e espaço livre"),
         ("cpu", "identifica o processador"),
         ("cores", "mostra a paleta VGA"),
         ("dormir <ms>", "espera (cedendo a CPU)"),
@@ -333,17 +343,21 @@ fn primes(args: &[&str]) {
 
 fn ls(args: &[&str]) {
     let path = args.first().copied().unwrap_or(".");
-    let entries = match vfs::resolve(MONITOR_CWD, path).and_then(|dir| dir.list()) {
-        Ok(entries) => entries,
-        Err(_) => return error(format_args!("não é um diretório: {path}")),
+    let Ok(dir) = vfs::resolve(MONITOR_CWD, path) else {
+        return error(format_args!("não encontrado: {path}"));
     };
-    for (name, node) in entries {
+    let Ok(entries) = dir.entries() else {
+        return error(format_args!("não é um diretório: {path}"));
+    };
+    for entry in entries {
+        let name = entry.name;
+        let Ok(node) = dir.lookup(&name) else { continue };
         if node.is_dir() {
             console::set_color(Color::LightBlue);
             println!("  {:>8}  {name}/", "-");
         } else {
             print!("  {:>8}  ", format_size(node.size()));
-            if node.mode & 0o111 != 0 {
+            if node.mode() & 0o111 != 0 {
                 console::set_color(Color::LightGreen);
             }
             println!("{name}");
@@ -383,6 +397,28 @@ fn rm(args: &[&str]) {
         if vfs::remove(MONITOR_CWD, path, false).is_err() {
             error(format_args!("não foi possível apagar {path}"));
         }
+    }
+}
+
+/// Os sistemas de arquivos montados e o espaço livre dos discos.
+fn df() {
+    for (source, path, fstype) in vfs::mounts() {
+        print!("  {path:<6} {fstype:<6} {source:<28}");
+        if let Ok(root) = vfs::resolve("/", &path)
+            && let Some(info) = ext2::Ext2::info(&root)
+        {
+            let size = |blocks: u64| format_size(blocks * info.block_size as u64);
+            print!(
+                " \"{}\": {} livres de {}, {} de {} inodes livres{}",
+                info.label,
+                size(info.free_blocks),
+                size(info.blocks),
+                info.free_inodes,
+                info.inodes,
+                if info.read_only { " (só leitura)" } else { "" }
+            );
+        }
+        println!();
     }
 }
 

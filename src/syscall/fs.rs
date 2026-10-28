@@ -5,18 +5,23 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::{
-    EINVAL, EISDIR, ENOTDIR, ENOTTY, ERANGE, Errno, SysResult, read_cstr, read_u64, user_slice, with_process,
-    write_user,
+    EINVAL, EISDIR, ELOOP, ENOENT, ENOTDIR, ENOTTY, ERANGE, Errno, SysResult, read_cstr, read_u64, user_slice,
+    with_process, write_user,
 };
 use crate::file::{
     FileKind, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NONBLOCK, O_RDONLY, O_TRUNC, O_WRONLY, OpenFile,
     Stat, node_stat,
 };
-use crate::{pipe, tty, vfs};
+use crate::vfs::Kind;
+use crate::{pipe, rtc, tty, vfs};
 
 pub const AT_FDCWD: i64 = -100;
 pub const AT_REMOVEDIR: u64 = 0x200;
+pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
+const O_NOFOLLOW: u32 = 0x2_0000;
+/// Permissões tiradas dos arquivos novos (ainda não há `umask`).
+const UMASK: u64 = 0o022;
 
 fn get_file(fd: u64) -> Result<Arc<OpenFile>, Errno> {
     with_process(|p| p.fds.get(fd as i32))
@@ -73,25 +78,29 @@ pub fn writev(fd: u64, iov: u64, count: u64) -> SysResult {
     Ok(total)
 }
 
-pub fn openat(dirfd: i64, path: u64, flags: u64, _mode: u64) -> SysResult {
+pub fn openat(dirfd: i64, path: u64, flags: u64, mode: u64) -> SysResult {
     let path = read_cstr(path)?;
     let flags = flags as u32;
     let base = base_dir(dirfd, &path)?;
-    let node = if flags & O_CREAT != 0 {
-        vfs::create_file(&base, &path, flags & O_EXCL != 0)?
+    let resolved = if flags & O_CREAT != 0 {
+        vfs::create_file(&base, &path, flags & O_EXCL != 0, (mode & !UMASK) as u32)?
     } else {
-        vfs::resolve(&base, &path)?
+        vfs::lookup(&base, &path, flags & O_NOFOLLOW == 0)?
     };
+    let node = resolved.node;
     let writes = flags & O_ACCMODE != O_RDONLY;
+    if node.kind() == Kind::Symlink {
+        return Err(ELOOP); // só acontece com O_NOFOLLOW
+    }
     if flags & O_DIRECTORY != 0 && !node.is_dir() {
         return Err(ENOTDIR);
     }
     if node.is_dir() && writes {
         return Err(EISDIR);
     }
-    let file = OpenFile::open_node(node, vfs::normalize(&base, &path), flags);
-    if flags & O_TRUNC != 0 && writes {
-        file.truncate();
+    let file = OpenFile::open_node(node, resolved.path, flags)?;
+    if flags & O_TRUNC != 0 && writes && file.node().is_some() {
+        file.truncate(0)?;
     }
     with_process(|p| p.fds.insert(file, flags & O_CLOEXEC != 0, 0)).map(i64::from)
 }
@@ -110,7 +119,7 @@ pub fn lseek(fd: u64, offset: u64, whence: u64) -> SysResult {
 /// Grava o `struct stat` do Linux x86_64 (144 bytes).
 fn write_stat(buf: u64, stat: &Stat) -> SysResult {
     let mut out = [0u8; 144];
-    out[0..8].copy_from_slice(&1u64.to_le_bytes()); // st_dev
+    out[0..8].copy_from_slice(&stat.dev.to_le_bytes());
     out[8..16].copy_from_slice(&stat.ino.to_le_bytes());
     out[16..24].copy_from_slice(&stat.nlink.to_le_bytes());
     out[24..28].copy_from_slice(&stat.mode.to_le_bytes());
@@ -118,6 +127,9 @@ fn write_stat(buf: u64, stat: &Stat) -> SysResult {
     out[48..56].copy_from_slice(&stat.size.to_le_bytes());
     out[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
     out[64..72].copy_from_slice(&stat.size.div_ceil(512).to_le_bytes()); // st_blocks
+    for offset in [72, 88, 104] {
+        out[offset..offset + 8].copy_from_slice(&stat.mtime.to_le_bytes()); // atime, mtime, ctime
+    }
     write_user(buf, &out)?;
     Ok(0)
 }
@@ -132,7 +144,8 @@ pub fn fstatat(dirfd: i64, path: u64, buf: u64, flags: u64) -> SysResult {
         return fstat(dirfd as u64, buf);
     }
     let base = base_dir(dirfd, &path)?;
-    write_stat(buf, &node_stat(&vfs::resolve(&base, &path)?))
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    write_stat(buf, &node_stat(&vfs::lookup(&base, &path, follow)?.node))
 }
 
 /// Grava entradas `struct linux_dirent64` até encher o buffer.
@@ -261,19 +274,19 @@ pub fn getcwd(buf: u64, size: u64) -> SysResult {
 pub fn chdir(path: u64) -> SysResult {
     let path = read_cstr(path)?;
     let cwd = with_process(|p| Ok(p.cwd.clone()))?;
-    if !vfs::resolve(&cwd, &path)?.is_dir() {
+    let resolved = vfs::lookup(&cwd, &path, true)?;
+    if !resolved.node.is_dir() {
         return Err(ENOTDIR);
     }
-    let new = vfs::normalize(&cwd, &path);
     with_process(|p| {
-        p.cwd = new;
+        p.cwd = resolved.path;
         Ok(0)
     })
 }
 
-pub fn mkdirat(dirfd: i64, path: u64) -> SysResult {
+pub fn mkdirat(dirfd: i64, path: u64, mode: u64) -> SysResult {
     let path = read_cstr(path)?;
-    vfs::mkdir(&base_dir(dirfd, &path)?, &path).map(|()| 0)
+    vfs::mkdir(&base_dir(dirfd, &path)?, &path, (mode & !UMASK) as u32).map(|()| 0)
 }
 
 pub fn unlinkat(dirfd: i64, path: u64, flags: u64) -> SysResult {
@@ -285,4 +298,77 @@ pub fn unlinkat(dirfd: i64, path: u64, flags: u64) -> SysResult {
 pub fn faccessat(dirfd: i64, path: u64) -> SysResult {
     let path = read_cstr(path)?;
     vfs::resolve(&base_dir(dirfd, &path)?, &path).map(|_| 0)
+}
+
+pub fn renameat(old_dirfd: i64, old: u64, new_dirfd: i64, new: u64, flags: u64) -> SysResult {
+    if flags != 0 {
+        return Err(EINVAL); // RENAME_NOREPLACE e afins ainda não
+    }
+    let (old, new) = (read_cstr(old)?, read_cstr(new)?);
+    let (old_base, new_base) = (base_dir(old_dirfd, &old)?, base_dir(new_dirfd, &new)?);
+    // O VFS resolve os dois a partir de um diretório só: usa caminhos absolutos.
+    let old = vfs::lookup_parent(&old_base, &old).map(|(dir, name)| join(&dir.path, &name))?;
+    let new = vfs::lookup_parent(&new_base, &new).map(|(dir, name)| join(&dir.path, &name))?;
+    vfs::rename("/", &old, &new).map(|()| 0)
+}
+
+pub fn linkat(old_dirfd: i64, old: u64, new_dirfd: i64, new: u64) -> SysResult {
+    let (old, new) = (read_cstr(old)?, read_cstr(new)?);
+    let old = vfs::lookup(&base_dir(old_dirfd, &old)?, &old, false)?.path;
+    let new = vfs::lookup_parent(&base_dir(new_dirfd, &new)?, &new).map(|(dir, name)| join(&dir.path, &name))?;
+    vfs::link("/", &old, &new).map(|()| 0)
+}
+
+fn join(dir: &str, name: &str) -> String {
+    if dir == "/" { alloc::format!("/{name}") } else { alloc::format!("{dir}/{name}") }
+}
+
+pub fn symlinkat(target: u64, dirfd: i64, path: u64) -> SysResult {
+    let (target, path) = (read_cstr(target)?, read_cstr(path)?);
+    if target.is_empty() {
+        return Err(ENOENT);
+    }
+    vfs::symlink(&target, &base_dir(dirfd, &path)?, &path).map(|()| 0)
+}
+
+pub fn readlinkat(dirfd: i64, path: u64, buf: u64, size: u64) -> SysResult {
+    let path = read_cstr(path)?;
+    let target = vfs::readlink(&base_dir(dirfd, &path)?, &path)?;
+    // Como no Linux: sem o zero no fim, e cortado se não couber.
+    let n = target.len().min(size as usize);
+    write_user(buf, &target.as_bytes()[..n])?;
+    Ok(n as i64)
+}
+
+pub fn ftruncate(fd: u64, size: u64) -> SysResult {
+    get_file(fd)?.truncate(size).map(|()| 0)
+}
+
+pub fn truncate(path: u64, size: u64) -> SysResult {
+    let path = read_cstr(path)?;
+    let cwd = with_process(|p| Ok(p.cwd.clone()))?;
+    vfs::resolve(&cwd, &path)?.truncate(size).map(|()| 0)
+}
+
+/// `utimensat`: só a hora de modificação existe; "agora" ou um valor dado.
+pub fn utimensat(dirfd: i64, path: u64, times: u64, flags: u64) -> SysResult {
+    const UTIME_NOW: u64 = 0x3FFF_FFFF;
+    const UTIME_OMIT: u64 = 0x3FFF_FFFE;
+    let node = if path == 0 {
+        get_file(dirfd as u64)?.node().cloned().ok_or(EINVAL)?
+    } else {
+        let path = read_cstr(path)?;
+        vfs::lookup(&base_dir(dirfd, &path)?, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?.node
+    };
+    // times[1] é a modificação (times[0], o acesso, não é guardado).
+    let mtime = if times == 0 {
+        rtc::now()
+    } else {
+        match read_u64(times + 24)? {
+            UTIME_OMIT => return Ok(0),
+            UTIME_NOW => rtc::now(),
+            _ => read_u64(times + 16)?,
+        }
+    };
+    node.set_mtime(mtime).map(|()| 0)
 }

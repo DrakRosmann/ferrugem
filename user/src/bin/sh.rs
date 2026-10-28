@@ -987,7 +987,8 @@ impl Shell {
         loop {
             self.collect();
             self.report(false);
-            if self.interactive && !pending.contains('\n') {
+            // Só no começo de uma linha: uma linha longa chega em vários `read`.
+            if self.interactive && pending.is_empty() {
                 self.prompt();
             }
             if let Some(end) = pending.find('\n') {

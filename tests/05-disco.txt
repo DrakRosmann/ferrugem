@@ -1,0 +1,104 @@
+# O ext2 no disco: arquivos, diretórios, links, arquivos grandes e
+# persistência depois de reiniciar. O e2fsck verifica o disco no fim.
+
+$ ls /
+bin  dev  etc  home  lost+found  mnt  tmp
+
+$ echo persistente > nota.txt; mkdir -p docs/fundo/mais; mkdir docs; echo $?
+mkdir: docs: arquivo já existe
+1
+
+$ echo dentro > docs/a.txt; cp docs/a.txt docs/b.txt; mv docs/b.txt c.txt; ls docs; cat c.txt
+a.txt  fundo
+dentro
+
+$ ln -s docs/a.txt atalho; ln c.txt duro; cat atalho
+dentro
+
+$ ls -l atalho duro
+lrwxrwxrwx  1       10 *-*-* *:* atalho -> docs/a.txt
+-rw-r--r--  2        7 *-*-* *:* duro
+
+# 330 KB: usa os blocos indiretos e duplamente indiretos do ext2.
+$ yes abcdefghij | head -n 30000 > grande; wc -c grande
+ 330000 grande
+
+$ cat grande | wc -l
+  30000
+
+# Um link relativo quebra quando o alvo muda de lugar.
+$ mv docs pasta; ls; cat atalho
+atalho  c.txt  duro  grande  leiame.txt  nota.txt  pasta  rust.txt
+cat: atalho: arquivo ou diretório não encontrado
+
+$ mv pasta pasta/fundo
+mv: pasta: argumento inválido
+
+# Entre /tmp (memória) e o disco, o mv copia e apaga.
+$ echo novo > /tmp/t; mv /tmp/t .; cat t; ls /tmp
+novo
+
+$ ln nota.txt /tmp/x
+ln: /tmp/x: entre sistemas de arquivos diferentes
+
+$ mkdir /tmp/v; rm -r /tmp; ls /tmp
+rm: /tmp: recurso ocupado
+
+$ rm grande duro; rm -r pasta; ls
+atalho  c.txt  leiame.txt  nota.txt  rust.txt  t
+
+@reiniciar
+
+$ cat nota.txt; ls
+persistente
+atalho  c.txt  leiame.txt  nota.txt  rust.txt  t
+
+$ cat /etc/motd
+FerrugemOS: os arquivos deste disco sobrevivem ao desligar.
+
+$ touch vazio; ls -l vazio
+-rw-r--r--  1        0 *-*-* *:* vazio
+
+$ date
+*-*-* *:*:* UTC
+
+# Diretório que cresce além de um bloco; apagar entradas no meio junta o
+# espaço delas à entrada anterior, e as novas reaproveitam os buracos.
+$ mkdir muitos; cd muitos; touch arquivo-de-nome-bem-comprido-000 arquivo-de-nome-bem-comprido-001 arquivo-de-nome-bem-comprido-002 arquivo-de-nome-bem-comprido-003 arquivo-de-nome-bem-comprido-004 arquivo-de-nome-bem-comprido-005 arquivo-de-nome-bem-comprido-006 arquivo-de-nome-bem-comprido-007 arquivo-de-nome-bem-comprido-008 arquivo-de-nome-bem-comprido-009 arquivo-de-nome-bem-comprido-010 arquivo-de-nome-bem-comprido-011 arquivo-de-nome-bem-comprido-012 arquivo-de-nome-bem-comprido-013 arquivo-de-nome-bem-comprido-014 arquivo-de-nome-bem-comprido-015 arquivo-de-nome-bem-comprido-016 arquivo-de-nome-bem-comprido-017 arquivo-de-nome-bem-comprido-018 arquivo-de-nome-bem-comprido-019 arquivo-de-nome-bem-comprido-020 arquivo-de-nome-bem-comprido-021 arquivo-de-nome-bem-comprido-022 arquivo-de-nome-bem-comprido-023 arquivo-de-nome-bem-comprido-024 arquivo-de-nome-bem-comprido-025 arquivo-de-nome-bem-comprido-026 arquivo-de-nome-bem-comprido-027 arquivo-de-nome-bem-comprido-028 arquivo-de-nome-bem-comprido-029 arquivo-de-nome-bem-comprido-030 arquivo-de-nome-bem-comprido-031 arquivo-de-nome-bem-comprido-032 arquivo-de-nome-bem-comprido-033 arquivo-de-nome-bem-comprido-034 arquivo-de-nome-bem-comprido-035 arquivo-de-nome-bem-comprido-036 arquivo-de-nome-bem-comprido-037 arquivo-de-nome-bem-comprido-038 arquivo-de-nome-bem-comprido-039
+$ touch arquivo-de-nome-bem-comprido-040 arquivo-de-nome-bem-comprido-041 arquivo-de-nome-bem-comprido-042 arquivo-de-nome-bem-comprido-043 arquivo-de-nome-bem-comprido-044 arquivo-de-nome-bem-comprido-045 arquivo-de-nome-bem-comprido-046 arquivo-de-nome-bem-comprido-047 arquivo-de-nome-bem-comprido-048 arquivo-de-nome-bem-comprido-049 arquivo-de-nome-bem-comprido-050 arquivo-de-nome-bem-comprido-051 arquivo-de-nome-bem-comprido-052 arquivo-de-nome-bem-comprido-053 arquivo-de-nome-bem-comprido-054 arquivo-de-nome-bem-comprido-055 arquivo-de-nome-bem-comprido-056 arquivo-de-nome-bem-comprido-057 arquivo-de-nome-bem-comprido-058 arquivo-de-nome-bem-comprido-059 arquivo-de-nome-bem-comprido-060 arquivo-de-nome-bem-comprido-061 arquivo-de-nome-bem-comprido-062 arquivo-de-nome-bem-comprido-063 arquivo-de-nome-bem-comprido-064 arquivo-de-nome-bem-comprido-065 arquivo-de-nome-bem-comprido-066 arquivo-de-nome-bem-comprido-067 arquivo-de-nome-bem-comprido-068 arquivo-de-nome-bem-comprido-069 arquivo-de-nome-bem-comprido-070 arquivo-de-nome-bem-comprido-071 arquivo-de-nome-bem-comprido-072 arquivo-de-nome-bem-comprido-073 arquivo-de-nome-bem-comprido-074 arquivo-de-nome-bem-comprido-075 arquivo-de-nome-bem-comprido-076 arquivo-de-nome-bem-comprido-077 arquivo-de-nome-bem-comprido-078 arquivo-de-nome-bem-comprido-079
+$ touch arquivo-de-nome-bem-comprido-080 arquivo-de-nome-bem-comprido-081 arquivo-de-nome-bem-comprido-082 arquivo-de-nome-bem-comprido-083 arquivo-de-nome-bem-comprido-084 arquivo-de-nome-bem-comprido-085 arquivo-de-nome-bem-comprido-086 arquivo-de-nome-bem-comprido-087 arquivo-de-nome-bem-comprido-088 arquivo-de-nome-bem-comprido-089 arquivo-de-nome-bem-comprido-090 arquivo-de-nome-bem-comprido-091 arquivo-de-nome-bem-comprido-092 arquivo-de-nome-bem-comprido-093 arquivo-de-nome-bem-comprido-094 arquivo-de-nome-bem-comprido-095 arquivo-de-nome-bem-comprido-096 arquivo-de-nome-bem-comprido-097 arquivo-de-nome-bem-comprido-098 arquivo-de-nome-bem-comprido-099 arquivo-de-nome-bem-comprido-100 arquivo-de-nome-bem-comprido-101 arquivo-de-nome-bem-comprido-102 arquivo-de-nome-bem-comprido-103 arquivo-de-nome-bem-comprido-104 arquivo-de-nome-bem-comprido-105 arquivo-de-nome-bem-comprido-106 arquivo-de-nome-bem-comprido-107 arquivo-de-nome-bem-comprido-108 arquivo-de-nome-bem-comprido-109 arquivo-de-nome-bem-comprido-110 arquivo-de-nome-bem-comprido-111 arquivo-de-nome-bem-comprido-112 arquivo-de-nome-bem-comprido-113 arquivo-de-nome-bem-comprido-114 arquivo-de-nome-bem-comprido-115 arquivo-de-nome-bem-comprido-116 arquivo-de-nome-bem-comprido-117 arquivo-de-nome-bem-comprido-118 arquivo-de-nome-bem-comprido-119; ls | wc -l
+    120
+
+$ rm arquivo-de-nome-bem-comprido-001 arquivo-de-nome-bem-comprido-003 arquivo-de-nome-bem-comprido-005 arquivo-de-nome-bem-comprido-007 arquivo-de-nome-bem-comprido-009 arquivo-de-nome-bem-comprido-011 arquivo-de-nome-bem-comprido-013 arquivo-de-nome-bem-comprido-015 arquivo-de-nome-bem-comprido-017 arquivo-de-nome-bem-comprido-019 arquivo-de-nome-bem-comprido-021 arquivo-de-nome-bem-comprido-023 arquivo-de-nome-bem-comprido-025 arquivo-de-nome-bem-comprido-027 arquivo-de-nome-bem-comprido-029 arquivo-de-nome-bem-comprido-031 arquivo-de-nome-bem-comprido-033 arquivo-de-nome-bem-comprido-035 arquivo-de-nome-bem-comprido-037 arquivo-de-nome-bem-comprido-039 arquivo-de-nome-bem-comprido-041 arquivo-de-nome-bem-comprido-043 arquivo-de-nome-bem-comprido-045 arquivo-de-nome-bem-comprido-047 arquivo-de-nome-bem-comprido-049 arquivo-de-nome-bem-comprido-051 arquivo-de-nome-bem-comprido-053 arquivo-de-nome-bem-comprido-055 arquivo-de-nome-bem-comprido-057 arquivo-de-nome-bem-comprido-059
+$ rm arquivo-de-nome-bem-comprido-061 arquivo-de-nome-bem-comprido-063 arquivo-de-nome-bem-comprido-065 arquivo-de-nome-bem-comprido-067 arquivo-de-nome-bem-comprido-069 arquivo-de-nome-bem-comprido-071 arquivo-de-nome-bem-comprido-073 arquivo-de-nome-bem-comprido-075 arquivo-de-nome-bem-comprido-077 arquivo-de-nome-bem-comprido-079 arquivo-de-nome-bem-comprido-081 arquivo-de-nome-bem-comprido-083 arquivo-de-nome-bem-comprido-085 arquivo-de-nome-bem-comprido-087 arquivo-de-nome-bem-comprido-089 arquivo-de-nome-bem-comprido-091 arquivo-de-nome-bem-comprido-093 arquivo-de-nome-bem-comprido-095 arquivo-de-nome-bem-comprido-097 arquivo-de-nome-bem-comprido-099 arquivo-de-nome-bem-comprido-101 arquivo-de-nome-bem-comprido-103 arquivo-de-nome-bem-comprido-105 arquivo-de-nome-bem-comprido-107 arquivo-de-nome-bem-comprido-109 arquivo-de-nome-bem-comprido-111 arquivo-de-nome-bem-comprido-113 arquivo-de-nome-bem-comprido-115 arquivo-de-nome-bem-comprido-117 arquivo-de-nome-bem-comprido-119; ls | wc -l
+     60
+
+$ touch novo-00 novo-01 novo-02 novo-03 novo-04 novo-05 novo-06 novo-07 novo-08 novo-09 novo-10 novo-11 novo-12 novo-13 novo-14 novo-15 novo-16 novo-17 novo-18 novo-19 novo-20 novo-21 novo-22 novo-23 novo-24 novo-25 novo-26 novo-27 novo-28 novo-29 novo-30 novo-31 novo-32 novo-33 novo-34 novo-35 novo-36 novo-37 novo-38 novo-39 novo-40 novo-41 novo-42 novo-43 novo-44 novo-45 novo-46 novo-47 novo-48 novo-49 novo-50 novo-51 novo-52 novo-53 novo-54 novo-55 novo-56 novo-57 novo-58 novo-59; ls | wc -l; ls | grep -c novo
+    120
+60
+
+$ rm arquivo-de-nome-bem-comprido-000 arquivo-de-nome-bem-comprido-002 arquivo-de-nome-bem-comprido-004 arquivo-de-nome-bem-comprido-006 arquivo-de-nome-bem-comprido-008 arquivo-de-nome-bem-comprido-010 arquivo-de-nome-bem-comprido-012 arquivo-de-nome-bem-comprido-014 arquivo-de-nome-bem-comprido-016 arquivo-de-nome-bem-comprido-018 arquivo-de-nome-bem-comprido-020 arquivo-de-nome-bem-comprido-022 arquivo-de-nome-bem-comprido-024 arquivo-de-nome-bem-comprido-026 arquivo-de-nome-bem-comprido-028 arquivo-de-nome-bem-comprido-030 arquivo-de-nome-bem-comprido-032 arquivo-de-nome-bem-comprido-034 arquivo-de-nome-bem-comprido-036 arquivo-de-nome-bem-comprido-038 arquivo-de-nome-bem-comprido-040 arquivo-de-nome-bem-comprido-042 arquivo-de-nome-bem-comprido-044 arquivo-de-nome-bem-comprido-046 arquivo-de-nome-bem-comprido-048 arquivo-de-nome-bem-comprido-050 arquivo-de-nome-bem-comprido-052 arquivo-de-nome-bem-comprido-054 arquivo-de-nome-bem-comprido-056 arquivo-de-nome-bem-comprido-058
+$ rm arquivo-de-nome-bem-comprido-060 arquivo-de-nome-bem-comprido-062 arquivo-de-nome-bem-comprido-064 arquivo-de-nome-bem-comprido-066 arquivo-de-nome-bem-comprido-068 arquivo-de-nome-bem-comprido-070 arquivo-de-nome-bem-comprido-072 arquivo-de-nome-bem-comprido-074 arquivo-de-nome-bem-comprido-076 arquivo-de-nome-bem-comprido-078 arquivo-de-nome-bem-comprido-080 arquivo-de-nome-bem-comprido-082 arquivo-de-nome-bem-comprido-084 arquivo-de-nome-bem-comprido-086 arquivo-de-nome-bem-comprido-088 arquivo-de-nome-bem-comprido-090 arquivo-de-nome-bem-comprido-092 arquivo-de-nome-bem-comprido-094 arquivo-de-nome-bem-comprido-096 arquivo-de-nome-bem-comprido-098 arquivo-de-nome-bem-comprido-100 arquivo-de-nome-bem-comprido-102 arquivo-de-nome-bem-comprido-104 arquivo-de-nome-bem-comprido-106 arquivo-de-nome-bem-comprido-108 arquivo-de-nome-bem-comprido-110 arquivo-de-nome-bem-comprido-112 arquivo-de-nome-bem-comprido-114 arquivo-de-nome-bem-comprido-116 arquivo-de-nome-bem-comprido-118 novo-00 novo-01 novo-02 novo-03 novo-04 novo-05 novo-06 novo-07 novo-08 novo-09 novo-10 novo-11 novo-12 novo-13 novo-14 novo-15 novo-16 novo-17 novo-18 novo-19 novo-20 novo-21 novo-22 novo-23 novo-24 novo-25 novo-26 novo-27 novo-28 novo-29 novo-30 novo-31 novo-32 novo-33 novo-34 novo-35 novo-36 novo-37 novo-38 novo-39 novo-40 novo-41 novo-42 novo-43 novo-44 novo-45 novo-46 novo-47 novo-48 novo-49 novo-50 novo-51 novo-52 novo-53 novo-54 novo-55 novo-56 novo-57 novo-58 novo-59; ls | wc -l; cd ..; rm -r muitos; ls
+      0
+atalho  c.txt  leiame.txt  nota.txt  rust.txt  t  vazio
+
+# Cortes no meio da árvore de blocos: diretos, indiretos e duplamente
+# indiretos (com blocos de 1 KiB, a partir de 12 KiB e de 268 KiB).
+$ yes 0123456789abcdefghijklmnopqrstuvwxyz | head -n 20000 > corte; wc -c corte
+ 740000 corte
+
+$ truncate -s 300K corte; wc -c corte; head -n 1 corte
+ 307200 corte
+0123456789abcdefghijklmnopqrstuvwxyz
+
+$ truncate -s 100K corte; wc -c corte; truncate -s 5000 corte; wc -c corte
+ 102400 corte
+   5000 corte
+
+# Estender completa com zeros: só restam as 135 linhas dos 5000 bytes.
+$ truncate -s 1M corte; wc -c corte; cat corte | wc -l
+1048576 corte
+    135
+
+$ truncate -s 0 corte; wc -c corte; rm corte
+      0 corte

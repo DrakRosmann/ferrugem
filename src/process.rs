@@ -20,7 +20,7 @@ use crate::paging::{AddressSpace, COPY_ON_WRITE, NO_EXECUTE, USER_TOP, WRITABLE}
 use crate::signal::SignalState;
 use crate::syscall::{E2BIG, EACCES, EFAULT, EINVAL, ENOEXEC, ENOMEM, Errno};
 use crate::task::{self, Pid, WaitStatus};
-use crate::vfs::{self, NodeKind};
+use crate::vfs::{self, Kind};
 
 /// A pilha cresce para baixo a partir daqui, até `STACK_MAX_SIZE`.
 const STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
@@ -359,10 +359,10 @@ fn build_initial_stack(space: &mut AddressSpace, args: &[&str], env: &[&str], en
 }
 
 fn file_contents(cwd: &str, path: &str) -> Result<Vec<u8>, Errno> {
-    match &vfs::resolve(cwd, path)?.kind {
-        NodeKind::File(data) => Ok(data.lock().clone()),
-        _ => Err(EACCES),
+    if vfs::resolve(cwd, path)?.kind() != Kind::File {
+        return Err(EACCES);
     }
+    vfs::read_file(cwd, path)
 }
 
 fn basename(path: &str) -> &str {
