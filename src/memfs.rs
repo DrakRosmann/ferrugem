@@ -7,7 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::rtc;
 use crate::sync::SpinLock;
@@ -37,7 +37,9 @@ enum Data {
 pub struct MemNode {
     fs: Arc<Shared>,
     ino: u64,
-    permissions: u32,
+    permissions: AtomicU32,
+    uid: AtomicU32,
+    gid: AtomicU32,
     links: AtomicU64,
     mtime: AtomicU64,
     data: Data,
@@ -48,7 +50,9 @@ impl MemNode {
         Arc::new(MemNode {
             fs: fs.clone(),
             ino: fs.next_ino.fetch_add(1, Ordering::Relaxed),
-            permissions,
+            permissions: AtomicU32::new(permissions),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
             links: AtomicU64::new(1),
             mtime: AtomicU64::new(rtc::now()),
             data,
@@ -149,7 +153,30 @@ impl Inode for MemNode {
     }
 
     fn mode(&self) -> u32 {
-        self.kind().type_bits() | self.permissions
+        self.kind().type_bits() | self.permissions.load(Ordering::Relaxed)
+    }
+
+    fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Relaxed)
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Relaxed)
+    }
+
+    fn set_permissions(&self, permissions: u32) -> Result<(), Errno> {
+        self.permissions.store(permissions & 0o7777, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        if let Some(uid) = uid {
+            self.uid.store(uid, Ordering::Relaxed);
+        }
+        if let Some(gid) = gid {
+            self.gid.store(gid, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn size(&self) -> u64 {

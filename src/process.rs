@@ -89,6 +89,8 @@ pub struct Process {
     /// Diretório atual, sempre um caminho absoluto normalizado.
     pub cwd: String,
     pub signals: SignalState,
+    /// Permissões tiradas dos arquivos e diretórios criados.
+    pub umask: u32,
 }
 
 impl Process {
@@ -218,6 +220,7 @@ impl Process {
             fds: self.fds.clone(),
             cwd: self.cwd.clone(),
             signals: self.signals.clone(),
+            umask: self.umask,
         })
     }
 }
@@ -386,6 +389,7 @@ pub fn spawn(path: &str, args: &[&str], env: &[&str], foreground: bool) -> Resul
         fds: FdTable::with_console(),
         cwd: "/home".to_string(),
         signals: SignalState::new(),
+        umask: 0o022,
     };
     Ok(cpu::without_interrupts(|| {
         let pid = task::spawn_user(basename(path), process, image.entry, image.rsp);

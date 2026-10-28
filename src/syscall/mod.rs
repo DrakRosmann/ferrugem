@@ -121,6 +121,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_STAT: u64 = 4;
+const SYS_POLL: u64 = 7;
 const SYS_FSTAT: u64 = 5;
 const SYS_LSTAT: u64 = 6;
 const SYS_LSEEK: u64 = 8;
@@ -131,15 +132,19 @@ const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_RT_SIGRETURN: u64 = 15;
 const SYS_IOCTL: u64 = 16;
+const SYS_PREAD64: u64 = 17;
+const SYS_PWRITE64: u64 = 18;
 const SYS_READV: u64 = 19;
 const SYS_WRITEV: u64 = 20;
 const SYS_ACCESS: u64 = 21;
 const SYS_PIPE: u64 = 22;
+const SYS_SELECT: u64 = 23;
 const SYS_SCHED_YIELD: u64 = 24;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_GETPID: u64 = 39;
+const SYS_SENDFILE: u64 = 40;
 const SYS_CLONE: u64 = 56;
 const SYS_FORK: u64 = 57;
 const SYS_VFORK: u64 = 58;
@@ -162,6 +167,13 @@ const SYS_LINK: u64 = 86;
 const SYS_UNLINK: u64 = 87;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
+const SYS_CHMOD: u64 = 90;
+const SYS_FCHMOD: u64 = 91;
+const SYS_CHOWN: u64 = 92;
+const SYS_FCHOWN: u64 = 93;
+const SYS_LCHOWN: u64 = 94;
+const SYS_UMASK: u64 = 95;
+const SYS_SYSINFO: u64 = 99;
 const SYS_GETUID: u64 = 102;
 const SYS_GETGID: u64 = 104;
 const SYS_GETEUID: u64 = 107;
@@ -169,6 +181,8 @@ const SYS_GETEGID: u64 = 108;
 const SYS_SETPGID: u64 = 109;
 const SYS_GETPPID: u64 = 110;
 const SYS_GETPGRP: u64 = 111;
+const SYS_RT_SIGSUSPEND: u64 = 130;
+const SYS_GETGROUPS: u64 = 115;
 const SYS_SETSID: u64 = 112;
 const SYS_GETPGID: u64 = 121;
 const SYS_GETSID: u64 = 124;
@@ -182,12 +196,16 @@ const SYS_EXIT_GROUP: u64 = 231;
 const SYS_OPENAT: u64 = 257;
 const SYS_MKDIRAT: u64 = 258;
 const SYS_NEWFSTATAT: u64 = 262;
+const SYS_FCHOWNAT: u64 = 260;
 const SYS_UNLINKAT: u64 = 263;
 const SYS_RENAMEAT: u64 = 264;
 const SYS_LINKAT: u64 = 265;
 const SYS_SYMLINKAT: u64 = 266;
 const SYS_READLINKAT: u64 = 267;
+const SYS_FCHMODAT: u64 = 268;
 const SYS_FACCESSAT: u64 = 269;
+const SYS_PSELECT6: u64 = 270;
+const SYS_PPOLL: u64 = 271;
 const SYS_UTIMENSAT: u64 = 280;
 const SYS_DUP3: u64 = 292;
 const SYS_PIPE2: u64 = 293;
@@ -239,6 +257,21 @@ pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
         SYS_TRUNCATE => fs::truncate(a[0], a[1]),
         SYS_FTRUNCATE => fs::ftruncate(a[0], a[1]),
         SYS_UTIMENSAT => fs::utimensat(a[0] as i64, a[1], a[2], a[3]),
+        SYS_CHMOD => fs::fchmodat(fs::AT_FDCWD, a[0], a[1]),
+        SYS_FCHMOD => fs::fchmod(a[0], a[1]),
+        SYS_FCHMODAT => fs::fchmodat(a[0] as i64, a[1], a[2]),
+        SYS_CHOWN => fs::fchownat(fs::AT_FDCWD, a[0], a[1], a[2], 0),
+        SYS_LCHOWN => fs::fchownat(fs::AT_FDCWD, a[0], a[1], a[2], fs::AT_SYMLINK_NOFOLLOW),
+        SYS_FCHOWN => fs::fchown(a[0], a[1], a[2]),
+        SYS_FCHOWNAT => fs::fchownat(a[0] as i64, a[1], a[2], a[3], a[4]),
+        SYS_UMASK => fs::umask(a[0]),
+        SYS_PREAD64 => fs::pread(a[0], a[1], a[2], a[3]),
+        SYS_PWRITE64 => fs::pwrite(a[0], a[1], a[2], a[3]),
+        SYS_SENDFILE => fs::sendfile(a[0], a[1], a[2], a[3]),
+        SYS_POLL => fs::poll(a[0], a[1], a[2] as i32 as i64),
+        SYS_PPOLL => fs::ppoll(a[0], a[1], a[2]),
+        SYS_SELECT => fs::timeval_ms(a[4]).and_then(|ms| fs::select(a[0], [a[1], a[2], a[3]], ms)),
+        SYS_PSELECT6 => fs::pselect(a[0], [a[1], a[2], a[3]], a[4]),
         // Cada escrita já vai direto para o disco: não há o que sincronizar.
         SYS_SYNC | SYS_FSYNC | SYS_FDATASYNC => Ok(0),
 
@@ -257,6 +290,7 @@ pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
         SYS_KILL => proc::kill(a[0] as i64, a[1]),
         SYS_RT_SIGACTION => proc::rt_sigaction(a[0], a[1], a[2]),
         SYS_RT_SIGPROCMASK => proc::rt_sigprocmask(a[0], a[1], a[2]),
+        SYS_RT_SIGSUSPEND => proc::rt_sigsuspend(a[0]),
         SYS_RT_SIGRETURN => {
             if signal::sigreturn(frame).is_err() {
                 task::force_signal_current(signal::SIGSEGV);
@@ -271,6 +305,7 @@ pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
         SYS_SETSID => task::new_session().map(|sid| sid as i64),
         SYS_GETSID => proc::getsid(a[0]),
         SYS_GETUID | SYS_GETGID | SYS_GETEUID | SYS_GETEGID => Ok(0), // só existe o usuário 0
+        SYS_GETGROUPS => Ok(0), // nenhum grupo suplementar
 
         // Memória, tempo e outras
         SYS_MMAP => mmap(a[1], a[2], a[3], a[4] as i64),
@@ -282,6 +317,7 @@ pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
         }
         SYS_NANOSLEEP => nanosleep(a[0]),
         SYS_UNAME => uname(a[0]),
+        SYS_SYSINFO => sysinfo(a[0]),
         SYS_ARCH_PRCTL => arch_prctl(a[0], a[1]),
         SYS_CLOCK_GETTIME => clock_gettime(a[0], a[1]),
         number => {
@@ -291,7 +327,9 @@ pub fn dispatch(frame: &mut InterruptFrame) -> *mut InterruptFrame {
         }
     };
 
-    let interrupted = (result == Err(EINTR)).then_some(number);
+    // Uma syscall interrompida pode ser reiniciada (SA_RESTART), menos o
+    // rt_sigsuspend, que existe justamente para voltar com EINTR.
+    let interrupted = (result == Err(EINTR) && number != SYS_RT_SIGSUSPEND).then_some(number);
     frame.rax = match result {
         Ok(value) => value as u64,
         Err(errno) => (-errno) as u64,
@@ -382,10 +420,23 @@ fn nanosleep(request: u64) -> SysResult {
 fn uname(buf: u64) -> SysResult {
     let out = user_slice(buf, 6 * 65, true)?;
     out.fill(0);
-    let fields = ["FerrugemOS", "ferrugem", env!("CARGO_PKG_VERSION"), "#1 (fase 2)", "x86_64", ""];
+    let fields = ["FerrugemOS", "ferrugem", env!("CARGO_PKG_VERSION"), "#1 (fase 3: busybox)", "x86_64", ""];
     for (i, field) in fields.iter().enumerate() {
         out[i * 65..i * 65 + field.len()].copy_from_slice(field.as_bytes());
     }
+    Ok(0)
+}
+
+/// `sysinfo`: tempo ligado, memória e número de processos.
+fn sysinfo(buf: u64) -> SysResult {
+    let (total, free) = crate::memory::stats();
+    let mut info = [0u8; 112];
+    info[0..8].copy_from_slice(&(timer::uptime_ms() / 1000).to_le_bytes());
+    info[32..40].copy_from_slice(&total.to_le_bytes()); // totalram
+    info[40..48].copy_from_slice(&free.to_le_bytes()); // freeram
+    info[80..82].copy_from_slice(&(task::count() as u16).to_le_bytes()); // procs
+    info[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit: bytes
+    write_user(buf, &info)?;
     Ok(0)
 }
 

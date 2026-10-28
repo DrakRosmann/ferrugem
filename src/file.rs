@@ -50,6 +50,8 @@ pub struct Stat {
     pub dev: u64,
     pub ino: u64,
     pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub size: u64,
     pub rdev: u64,
     pub nlink: u64,
@@ -61,6 +63,8 @@ pub fn node_stat(node: &NodeRef) -> Stat {
         dev: node.dev(),
         ino: node.ino(),
         mode: node.mode(),
+        uid: node.uid(),
+        gid: node.gid(),
         size: node.size(),
         rdev: node.rdev(),
         nlink: node.nlink(),
@@ -198,12 +202,68 @@ impl OpenFile {
         Ok(target as u64)
     }
 
+    /// Eventos de `poll` prontos agora (POLLIN, POLLOUT, POLLHUP, POLLERR).
+    pub fn poll(&self) -> u16 {
+        const POLLIN: u16 = 0x1;
+        const POLLOUT: u16 = 0x4;
+        const POLLERR: u16 = 0x8;
+        const POLLHUP: u16 = 0x10;
+        match &self.kind {
+            FileKind::Pipe(end) => {
+                let (readable, writable, closed) = end.readiness();
+                let mut events = 0;
+                if readable {
+                    events |= POLLIN;
+                }
+                if writable {
+                    events |= POLLOUT;
+                }
+                if closed {
+                    events |= if end.is_writer() { POLLERR } else { POLLHUP };
+                }
+                events
+            }
+            FileKind::Device(Device::Tty) => POLLOUT | if tty::readable() { POLLIN } else { 0 },
+            _ => POLLIN | POLLOUT, // arquivos e /dev/null nunca bloqueiam
+        }
+    }
+
+    /// `pread64`: lê de uma posição sem mexer na posição do arquivo.
+    pub fn read_at(&self, offset: u64, max: usize) -> Result<Vec<u8>, Errno> {
+        let FileKind::Node { node, .. } = &self.kind else { return Err(ESPIPE) };
+        if !self.readable() {
+            return Err(EBADF);
+        }
+        let mut data = vec![0; (max as u64).min(node.size().saturating_sub(offset)).min(1 << 20) as usize];
+        let n = node.read_at(offset, &mut data)?;
+        data.truncate(n);
+        Ok(data)
+    }
+
+    pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize, Errno> {
+        let FileKind::Node { node, .. } = &self.kind else { return Err(ESPIPE) };
+        if !self.writable() {
+            return Err(EBADF);
+        }
+        node.write_at(offset, bytes)
+    }
+
     pub fn stat(&self) -> Stat {
         match &self.kind {
             FileKind::Node { node, .. } => node_stat(node),
-            FileKind::Pipe(_) => Stat { dev: 0, ino: 0, mode: S_IFIFO | 0o600, size: 0, rdev: 0, nlink: 1, mtime: 0 },
+            FileKind::Pipe(_) => Stat { dev: 0, ino: 0, mode: S_IFIFO | 0o600, uid: 0, gid: 0, size: 0, rdev: 0, nlink: 1, mtime: 0 },
             FileKind::Device(device) => {
-                Stat { dev: 0, ino: 0, mode: S_IFCHR | 0o666, size: 0, rdev: device.rdev(), nlink: 1, mtime: 0 }
+                Stat {
+                dev: 0,
+                ino: 0,
+                mode: S_IFCHR | 0o666,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                rdev: device.rdev(),
+                nlink: 1,
+                mtime: 0,
+            }
             }
         }
     }

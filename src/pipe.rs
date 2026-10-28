@@ -109,6 +109,20 @@ impl PipeEnd {
     }
 }
 
+impl PipeEnd {
+    /// Para `poll`: (dá para ler, dá para escrever, a outra ponta fechou).
+    pub fn readiness(&self) -> (bool, bool, bool) {
+        let used = self.pipe.buffer.lock().len();
+        if self.writer {
+            let closed = self.pipe.readers.load(Ordering::Acquire) == 0;
+            (false, used < CAPACITY || closed, closed)
+        } else {
+            let closed = self.pipe.writers.load(Ordering::Acquire) == 0;
+            (used > 0 || closed, false, closed)
+        }
+    }
+}
+
 impl Drop for PipeEnd {
     fn drop(&mut self) {
         let counter = if self.writer { &self.pipe.writers } else { &self.pipe.readers };

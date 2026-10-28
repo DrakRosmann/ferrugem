@@ -2,7 +2,7 @@
 
 $ ola a "b c"
 Olá do espaço de usuário! Sou o processo *.
-Rodando em FerrugemOS 0.2.0 (x86_64).
+Rodando em FerrugemOS 0.3.0 (x86_64).
 Nível de privilégio da CPU: anel 3 (CS = 0x23).
 Argumentos (3): ["ola", "a", "b c"]
 
@@ -48,4 +48,4 @@ pilha: recursão de 2000 níveis (~1 MiB) devolveu 2000
 pausando 100 ms (veja a coluna MEMÓRIA no `ps`)...
 
 $ ls /dev
-console  null  tty  zero
+console  null     tty      zero

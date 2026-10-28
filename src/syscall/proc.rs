@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{
-    EINVAL, ENOSYS, Errno, SysResult, read_cstr, read_cstr_array, read_u64, user_slice, with_process, write_user,
+    EINTR, EINVAL, ENOSYS, Errno, SysResult, read_cstr, read_cstr_array, read_u64, user_slice, with_process, write_user,
 };
 use crate::interrupts::InterruptFrame;
 use crate::process;
@@ -140,4 +140,19 @@ pub fn getsid(pid: u64) -> SysResult {
         return Ok(task::current_ids().3 as i64);
     }
     task::ids_of(pid as Pid).map(|(_, sid)| sid as i64)
+}
+
+/// `rt_sigsuspend`: troca a máscara de sinais e dorme até chegar um sinal
+/// que precise ser entregue. Sempre volta com EINTR.
+pub fn rt_sigsuspend(mask: u64) -> SysResult {
+    let mask = read_u64(mask)?;
+    with_process(|p| {
+        p.signals.suspended_mask = Some(p.signals.mask);
+        p.signals.mask = mask & !UNBLOCKABLE;
+        Ok(())
+    })?;
+    while !task::signal_pending() {
+        task::sleep_ms(60 * 60 * 1000); // um sinal acorda antes
+    }
+    Err(EINTR)
 }

@@ -28,8 +28,8 @@ entry!(main);
 /// Sinais de controle de jobs: o shell interativo os ignora (só um Ctrl+C
 /// interrompe a leitura do prompt) e os filhos voltam ao padrão.
 const JOB_SIGNALS: [u32; 4] = [sys::SIGQUIT, sys::SIGTSTP, sys::SIGTTIN, sys::SIGTTOU];
-const BUILTINS: [&str; 12] =
-    ["cd", "pwd", "exit", "export", "unset", "jobs", "fg", "bg", "wait", "kill", "ajuda", "help"];
+const BUILTINS: [&str; 13] =
+    ["cd", "pwd", "exit", "export", "unset", "jobs", "fg", "bg", "wait", "kill", "umask", "ajuda", "help"];
 const F_DUPFD_CLOEXEC: u64 = 1030;
 /// Os de dois caracteres vêm antes, para `>>` não ser lido como `>` `>`.
 const OPERATORS: [&str; 10] = ["||", "&&", ">>", ">&", "<&", "|", "&", ";", "<", ">"];
@@ -329,7 +329,7 @@ impl Shell {
     fn new() -> Self {
         let mut env: Vec<String> = rt::env().map(String::from).collect();
         if !env.iter().any(|e| e.starts_with("PATH=")) {
-            env.push(String::from("PATH=/bin"));
+            env.push(String::from("PATH=/bin:/sbin:/usr/bin:/usr/sbin"));
         }
         Shell {
             env,
@@ -941,6 +941,25 @@ impl Shell {
             "fg" | "bg" => self.resume(&args),
             "wait" => self.wait_all(),
             "kill" => self.kill(&args),
+            "umask" => match args.get(1) {
+                // Sem argumento, mostra; com um número octal, troca.
+                None => {
+                    let mask = sys::umask(0);
+                    sys::umask(mask);
+                    println!("{mask:04o}");
+                    0
+                }
+                Some(text) => match u32::from_str_radix(text, 8) {
+                    Ok(mask) if mask <= 0o777 => {
+                        sys::umask(mask);
+                        0
+                    }
+                    _ => {
+                        eprintln!("umask: {text}: número octal inválido");
+                        1
+                    }
+                },
+            },
             "ajuda" | "help" => {
                 help();
                 0
@@ -1031,6 +1050,7 @@ fn help() {
         ("jobs  fg [%n]  bg [%n]", "controle de jobs (Ctrl+Z para o atual)"),
         ("wait  kill %n", "espera os jobs / envia um sinal a um job"),
         ("cd  pwd  export  unset", "diretório e variáveis"),
+        ("umask [modo]", "permissões tiradas dos arquivos novos"),
         ("$VAR ${VAR} $? $$ $! ~", "expansões (também $0..$9, $#, $@)"),
         ("exit [n]", "sai do shell (Ctrl+D também)"),
     ];

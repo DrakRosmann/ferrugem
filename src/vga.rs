@@ -88,12 +88,13 @@ pub const fn attr(fg: Color, bg: Color) -> u8 {
 pub const DEFAULT_ATTR: u8 = attr(Color::LightGray, Color::Black);
 pub const STATUS_ATTR: u8 = attr(Color::White, Color::Blue);
 
-/// Estado do interpretador de sequências ANSI (ESC [ parâmetros letra).
+/// Estado do interpretador de sequências ANSI: `ESC [ parâmetros letra`
+/// (CSI, com `?` nas sequências privadas) ou `ESC letra`.
 #[derive(Clone, Copy)]
 enum Escape {
     None,
     Started,
-    Params { values: [u16; 4], count: usize },
+    Params { values: [u16; 8], count: usize, private: bool },
 }
 
 pub struct Writer {
@@ -101,10 +102,17 @@ pub struct Writer {
     col: usize,
     attr: u8,
     escape: Escape,
+    /// Posição guardada por `ESC 7` / `ESC[s`.
+    saved: (usize, usize),
 }
 
-pub static WRITER: SpinLock<Writer> =
-    SpinLock::new(Writer { row: TOP, col: 0, attr: DEFAULT_ATTR, escape: Escape::None });
+pub static WRITER: SpinLock<Writer> = SpinLock::new(Writer {
+    row: TOP,
+    col: 0,
+    attr: DEFAULT_ATTR,
+    escape: Escape::None,
+    saved: (TOP, 0),
+});
 
 pub fn put(row: usize, col: usize, byte: u8, attr: u8) {
     if row < HEIGHT && col < WIDTH {
@@ -184,28 +192,103 @@ impl Writer {
         }
     }
 
-    /// Processa um caractere, interpretando as sequências ANSI mais comuns:
-    /// cores (SGR, `ESC[...m`), limpar a tela (`ESC[2J`), cursor ao início
-    /// (`ESC[H`) e apagar até o fim da linha (`ESC[K`).
+    /// Processa um caractere, interpretando as sequências ANSI de um
+    /// terminal "linux"/"vt100": cores, posição do cursor, apagar e inserir
+    /// linhas e caracteres. É o bastante para editores como o `vi`.
     fn write_char(&mut self, ch: char) {
         match (self.escape, ch) {
             (Escape::None, '\x1b') => self.escape = Escape::Started,
             (Escape::None, ch) => self.write_byte(to_cp437(ch)),
-            (Escape::Started, '[') => self.escape = Escape::Params { values: [0; 4], count: 0 },
-            (Escape::Started, _) => self.escape = Escape::None,
-            (Escape::Params { mut values, count }, '0'..='9') => {
-                if count < values.len() {
-                    values[count] = values[count].saturating_mul(10) + ch as u16 - '0' as u16;
-                }
-                self.escape = Escape::Params { values, count };
-            }
-            (Escape::Params { values, count }, ';') => {
-                self.escape = Escape::Params { values, count: (count + 1).min(values.len()) }
-            }
-            (Escape::Params { values, count }, command) => {
+            (Escape::Started, '[') => self.escape = Escape::Params { values: [0; 8], count: 0, private: false },
+            (Escape::Started, ch) => {
                 self.escape = Escape::None;
-                self.apply_escape(command, &values[..(count + 1).min(values.len())]);
+                match ch {
+                    '7' => self.saved = (self.row, self.col),
+                    '8' => (self.row, self.col) = self.saved,
+                    'M' => self.reverse_index(),
+                    'D' => self.newline_keep_column(),
+                    'c' => {
+                        self.attr = DEFAULT_ATTR;
+                        self.clear();
+                    }
+                    _ => {}
+                }
             }
+            (Escape::Params { values, count, .. }, '?') if count == 0 && values[0] == 0 => {
+                self.escape = Escape::Params { values, count, private: true };
+            }
+            (Escape::Params { mut values, count, private }, '0'..='9') => {
+                if count < values.len() {
+                    values[count] = values[count].saturating_mul(10).saturating_add(ch as u16 - '0' as u16);
+                }
+                self.escape = Escape::Params { values, count, private };
+            }
+            (Escape::Params { values, count, private }, ';') => {
+                self.escape = Escape::Params { values, count: (count + 1).min(values.len()), private }
+            }
+            (Escape::Params { values, count, private }, command) => {
+                self.escape = Escape::None;
+                if !private {
+                    // Sequências privadas (`ESC[?25l`, mostrar/esconder o
+                    // cursor...) são ignoradas.
+                    self.apply_escape(command, &values[..(count + 1).min(values.len())]);
+                }
+            }
+        }
+    }
+
+    /// Linhas e colunas na tela: as linhas do terminal vão de TOP a HEIGHT-1.
+    fn move_to(&mut self, row: usize, col: usize) {
+        self.row = row.clamp(TOP, HEIGHT - 1);
+        self.col = col.min(WIDTH - 1);
+    }
+
+    fn copy_row(&self, from: usize, to: usize) {
+        for col in 0..WIDTH {
+            unsafe { BUFFER.add(to * WIDTH + col).write_volatile(get(from, col)) }
+        }
+    }
+
+    /// Insere `count` linhas em branco na linha do cursor (as de baixo descem).
+    fn insert_lines(&mut self, count: usize) {
+        let count = count.min(HEIGHT - self.row);
+        for row in (self.row + count..HEIGHT).rev() {
+            self.copy_row(row - count, row);
+        }
+        for row in self.row..self.row + count {
+            self.clear_row(row);
+        }
+    }
+
+    /// Apaga `count` linhas a partir do cursor (as de baixo sobem).
+    fn delete_lines(&mut self, count: usize) {
+        let count = count.min(HEIGHT - self.row);
+        for row in self.row..HEIGHT - count {
+            self.copy_row(row + count, row);
+        }
+        for row in HEIGHT - count..HEIGHT {
+            self.clear_row(row);
+        }
+    }
+
+    /// `ESC M`: sobe uma linha; no topo, a tela rola para baixo.
+    fn reverse_index(&mut self) {
+        if self.row > TOP {
+            self.row -= 1;
+        } else {
+            self.insert_lines(1);
+        }
+    }
+
+    fn newline_keep_column(&mut self) {
+        let col = self.col;
+        self.newline();
+        self.col = col;
+    }
+
+    fn erase(&self, row: usize, cols: core::ops::Range<usize>) {
+        for col in cols {
+            put(row, col, b' ', self.attr);
         }
     }
 
@@ -213,6 +296,8 @@ impl Writer {
         // Ordem ANSI (preto, vermelho, verde, amarelo, azul, magenta, ciano,
         // branco) nos índices de cor da VGA.
         const ANSI_TO_VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+        let first = params[0] as usize;
+        let n = first.max(1); // contagem, com 1 como padrão
         match command {
             'm' => {
                 for &p in params {
@@ -220,6 +305,9 @@ impl Writer {
                     self.attr = match p {
                         0 => DEFAULT_ATTR,
                         1 => self.attr | 0x08,
+                        22 => self.attr & !0x08,
+                        7 => self.attr.rotate_left(4), // vídeo reverso: troca frente e fundo
+                        27 => DEFAULT_ATTR,
                         30..=37 => (self.attr & 0xF8) | ANSI_TO_VGA[(p - 30) as usize],
                         90..=97 => (self.attr & 0xF0) | ANSI_TO_VGA[(p - 90) as usize] | 0x08,
                         39 => (self.attr & 0xF0) | (DEFAULT_ATTR & 0x0F),
@@ -229,17 +317,63 @@ impl Writer {
                     };
                 }
             }
-            'J' if params[0] == 2 => self.clear(),
-            'H' => {
-                self.row = TOP;
-                self.col = 0;
+            'H' | 'f' => {
+                let col = params.get(1).copied().unwrap_or(0).max(1) as usize;
+                self.move_to(TOP + n - 1, col - 1);
             }
-            'K' => {
-                for col in self.col..WIDTH {
-                    put(self.row, col, b' ', self.attr);
+            'A' => self.move_to(self.row.saturating_sub(n).max(TOP), self.col),
+            'B' => self.move_to(self.row + n, self.col),
+            'C' => self.move_to(self.row, self.col + n),
+            'D' => self.move_to(self.row, self.col.saturating_sub(n)),
+            'G' => self.move_to(self.row, n - 1),
+            'd' => self.move_to(TOP + n - 1, self.col),
+            'J' => {
+                let (row, col) = (self.row, self.col.min(WIDTH));
+                match first {
+                    0 => {
+                        self.erase(row, col..WIDTH);
+                        (row + 1..HEIGHT).for_each(|r| self.clear_row(r));
+                    }
+                    1 => {
+                        (TOP..row).for_each(|r| self.clear_row(r));
+                        self.erase(row, 0..(col + 1).min(WIDTH));
+                    }
+                    _ => (TOP..HEIGHT).for_each(|r| self.clear_row(r)),
                 }
             }
-            _ => {}
+            'K' => {
+                let col = self.col.min(WIDTH);
+                match first {
+                    0 => self.erase(self.row, col..WIDTH),
+                    1 => self.erase(self.row, 0..(col + 1).min(WIDTH)),
+                    _ => self.clear_row(self.row),
+                }
+            }
+            'L' => self.insert_lines(n),
+            'M' => self.delete_lines(n),
+            'P' | '@' | 'X' => {
+                let (row, col) = (self.row, self.col.min(WIDTH - 1));
+                let n = n.min(WIDTH - col);
+                match command {
+                    'P' => {
+                        // Apaga n caracteres; o resto da linha anda para a esquerda.
+                        for c in col..WIDTH - n {
+                            unsafe { BUFFER.add(row * WIDTH + c).write_volatile(get(row, c + n)) }
+                        }
+                        self.erase(row, WIDTH - n..WIDTH);
+                    }
+                    '@' => {
+                        for c in (col + n..WIDTH).rev() {
+                            unsafe { BUFFER.add(row * WIDTH + c).write_volatile(get(row, c - n)) }
+                        }
+                        self.erase(row, col..col + n);
+                    }
+                    _ => self.erase(row, col..col + n),
+                }
+            }
+            's' => self.saved = (self.row, self.col),
+            'u' => (self.row, self.col) = self.saved,
+            _ => {} // 'r' (região de rolagem), 'n' (consultas) e outras: ignoradas
         }
     }
 

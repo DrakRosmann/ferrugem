@@ -135,6 +135,20 @@ pub trait Inode: Send + Sync {
     fn rdev(&self) -> u64 {
         0
     }
+    fn uid(&self) -> u32 {
+        0
+    }
+    fn gid(&self) -> u32 {
+        0
+    }
+    /// `chmod`: troca os 12 bits de permissão.
+    fn set_permissions(&self, _permissions: u32) -> Result<(), Errno> {
+        Err(EPERM)
+    }
+    /// `chown`: `None` mantém o valor atual.
+    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), Errno> {
+        Err(EPERM)
+    }
 
     // Arquivos regulares.
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, Errno> {
@@ -369,6 +383,9 @@ pub fn create_file(cwd: &str, path: &str, exclusive: bool, permissions: u32) -> 
 }
 
 pub fn mkdir(cwd: &str, path: &str, permissions: u32) -> Result<(), Errno> {
+    if !path.is_empty() && path.trim_end_matches('/').is_empty() {
+        return Err(EEXIST); // a raiz sempre existe (o `mkdir -p` conta com isso)
+    }
     let (parent, name) = lookup_parent(cwd, path)?;
     if parent.node.lookup(&name).is_ok() || is_mount_point(&child_path(&parent, &name)) {
         return Err(EEXIST);

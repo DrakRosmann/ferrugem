@@ -25,6 +25,24 @@ mkdir -p "$pasta"/{bin,dev,tmp,mnt}
 cp "$programas"/* "$pasta/bin/"
 chmod 755 "$pasta"/bin/*
 
+# O busybox (scripts/busybox.sh), se foi compilado, fornece os comandos
+# Unix padrão, cada um no seu lugar de costume (/bin, /sbin, /usr/bin...),
+# como links para /bin/busybox. Eles substituem as versões simples feitas
+# para o FerrugemOS (que continuam embutidas no kernel, para quando não há
+# disco), menos o /bin/sh, que continua sendo o shell do FerrugemOS.
+busybox="$raiz/target/busybox"
+if [[ -x "$busybox/busybox" ]]; then
+    mkdir -p "$pasta"/{sbin,usr/bin,usr/sbin}
+    cp "$busybox/busybox" "$pasta/bin/busybox"
+    while read -r caminho; do
+        nome="${caminho##*/}"
+        # O sh continua o do FerrugemOS; o linuxrc (init de initrd) não serve.
+        [[ "$nome" == sh || "$caminho" != */* ]] && continue
+        rm -f "$pasta/bin/$nome"
+        ln -s /bin/busybox "$pasta/$caminho"
+    done < "$busybox/comandos"
+fi
+
 if [[ -f "$imagem" && "${FERRUGEM_DISCO_NOVO:-}" != 1 ]]; then
     rm -rf "$pasta/home"
     debugfs -R "rdump /home $pasta" "$imagem" 2>/dev/null

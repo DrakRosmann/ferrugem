@@ -95,6 +95,19 @@ impl RawInode {
     fn mtime(&self) -> u32 {
         u32_at(&self.0, 16)
     }
+    /// Dono: 16 bits baixos no começo do inode, altos na área "osd2".
+    fn uid(&self) -> u32 {
+        u16_at(&self.0, 2) as u32 | (u16_at(&self.0, 120) as u32) << 16
+    }
+    fn gid(&self) -> u32 {
+        u16_at(&self.0, 24) as u32 | (u16_at(&self.0, 122) as u32) << 16
+    }
+    fn set_owner(&mut self, uid: u32, gid: u32) {
+        put_u16(&mut self.0, 2, uid as u16);
+        put_u16(&mut self.0, 120, (uid >> 16) as u16);
+        put_u16(&mut self.0, 24, gid as u16);
+        put_u16(&mut self.0, 122, (gid >> 16) as u16);
+    }
     /// Marca uma alteração: muda mtime e ctime.
     fn touch(&mut self) {
         let now = rtc::now() as u32;
@@ -927,6 +940,34 @@ impl Inode for Ext2Node {
         let mut fs = self.fs.fs.lock();
         let mut inode = fs.read_inode(self.ino)?;
         put_u32(&mut inode.0, 16, seconds as u32);
+        fs.write_inode(self.ino, &inode)
+    }
+
+    fn uid(&self) -> u32 {
+        self.inode().map_or(0, |inode| inode.uid())
+    }
+
+    fn gid(&self) -> u32 {
+        self.inode().map_or(0, |inode| inode.gid())
+    }
+
+    fn set_permissions(&self, permissions: u32) -> Result<(), Errno> {
+        self.fs.writable()?;
+        let mut fs = self.fs.fs.lock();
+        let mut inode = fs.read_inode(self.ino)?;
+        let mode = inode.file_type() | (permissions & 0o7777) as u16;
+        put_u16(&mut inode.0, 0, mode);
+        put_u32(&mut inode.0, 12, rtc::now() as u32); // ctime
+        fs.write_inode(self.ino, &inode)
+    }
+
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.fs.writable()?;
+        let mut fs = self.fs.fs.lock();
+        let mut inode = fs.read_inode(self.ino)?;
+        let (uid, gid) = (uid.unwrap_or(inode.uid()), gid.unwrap_or(inode.gid()));
+        inode.set_owner(uid, gid);
+        put_u32(&mut inode.0, 12, rtc::now() as u32); // ctime
         fs.write_inode(self.ino, &inode)
     }
 

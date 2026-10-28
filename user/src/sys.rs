@@ -40,6 +40,7 @@ pub const SYS_RENAME: u64 = 82;
 pub const SYS_RMDIR: u64 = 84;
 pub const SYS_LINK: u64 = 86;
 pub const SYS_UNLINK: u64 = 87;
+pub const SYS_UMASK: u64 = 95;
 pub const SYS_SYMLINK: u64 = 88;
 pub const SYS_READLINK: u64 = 89;
 pub const SYS_SETPGID: u64 = 109;
@@ -357,6 +358,11 @@ pub fn touch_now(path: &str) -> Result<()> {
     const AT_FDCWD: u64 = -100i64 as u64;
     let path = cstring(path);
     call(SYS_UTIMENSAT, [AT_FDCWD, path.as_ptr() as u64, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// Troca a máscara de criação de arquivos e devolve a anterior.
+pub fn umask(mask: u32) -> u32 {
+    unsafe { syscall(SYS_UMASK, [mask as u64, 0, 0, 0, 0, 0]) as u32 }
 }
 
 pub fn chdir(path: &str) -> Result<()> {

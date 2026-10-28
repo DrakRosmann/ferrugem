@@ -26,6 +26,18 @@ jobs:
       - name: QEMU e e2fsprogs (mkfs.ext2, e2fsck)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 e2fsprogs
 
+      - name: Cache da musl e do busybox
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/externos
+            target/musl
+            target/busybox
+          key: busybox-${{ runner.os }}-${{ hashFiles('scripts/busybox.sh') }}
+
+      - name: Compilar o busybox (com a musl)
+        run: scripts/busybox.sh
+
       - name: Compilar
         run: cargo build --release
 

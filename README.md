@@ -5,13 +5,15 @@ nenhum crate externo. O kernel tem memória virtual, processos isolados no
 anel 3 com `fork`/`execve`, pipes, sinais, um terminal com controle de jobs
 e chamadas de sistema compatíveis com as do Linux, de modo que binários
 estáticos simples feitos para o Linux rodam nele sem mudança. A raiz fica
-num disco ext2 (lido e gravado pelo próprio kernel, compatível com o Linux)
-e, no boot, ele abre o `/bin/sh`, um shell Unix escrito para ele.
+num disco ext2 (lido e gravado pelo próprio kernel, compatível com o Linux),
+os comandos Unix são os do [busybox](https://busybox.net) (compilado com a
+musl, sem nenhuma mudança: `vi`, `awk`, `sed`, `find`, `tar`, o shell
+`ash`...) e, no boot, ele abre o `/bin/sh`, um shell escrito para ele.
 
 ## Requisitos (Fedora)
 
 ```sh
-sudo dnf install rust-std-static-x86_64-unknown-none qemu-system-x86 binutils gcc e2fsprogs
+sudo dnf install rust-std-static-x86_64-unknown-none qemu-system-x86 binutils gcc e2fsprogs make curl bzip2
 # opcional, para gerar a ISO: grub2-tools-extra grub2-pc-modules xorriso
 ```
 
@@ -24,12 +26,14 @@ make run          # janela do QEMU (tela VGA) + serial no terminal
 make run-serial   # sem janela: o shell roda no próprio terminal
 cargo run --release   # o mesmo que `make run`
 make disco        # refaz o disco com os programas atuais (o /home é mantido)
+make busybox      # recompila o busybox
 make iso          # target/ferrugem.iso, inicializável via GRUB
 ```
 
-Na primeira vez, o `make run` cria `target/disco.img`: um disco ext2 de
-64 MiB com `/bin`, `/etc` e `/home` (de `sistema/`), gerado sem root pelo
-`mkfs.ext2 -d`. O que você grava nele continua lá no próximo boot. Depois
+Na primeira vez, o `make run` baixa e compila a musl e o busybox (cerca de
+um minuto; os fontes são conferidos pelo SHA-256) e cria `target/disco.img`:
+um disco ext2 de 64 MiB com `/bin`, `/sbin`, `/usr`, `/etc` e `/home` (de
+`sistema/`), gerado sem root pelo `mkfs.ext2 -d`. O que você grava nele continua lá no próximo boot. Depois
 de mudar os programas de `user/`, rode `make disco` para atualizá-los no
 disco. No Linux, a imagem pode ser inspecionada com `debugfs`, verificada
 com `e2fsck -f` ou montada (`sudo mount -o loop target/disco.img /mnt`).
@@ -65,6 +69,10 @@ $ echo fica > nota.txt             # no disco: continua lá depois de reiniciar
 $ mkdir -p a/b; mv nota.txt a/b; ln -s a/b/nota.txt atalho; ls -l
 $ yes | head -n 100000 > grande    # arquivo de 200 KB (blocos indiretos do ext2)
 $ date                             # hora do relógio da máquina (RTC), em UTC
+$ vi nota.txt                      # o vi do busybox (i, ESC, :wq)
+$ find / -name '*.txt' | xargs wc -l
+$ ls /usr/bin | wc -l              # os comandos do busybox
+$ ash                              # o shell POSIX do busybox (if, for, funções...)
 $ exit                             # volta ao monitor do kernel
 ```
 
@@ -121,14 +129,18 @@ contra a permissão delas, encerra o processo com SIGSEGV.
     `ioctl`, `getcwd`, `chdir`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
     `unlinkat`, `access`, `faccessat`, `rename`, `renameat`, `renameat2`,
     `link`, `linkat`, `symlink`, `symlinkat`, `readlink`, `readlinkat`,
-    `truncate`, `ftruncate`, `utimensat`, `sync`, `fsync`, `fdatasync`;
+    `truncate`, `ftruncate`, `utimensat`, `sync`, `fsync`, `fdatasync`,
+    `pread64`, `pwrite64`, `sendfile`, `poll`, `ppoll`, `select`,
+    `pselect6`, `chmod`, `fchmod`, `fchmodat`, `chown`, `fchown`, `lchown`,
+    `fchownat`, `umask`;
   - processos: `fork`, `vfork`, `clone` (só a forma do `fork`), `execve`,
     `exit`, `exit_group`, `wait4`, `kill`, `getpid`, `getppid`, `gettid`,
     `setpgid`, `getpgid`, `getpgrp`, `setsid`, `getsid`, `getuid` e afins;
-  - sinais: `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`;
+  - sinais: `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`,
+    `rt_sigsuspend`;
   - memória e outras: `mmap` (anônimo), `munmap`, `brk`, `sched_yield`,
     `nanosleep`, `uname`, `arch_prctl`, `set_tid_address`,
-    `clock_gettime` (`CLOCK_REALTIME` vem do RTC).
+    `clock_gettime` (`CLOCK_REALTIME` vem do RTC), `sysinfo`, `getgroups`.
 
   As que faltam devolvem ENOSYS e são registradas na serial.
 
@@ -159,9 +171,16 @@ recursos de ext3/ext4 (journal, extents) são recusadas; diretórios com
 ### Terminal e shell
 
 O terminal (`tty.rs`) tem disciplina de linha com `termios` (modo canônico
-ou cru, eco), uma sessão e um grupo em primeiro plano: Ctrl+C, Ctrl+Z e
+ou cru, eco, UTF-8: o backspace apaga um "ç" inteiro), uma sessão e um grupo
+em primeiro plano: Ctrl+C, Ctrl+Z e
 Ctrl+\\ viram SIGINT, SIGTSTP e SIGQUIT para esse grupo, e um grupo em
 segundo plano que tenta ler recebe SIGTTIN.
+
+A tela VGA (`vga.rs`) interpreta as sequências ANSI de um terminal "linux"
+(posição do cursor, apagar e inserir linhas e caracteres, vídeo reverso), o
+bastante para o `vi` e o `less`; a serial repassa tudo ao terminal do host.
+Se a fila de entrada enche (texto colado), a serial para de ser esvaziada e
+os bytes esperam na UART, sem se perder.
 
 O `/bin/sh` (`user/src/bin/sh.rs`) separa a linha em tokens respeitando
 aspas, monta listas (`;`, `&&`, `||`, `&`) de pipelines de comandos com
@@ -169,7 +188,16 @@ redirecionamentos, e só expande `$VAR`, `$?`, `~` etc. na hora de executar
 cada comando. Cada pipeline vira um job num grupo de processos próprio,
 que recebe o terminal (`tcsetpgrp`) enquanto roda em primeiro plano.
 Comandos internos: `cd`, `pwd`, `export`, `unset`, `jobs`, `fg`, `bg`,
-`wait`, `kill` (aceita `%n`), `exit` e `ajuda`.
+`wait`, `kill` (aceita `%n`), `umask`, `exit` e `ajuda`.
+
+### Busybox
+
+O `scripts/busybox.sh` compila a musl (para `target/musl`, sem root) e com
+ela o busybox estático. O `disco.sh` instala o executável em `/bin/busybox` e
+um link para cada um dos ~400 comandos no lugar de costume (`/bin/ls`,
+`/usr/bin/awk`, `/sbin/...`); eles substituem as versões simples escritas
+para o FerrugemOS, que continuam embutidas no kernel para o modo sem disco.
+As mensagens do busybox são em inglês (a musl não tem traduções).
 
 ### Arquivos
 
@@ -198,7 +226,7 @@ Comandos internos: `cd`, `pwd`, `export`, `unset`, `jobs`, `fg`, `bg`,
 | `src/sync.rs`, `src/cpu.rs`, `src/power.rs` | Trava giratória sem interrupções; instruções de baixo nível; reiniciar e desligar |
 | `user/` | Biblioteca de usuário (`_start`, syscalls, `print!`, alocador sobre `brk`) e programas: `sh`, `ls`, `cat`, `cp`, `mv`, `ln`, `rm`, `mkdir`, `touch`, `truncate`, `grep`, `wc`, `head`, `date`, `kill`... |
 | `sistema/` | Arquivos que vão para o disco (`/etc`, `/home`) |
-| `scripts/` | `qemu.sh` (roda), `disco.sh` (cria o disco), `testar.py` (testes) |
+| `scripts/` | `qemu.sh` (roda), `disco.sh` (cria o disco), `busybox.sh` (musl + busybox), `testar.py` (testes) |
 | `tests/` | Sessões de teste do sh, com a saída esperada |
 
 O `build.rs` compila `user/` para `x86_64-unknown-linux-gnu` (binários
@@ -234,9 +262,9 @@ Depois rode `make disco run` e digite `meuprog` no shell.
 
 ## Próximos passos
 
-- Executáveis estáticos com musl, para rodar o busybox (e `poll`, `mmap` de arquivos, ELF PIE)
-- Usuários e permissões (uid/gid, `chmod`), `/sbin/init` e `login`
-- `/proc`, para o `ps` virar um programa de usuário; depois threads e rede
+- Usuários e permissões verificadas (`/etc/passwd`, setuid), `/sbin/init` e `login`
+- `/proc`, para `ps`, `top`, `free` e `df` do busybox; depois threads e rede
+- `mmap` de arquivos e executáveis PIE/dinâmicos
 - Subshells `( ... )`, substituição de comandos `$(...)` e globs (`*.txt`) no sh
 - Disco mais rápido: DMA ou virtio-blk, com interrupções em vez de espera ativa
 

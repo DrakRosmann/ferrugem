@@ -13,8 +13,8 @@ x=5 $X $X 59
 
 # Entre aspas, uma variável vazia continua sendo um argumento.
 $ echo "$NADA" | wc -c; echo $NADA | wc -c
-      1
-      1
+1
+1
 
 $ A=1 env | grep A=1
 A=1

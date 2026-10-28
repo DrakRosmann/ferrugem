@@ -2,6 +2,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{
@@ -18,10 +19,13 @@ use crate::{pipe, rtc, tty, vfs};
 pub const AT_FDCWD: i64 = -100;
 pub const AT_REMOVEDIR: u64 = 0x200;
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-const AT_EMPTY_PATH: u64 = 0x1000;
+pub const AT_EMPTY_PATH: u64 = 0x1000;
 const O_NOFOLLOW: u32 = 0x2_0000;
-/// Permissões tiradas dos arquivos novos (ainda não há `umask`).
-const UMASK: u64 = 0o022;
+/// Permissões de um arquivo novo: as pedidas menos as do `umask`.
+fn creation_mode(mode: u64) -> Result<u32, Errno> {
+    let umask = with_process(|p| Ok(p.umask))?;
+    Ok(mode as u32 & 0o7777 & !umask)
+}
 
 fn get_file(fd: u64) -> Result<Arc<OpenFile>, Errno> {
     with_process(|p| p.fds.get(fd as i32))
@@ -83,7 +87,7 @@ pub fn openat(dirfd: i64, path: u64, flags: u64, mode: u64) -> SysResult {
     let flags = flags as u32;
     let base = base_dir(dirfd, &path)?;
     let resolved = if flags & O_CREAT != 0 {
-        vfs::create_file(&base, &path, flags & O_EXCL != 0, (mode & !UMASK) as u32)?
+        vfs::create_file(&base, &path, flags & O_EXCL != 0, creation_mode(mode)?)?
     } else {
         vfs::lookup(&base, &path, flags & O_NOFOLLOW == 0)?
     };
@@ -123,6 +127,8 @@ fn write_stat(buf: u64, stat: &Stat) -> SysResult {
     out[8..16].copy_from_slice(&stat.ino.to_le_bytes());
     out[16..24].copy_from_slice(&stat.nlink.to_le_bytes());
     out[24..28].copy_from_slice(&stat.mode.to_le_bytes());
+    out[28..32].copy_from_slice(&stat.uid.to_le_bytes());
+    out[32..36].copy_from_slice(&stat.gid.to_le_bytes());
     out[40..48].copy_from_slice(&stat.rdev.to_le_bytes());
     out[48..56].copy_from_slice(&stat.size.to_le_bytes());
     out[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
@@ -286,7 +292,7 @@ pub fn chdir(path: u64) -> SysResult {
 
 pub fn mkdirat(dirfd: i64, path: u64, mode: u64) -> SysResult {
     let path = read_cstr(path)?;
-    vfs::mkdir(&base_dir(dirfd, &path)?, &path, (mode & !UMASK) as u32).map(|()| 0)
+    vfs::mkdir(&base_dir(dirfd, &path)?, &path, creation_mode(mode)?).map(|()| 0)
 }
 
 pub fn unlinkat(dirfd: i64, path: u64, flags: u64) -> SysResult {
@@ -371,4 +377,219 @@ pub fn utimensat(dirfd: i64, path: u64, times: u64, flags: u64) -> SysResult {
         }
     };
     node.set_mtime(mtime).map(|()| 0)
+}
+
+pub fn pread(fd: u64, buf: u64, len: u64, offset: u64) -> SysResult {
+    let file = get_file(fd)?;
+    user_slice(buf, len, true)?;
+    let data = file.read_at(offset, len as usize)?;
+    write_user(buf, &data)?;
+    Ok(data.len() as i64)
+}
+
+pub fn pwrite(fd: u64, buf: u64, len: u64, offset: u64) -> SysResult {
+    let file = get_file(fd)?;
+    let data = user_slice(buf, len, false)?.to_vec();
+    Ok(file.write_at(offset, &data)? as i64)
+}
+
+/// `sendfile`: copia de um descritor para outro dentro do kernel.
+pub fn sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64) -> SysResult {
+    let (input, output) = (get_file(in_fd)?, get_file(out_fd)?);
+    let mut offset = if offset_ptr != 0 { Some(read_u64(offset_ptr)?) } else { None };
+    let mut total = 0u64;
+    while total < count {
+        let chunk = (count - total).min(64 * 1024) as usize;
+        let data = match offset {
+            Some(position) => input.read_at(position, chunk)?,
+            None => input.read(chunk)?,
+        };
+        if data.is_empty() {
+            break;
+        }
+        let written = output.write(&data)?;
+        total += written as u64;
+        if let Some(position) = offset.as_mut() {
+            *position += written as u64;
+        }
+        if written < data.len() {
+            break;
+        }
+    }
+    if let Some(position) = offset {
+        write_user(offset_ptr, &position.to_le_bytes())?;
+    }
+    Ok(total as i64)
+}
+
+/// Espera, de 10 em 10 ms, até `ready` achar algo, o prazo vencer ou chegar
+/// um sinal. `timeout_ms` negativo espera para sempre.
+fn wait_until(timeout_ms: i64, mut ready: impl FnMut() -> Result<i64, Errno>) -> SysResult {
+    let deadline = (timeout_ms >= 0).then(|| crate::timer::uptime_ms() + timeout_ms as u64);
+    loop {
+        let count = ready()?;
+        if count > 0 {
+            return Ok(count);
+        }
+        let now = crate::timer::uptime_ms();
+        if deadline.is_some_and(|d| now >= d) {
+            return Ok(0);
+        }
+        if crate::task::signal_pending() {
+            return Err(super::EINTR);
+        }
+        crate::task::sleep_ms(deadline.map_or(10, |d| (d - now).min(10)));
+    }
+}
+
+/// Lê um `struct timespec` como milissegundos (-1 se o ponteiro é nulo).
+fn timespec_ms(addr: u64) -> Result<i64, Errno> {
+    if addr == 0 {
+        return Ok(-1);
+    }
+    let (seconds, nanos) = (read_u64(addr)? as i64, read_u64(addr + 8)? as i64);
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return Err(EINVAL);
+    }
+    Ok(seconds.saturating_mul(1000).saturating_add((nanos as u64).div_ceil(1_000_000) as i64))
+}
+
+/// `poll`: `struct pollfd { int fd; short events; short revents; }`.
+pub fn poll(fds: u64, count: u64, timeout_ms: i64) -> SysResult {
+    const POLLNVAL: u16 = 0x20;
+    const ALWAYS: u16 = 0x8 | 0x10; // POLLERR e POLLHUP valem mesmo sem pedir
+    if count > 1024 {
+        return Err(EINVAL);
+    }
+    user_slice(fds, count * 8, true)?;
+    let entries: Vec<(i32, u16)> = (0..count)
+        .map(|i| {
+            let raw = read_u64(fds + i * 8)?;
+            Ok((raw as u32 as i32, (raw >> 32) as u16))
+        })
+        .collect::<Result<_, Errno>>()?;
+    wait_until(timeout_ms, || {
+        let mut ready = 0;
+        for (i, &(fd, events)) in entries.iter().enumerate() {
+            let revents = if fd < 0 {
+                0
+            } else {
+                match get_file(fd as u64) {
+                    Ok(file) => file.poll() & (events | ALWAYS),
+                    Err(_) => POLLNVAL,
+                }
+            };
+            write_user(fds + i as u64 * 8 + 6, &revents.to_le_bytes())?;
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        Ok(ready)
+    })
+}
+
+pub fn ppoll(fds: u64, count: u64, timeout: u64) -> SysResult {
+    poll(fds, count, timespec_ms(timeout)?)
+}
+
+/// `select`/`pselect6`: três conjuntos de bits (leitura, escrita, exceção).
+pub fn select(nfds: u64, sets: [u64; 3], timeout_ms: i64) -> SysResult {
+    const POLLIN: u16 = 0x1;
+    const POLLOUT: u16 = 0x4;
+    const POLLERR: u16 = 0x8;
+    const POLLHUP: u16 = 0x10;
+    if nfds > 1024 {
+        return Err(EINVAL);
+    }
+    let bytes = nfds.div_ceil(64) * 8;
+    let wanted: Vec<Vec<u8>> = sets
+        .iter()
+        .map(|&set| if set == 0 { Ok(vec![0; bytes as usize]) } else { user_slice(set, bytes, true).map(|s| s.to_vec()) })
+        .collect::<Result<_, Errno>>()?;
+    let is_set = |bits: &[u8], fd: usize| bits[fd / 8] & (1 << (fd % 8)) != 0;
+    for fd in 0..nfds as usize {
+        if (0..3).any(|k| is_set(&wanted[k], fd)) {
+            get_file(fd as u64)?; // descritor inválido: EBADF
+        }
+    }
+    wait_until(timeout_ms, || {
+        let mut result = vec![vec![0u8; bytes as usize]; 3];
+        let mut ready = 0;
+        for fd in 0..nfds as usize {
+            if !(0..3).any(|k| is_set(&wanted[k], fd)) {
+                continue;
+            }
+            let events = get_file(fd as u64)?.poll();
+            let hits = [events & (POLLIN | POLLHUP) != 0, events & (POLLOUT | POLLERR) != 0, false];
+            for k in 0..3 {
+                if hits[k] && is_set(&wanted[k], fd) {
+                    result[k][fd / 8] |= 1 << (fd % 8);
+                    ready += 1;
+                }
+            }
+        }
+        // Os conjuntos voltam só com os descritores prontos (todos zerados
+        // se o prazo vencer).
+        for k in 0..3 {
+            if sets[k] != 0 {
+                write_user(sets[k], &result[k])?;
+            }
+        }
+        Ok(ready)
+    })
+}
+
+/// `struct timeval` (segundos, microssegundos) em milissegundos.
+pub fn timeval_ms(addr: u64) -> Result<i64, Errno> {
+    if addr == 0 {
+        return Ok(-1);
+    }
+    let (seconds, micros) = (read_u64(addr)? as i64, read_u64(addr + 8)? as i64);
+    if seconds < 0 || !(0..1_000_000).contains(&micros) {
+        return Err(EINVAL);
+    }
+    Ok(seconds * 1000 + (micros as u64).div_ceil(1000) as i64)
+}
+
+pub fn pselect(nfds: u64, sets: [u64; 3], timeout: u64) -> SysResult {
+    select(nfds, sets, timespec_ms(timeout)?)
+}
+
+/// O nó de `path` (ou do descritor `dirfd`, com AT_EMPTY_PATH ou caminho nulo).
+fn node_at(dirfd: i64, path: u64, flags: u64) -> Result<crate::vfs::NodeRef, Errno> {
+    let path = if path == 0 { String::new() } else { read_cstr(path)? };
+    if path.is_empty() {
+        if path_required(flags) {
+            return Err(ENOENT);
+        }
+        return get_file(dirfd as u64)?.node().cloned().ok_or(EINVAL);
+    }
+    Ok(vfs::lookup(&base_dir(dirfd, &path)?, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?.node)
+}
+
+fn path_required(flags: u64) -> bool {
+    flags & AT_EMPTY_PATH == 0
+}
+
+pub fn fchmodat(dirfd: i64, path: u64, mode: u64) -> SysResult {
+    node_at(dirfd, path, 0)?.set_permissions(mode as u32).map(|()| 0)
+}
+
+pub fn fchmod(fd: u64, mode: u64) -> SysResult {
+    get_file(fd)?.node().ok_or(EINVAL)?.set_permissions(mode as u32).map(|()| 0)
+}
+
+/// `chown` e afins: -1 mantém o dono ou o grupo.
+pub fn fchownat(dirfd: i64, path: u64, uid: u64, gid: u64, flags: u64) -> SysResult {
+    let keep = |id: u64| (id as u32 != u32::MAX).then_some(id as u32);
+    node_at(dirfd, path, flags)?.set_owner(keep(uid), keep(gid)).map(|()| 0)
+}
+
+pub fn fchown(fd: u64, uid: u64, gid: u64) -> SysResult {
+    let keep = |id: u64| (id as u32 != u32::MAX).then_some(id as u32);
+    get_file(fd)?.node().ok_or(EINVAL)?.set_owner(keep(uid), keep(gid)).map(|()| 0)
+}
+
+pub fn umask(mask: u64) -> SysResult {
+    with_process(|p| Ok(core::mem::replace(&mut p.umask, mask as u32 & 0o777) as i64))
 }

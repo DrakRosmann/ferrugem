@@ -87,11 +87,14 @@ pub fn name(signal: u32) -> &'static str {
 pub struct SignalState {
     pub actions: [SigAction; NSIG as usize],
     pub mask: u64,
+    /// Durante um `rt_sigsuspend`, a máscara de antes, que volta depois do
+    /// tratador (pelo quadro do sinal) ou logo, se nenhum tratador rodar.
+    pub suspended_mask: Option<u64>,
 }
 
 impl SignalState {
     pub fn new() -> Self {
-        SignalState { actions: [SigAction::default(); NSIG as usize], mask: 0 }
+        SignalState { actions: [SigAction::default(); NSIG as usize], mask: 0, suspended_mask: None }
     }
 
     pub fn action(&self, signal: u32) -> SigAction {
@@ -174,6 +177,7 @@ pub fn deliver(frame: &mut InterruptFrame, mut interrupted: Option<u64>) -> Opti
                     if let Some(number) = interrupted.take() {
                         restart_syscall(frame, number);
                     }
+                    restore_suspended_mask();
                     task::stop_current(signal);
                     return Some(task::schedule(frame, false));
                 }
@@ -197,11 +201,21 @@ pub fn deliver(frame: &mut InterruptFrame, mut interrupted: Option<u64>) -> Opti
             }
         }
     }
+    restore_suspended_mask();
     // Interrompida por um sinal que acabou não precisando de tratamento.
     if let Some(number) = interrupted {
         restart_syscall(frame, number);
     }
     None
+}
+
+/// Fim de um `rt_sigsuspend` sem tratador: a máscara antiga volta já.
+fn restore_suspended_mask() {
+    task::with_current_process(|p| {
+        if let Some(mask) = p.signals.suspended_mask.take() {
+            p.signals.mask = mask;
+        }
+    });
 }
 
 fn setup_handler(frame: &mut InterruptFrame, signal: u32, action: &SigAction) -> Result<(), Errno> {
@@ -210,7 +224,10 @@ fn setup_handler(frame: &mut InterruptFrame, signal: u32, action: &SigAction) ->
     let info_addr = context_addr - SIGINFO_SIZE;
     let return_addr = info_addr - 8; // ≡ 8 (mod 16), como logo após um `call`
 
-    let old_mask = task::with_current_process(|p| p.signals.mask).unwrap_or(0);
+    // Depois de um rt_sigsuspend, o sigreturn deve restaurar a máscara de
+    // antes dele, e não a temporária.
+    let old_mask =
+        task::with_current_process(|p| p.signals.suspended_mask.take().unwrap_or(p.signals.mask)).unwrap_or(0);
     let mut fpu = FpuState::clean();
     fpu.save();
     let context = SignalContext {

@@ -1,8 +1,9 @@
-KERNEL := target/x86_64-unknown-none/release/ferrugem
-ISO    := target/ferrugem.iso
-DISCO  := target/disco.img
+KERNEL  := target/x86_64-unknown-none/release/ferrugem
+ISO     := target/ferrugem.iso
+DISCO   := target/disco.img
+BUSYBOX := target/busybox/busybox
 
-.PHONY: build run run-serial test disco iso run-iso clean
+.PHONY: build run run-serial test disco busybox iso run-iso clean
 
 build:
 	cargo build --release
@@ -16,16 +17,23 @@ run-serial: build $(DISCO)
 	FERRUGEM_DISPLAY=none scripts/qemu.sh $(KERNEL)
 
 # O disco só é criado se não existir, para não perder o que foi gravado nele.
-$(DISCO):
+$(DISCO): | $(BUSYBOX)
 	$(MAKE) build
 	scripts/disco.sh $(DISCO)
 
 # Refaz o disco com os programas atuais, preservando o /home.
-disco: build
+disco: build $(BUSYBOX)
 	scripts/disco.sh $(DISCO)
 
+# O busybox com a musl (baixa os fontes na primeira vez).
+$(BUSYBOX):
+	scripts/busybox.sh
+
+busybox:
+	scripts/busybox.sh
+
 # Testes de integração: cada tests/*.txt é uma sessão no sh, no QEMU.
-test: build
+test: build $(BUSYBOX)
 	python3 scripts/testar.py
 
 # Imagem inicializável com GRUB (para pendrive ou outras VMs).

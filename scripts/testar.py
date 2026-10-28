@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Testes de integração do FerrugemOS.
+r"""Testes de integração do FerrugemOS.
 
 Cada arquivo em tests/*.txt é uma sessão no /bin/sh: o sistema dá boot no
 QEMU (sem janela, pela serial), e cada comando só é digitado quando o prompt
@@ -14,6 +14,9 @@ Formato dos testes:
     <Ctrl+Z>                tecla enviada enquanto o comando roda
     ^Z
     [1]  Parado      yes >/dev/null
+    $ vi /tmp/x
+    > iolá\e:wq\r           texto digitado enquanto o comando roda (\e = ESC)
+    ...                     saída ignorada (a tela de um editor, por exemplo)
 
 Nas linhas esperadas, `*` casa com qualquer trecho (útil para pids e tempos).
 Espaços no fim das linhas e as cores (sequências ANSI) são ignorados.
@@ -155,6 +158,11 @@ def ler_testes(caminho):
                     raise Falha(f"{caminho}:{numero}: texto antes do primeiro comando")
             elif linha in TECLAS and not casos[-1][3]:
                 casos[-1][2].append(TECLAS[linha])
+            elif linha.startswith("> ") and not casos[-1][3]:
+                texto = linha[2:]
+                for codigo, valor in (("\\e", "\x1b"), ("\\r", "\r"), ("\\n", "\n"), ("\\t", "\t")):
+                    texto = texto.replace(codigo, valor)
+                casos[-1][2].append(texto)
             else:
                 casos[-1][3].append(linha)
     for _, _, _, esperado in casos:
@@ -178,6 +186,8 @@ def casa(real, esperado):
 
 
 def comparar(esperado, real):
+    if esperado == ["..."]:
+        return None
     real = [linha.rstrip() for linha in real]
     esperado = [linha.rstrip() for linha in esperado]
     if len(real) == len(esperado) and all(casa(r, e) for r, e in zip(real, esperado)):

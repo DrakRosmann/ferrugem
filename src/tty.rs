@@ -76,6 +76,28 @@ struct Tty {
     line: Vec<u8>,
     /// Bytes já liberados para leitura.
     ready: VecDeque<u8>,
+    /// Um Ctrl+D numa linha vazia, ainda não entregue como fim de arquivo.
+    eof: bool,
+    /// Bytes de um caractere UTF-8 incompleto, esperando o resto para o eco.
+    partial: Vec<u8>,
+}
+
+impl Tty {
+    /// Ecoa um byte; um caractere de vários bytes (ç, ã...) só é mostrado
+    /// quando chega inteiro.
+    fn echo(&mut self, byte: u8, out: &mut String) {
+        if byte < 0x80 && self.partial.is_empty() {
+            out.push(byte as char);
+            return;
+        }
+        self.partial.push(byte);
+        match core::str::from_utf8(&self.partial) {
+            Ok(text) => out.push_str(text),
+            Err(error) if error.error_len().is_none() => return, // falta byte
+            Err(_) => out.push_str(&String::from_utf8_lossy(&self.partial)),
+        }
+        self.partial.clear();
+    }
 }
 
 static TTY: SpinLock<Tty> = SpinLock::new(Tty {
@@ -84,6 +106,8 @@ static TTY: SpinLock<Tty> = SpinLock::new(Tty {
     session: 0,
     line: Vec::new(),
     ready: VecDeque::new(),
+    eof: false,
+    partial: Vec::new(),
 });
 
 /// Entrega o terminal a uma sessão e grupo (0, 0 = de volta ao monitor).
@@ -94,6 +118,7 @@ pub fn set_foreground(pgid: Pid, session: Pid) {
         tty.termios = DEFAULT_TERMIOS;
         tty.line.clear();
         tty.ready.clear();
+        tty.eof = false;
     }
     tty.foreground = pgid;
     tty.session = session;
@@ -152,6 +177,9 @@ pub fn read(max: usize, nonblocking: bool) -> Result<Vec<u8>, Errno> {
         let seen = input::QUEUE.generation();
         {
             let mut tty = TTY.lock();
+            if tty.ready.is_empty() && core::mem::take(&mut tty.eof) {
+                return Ok(Vec::new());
+            }
             if !tty.ready.is_empty() {
                 let count = max.min(tty.ready.len());
                 return Ok(tty.ready.drain(..count).collect());
@@ -180,31 +208,59 @@ pub fn read(max: usize, nonblocking: bool) -> Result<Vec<u8>, Errno> {
     }
 }
 
+/// Para `poll`: há algo para ler? Passa pela disciplina de linha o que já
+/// foi digitado (em modo canônico, só uma linha completa conta).
+pub fn readable() -> bool {
+    while let Some(byte) = input::pop() {
+        if process_byte(byte) {
+            TTY.lock().eof = true;
+        }
+    }
+    let tty = TTY.lock();
+    !tty.ready.is_empty() || tty.eof
+}
+
 /// Aplica a disciplina de linha a um byte recebido. Devolve `true` para
 /// fim de arquivo.
 fn process_byte(mut byte: u8) -> bool {
-    let mut echo: Option<&[u8]> = None;
+    let mut out = String::new();
     let mut eof = false;
     {
         let mut tty = TTY.lock();
         let termios = tty.termios;
+        let echo = termios.lflag & ECHO != 0;
         if byte == b'\r' && termios.iflag & ICRNL != 0 {
             byte = b'\n';
         }
         if termios.lflag & ICANON == 0 {
             tty.ready.push_back(byte);
-            if termios.lflag & ECHO != 0 {
-                crate::print!("{}", byte as char);
+            if echo {
+                tty.echo(byte, &mut out);
             }
-            return false;
+        } else {
+            eof = edit_line(&mut tty, byte, echo, &mut out);
         }
-        let cc = termios.cc;
+    }
+    if !out.is_empty() {
+        crate::print!("{out}");
+    }
+    eof
+}
+
+/// Modo canônico: edição da linha (apagar, matar a linha, fim de arquivo).
+/// Devolve `true` para fim de arquivo.
+fn edit_line(tty: &mut Tty, byte: u8, echo: bool, out: &mut String) -> bool {
+    let cc = tty.termios.cc;
+    let mut eof = false;
+    {
         match byte {
             b'\n' => {
                 tty.line.push(b'\n');
                 let line = core::mem::take(&mut tty.line);
                 tty.ready.extend(line);
-                echo = Some(b"\n");
+                if echo {
+                    out.push('\n');
+                }
             }
             b if b == cc[VEOF] => {
                 if tty.line.is_empty() {
@@ -215,30 +271,34 @@ fn process_byte(mut byte: u8) -> bool {
                 }
             }
             b if b == cc[VERASE] || b == 0x08 => {
-                if tty.line.pop().is_some() {
-                    echo = Some(b"\x08 \x08");
+                // Apaga um caractere inteiro, mesmo que tenha vários bytes.
+                let mut erased = false;
+                while let Some(last) = tty.line.pop() {
+                    erased = true;
+                    if last & 0xC0 != 0x80 {
+                        break; // chegou ao primeiro byte do caractere
+                    }
+                }
+                if erased && echo {
+                    out.push_str("\x08 \x08");
                 }
             }
             b if b == cc[VKILL] => {
-                for _ in 0..tty.line.len() {
-                    crate::print!("\x08 \x08");
+                if echo {
+                    let width = String::from_utf8_lossy(&tty.line).chars().count();
+                    (0..width).for_each(|_| out.push_str("\x08 \x08"));
                 }
                 tty.line.clear();
             }
-            b'\t' | 0x20..=0x7E => {
+            // Texto, inclusive os bytes de caracteres UTF-8 (≥ 0x80).
+            b'\t' | 0x20..=0x7E | 0x80..=0xFF => {
                 tty.line.push(byte);
-                if termios.lflag & ECHO != 0 {
-                    crate::print!("{}", byte as char);
+                if echo {
+                    tty.echo(byte, out);
                 }
             }
             _ => {} // outras teclas de controle e sequências de escape
         }
-        if termios.lflag & ECHO == 0 {
-            echo = None;
-        }
-    }
-    if let Some(text) = echo {
-        crate::print!("{}", core::str::from_utf8(text).unwrap());
     }
     eof
 }

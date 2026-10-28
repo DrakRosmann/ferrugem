@@ -26,7 +26,7 @@ use crate::tty;
 const MAX_LINE: usize = 200;
 /// Diretório a partir do qual o monitor resolve caminhos relativos.
 const MONITOR_CWD: &str = "/home";
-const ENVIRONMENT: [&str; 4] = ["PATH=/bin", "HOME=/home", "TERM=ferrugem", "USER=root"];
+const ENVIRONMENT: [&str; 4] = ["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/home", "TERM=linux", "USER=root"];
 
 pub fn run(boot: BootInfo) -> ! {
     if vfs::resolve("/", "/bin/sh").is_ok() {

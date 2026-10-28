@@ -5,13 +5,13 @@ abc
 def
 
 $ wc -l < /tmp/f
-      2
+2
 
 $ cat /tmp/f | grep d
 def
 
 $ ls /nada 2>&1 | head -n 1
-ls: /nada: arquivo ou diretório não encontrado
+ls: /nada: No such file or directory
 
 $ ls /nada 2>/dev/null; echo $?
 1
@@ -24,7 +24,7 @@ $ mkdir /tmp/d; echo x > /tmp/d/a; ls /tmp/d
 a
 
 $ rm /tmp/d; echo $?
-rm: /tmp/d: é um diretório
+rm: '/tmp/d' is a directory
 1
 
 $ rm -r /tmp/d; ls /tmp
@@ -41,7 +41,7 @@ $ cat leiame.txt | grep -c sistema
 2
 
 $ > /tmp/vazio; wc -c /tmp/vazio
-      0 /tmp/vazio
+0 /tmp/vazio
 
 $ echo 'echo script $0 $#: $@' > /tmp/s.sh; sh /tmp/s.sh a b
 script /tmp/s.sh 2: a b
