@@ -3,6 +3,8 @@ name = "ferrugem"
 version = "0.2.0"
 edition = "2024"
 description = "FerrugemOS: um sistema operacional x86_64 escrito do zero em Rust"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/DrakRosmann/ferrugem"
 
 # Nenhuma dependência: tudo (boot, interrupções, memória, alocador,
 # escalonador, sistema de arquivos e shell) é implementado aqui.

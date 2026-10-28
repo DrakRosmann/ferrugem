@@ -181,3 +181,13 @@ Depois rode `make run` e digite `meuprog` no shell.
 - Subshells `( ... )`, substituição de comandos `$(...)` e globs (`*.txt`) no sh
 - Executáveis PIE/estáticos com musl, para rodar o busybox
 - Um disco de verdade (ATA/virtio) e um sistema de arquivos persistente
+
+## Licença
+
+Copyright (C) 2026 DrakRosmann
+
+Este programa é software livre: você pode redistribuí-lo e/ou modificá-lo
+sob os termos da GNU General Public License, como publicada pela Free
+Software Foundation, na versão 3 da licença ou (a seu critério) qualquer
+versão posterior. Ele é distribuído na esperança de ser útil, mas SEM
+NENHUMA GARANTIA. Veja o texto completo em [LICENSE](LICENSE).

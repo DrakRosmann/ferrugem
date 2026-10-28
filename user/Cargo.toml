@@ -3,6 +3,7 @@ name = "ferrugem-user"
 version = "0.1.0"
 edition = "2024"
 description = "Biblioteca e programas de usuário do FerrugemOS (ABI do Linux x86_64)"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "ferrugem_user"
