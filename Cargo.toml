@@ -1,0 +1,15 @@
+[package]
+name = "ferrugem"
+version = "0.2.0"
+edition = "2024"
+description = "FerrugemOS: um sistema operacional x86_64 escrito do zero em Rust"
+
+# Nenhuma dependência: tudo (boot, interrupções, memória, alocador,
+# escalonador, sistema de arquivos e shell) é implementado aqui.
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
