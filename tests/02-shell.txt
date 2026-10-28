@@ -1,0 +1,46 @@
+# Sintaxe do sh: listas, expansões, aspas, erros.
+
+$ echo um; echo dois
+um
+dois
+
+$ false && echo nao; false || echo sim; true && echo e
+sim
+e
+
+$ X=5; echo "x=$X" '$X' \$X ${X}9
+x=5 $X $X 59
+
+# Entre aspas, uma variável vazia continua sendo um argumento.
+$ echo "$NADA" | wc -c; echo $NADA | wc -c
+      1
+      1
+
+$ A=1 env | grep A=1
+A=1
+
+$ cd /tmp; pwd; cd; pwd
+/tmp
+/home
+
+$ export LUGAR=mundo; sh -c 'echo ola $LUGAR'
+ola mundo
+
+$ sh -c 'echo $0 $# $1-$2' nome a b
+nome 2 a-b
+
+$ nao_existe; echo $?
+sh: nao_existe: comando não encontrado
+127
+
+$ echo |
+sh: erro de sintaxe: fim inesperado da linha
+
+$ ; echo
+sh: erro de sintaxe perto de `;`
+
+$ echo "aberta
+sh: aspas duplas sem fim
+
+$ echo a # comentário
+a

@@ -1,7 +1,7 @@
 KERNEL := target/x86_64-unknown-none/release/ferrugem
 ISO    := target/ferrugem.iso
 
-.PHONY: build run run-serial iso run-iso clean
+.PHONY: build run run-serial test iso run-iso clean
 
 build:
 	cargo build --release
@@ -13,6 +13,10 @@ run: build
 # Sem janela: use o shell pelo próprio terminal.
 run-serial: build
 	FERRUGEM_DISPLAY=none scripts/qemu.sh $(KERNEL)
+
+# Testes de integração: cada tests/*.txt é uma sessão no sh, no QEMU.
+test: build
+	python3 scripts/testar.py
 
 # Imagem inicializável com GRUB (para pendrive ou outras VMs).
 iso: build

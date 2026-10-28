@@ -371,7 +371,10 @@ fn basename(path: &str) -> &str {
 
 /// Inicia um processo a partir do monitor do kernel: ele lidera sua própria
 /// sessão e grupo, com 0, 1 e 2 no terminal.
-pub fn spawn(path: &str, args: &[&str], env: &[&str]) -> Result<Pid, &'static str> {
+/// Cria um processo filho do kernel, líder de uma sessão nova. Com
+/// `foreground`, a sessão recebe o terminal antes de o processo poder rodar
+/// (senão um shell poderia se ver em segundo plano e parar com SIGTTIN).
+pub fn spawn(path: &str, args: &[&str], env: &[&str], foreground: bool) -> Result<Pid, &'static str> {
     let data = file_contents("/", path).map_err(|_| "programa não encontrado")?;
     let image = load(&data, args, env).map_err(|e| e.message())?;
     let process = Process {
@@ -384,7 +387,13 @@ pub fn spawn(path: &str, args: &[&str], env: &[&str]) -> Result<Pid, &'static st
         cwd: "/home".to_string(),
         signals: SignalState::new(),
     };
-    Ok(task::spawn_user(basename(path), process, image.entry, image.rsp))
+    Ok(cpu::without_interrupts(|| {
+        let pid = task::spawn_user(basename(path), process, image.entry, image.rsp);
+        if foreground {
+            crate::tty::set_foreground(pid, pid);
+        }
+        pid
+    }))
 }
 
 /// `execve`: troca a imagem do processo atual. Só volta em caso de erro; se

@@ -1,0 +1,51 @@
+# Programas de /bin: anel 3, argumentos, ambiente, falhas isoladas.
+
+$ ola a "b c"
+Olá do espaço de usuário! Sou o processo *.
+Rodando em FerrugemOS 0.2.0 (x86_64).
+Nível de privilégio da CPU: anel 3 (CS = 0x23).
+Argumentos (3): ["ola", "a", "b c"]
+
+$ ola-c x
+Olá de um programa em C! Este kernel se chama FerrugemOS.
+Argumentos: ola-c x
+
+$ echo -n sem quebra; echo
+sem quebra
+
+$ true; echo $?
+0
+
+$ false; echo $?
+1
+
+$ env | grep -c =
+4
+
+$ echo abc | reverso
+Digite algo ("sair" ou Ctrl+D para terminar):
+eco> CBA
+eco> tchau!
+
+# Uma falha de página mata só o processo culpado.
+$ falha
+Lendo a memória do kernel em 0xffffffff80100000...
+[pid *] SIGSEGV: falha de página em 0xffffffff80100000 (rip=*)
+Falha de segmentação
+
+$ echo $?
+139
+
+$ falha pilha
+Recursão infinita: a pilha cresce sob demanda até o limite de 8 MiB...
+[pid *] SIGSEGV: falha de página em 0x7fffff7f* (rip=*)
+Falha de segmentação
+
+$ memoria 100
+heap: vetor de 4 MiB somou 137438691328 (ok); brk cresceu * KiB
+mmap: região de 16 MiB em 0x*, 256 páginas tocadas: ok
+pilha: recursão de 2000 níveis (~1 MiB) devolveu 2000
+pausando 100 ms (veja a coluna MEMÓRIA no `ps`)...
+
+$ ls /dev
+console  null  tty  zero

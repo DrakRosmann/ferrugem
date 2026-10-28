@@ -1,0 +1,47 @@
+# Arquivos, diretórios, pipes e redirecionamentos.
+
+$ echo abc > /tmp/f; echo def >> /tmp/f; cat /tmp/f
+abc
+def
+
+$ wc -l < /tmp/f
+      2
+
+$ cat /tmp/f | grep d
+def
+
+$ ls /nada 2>&1 | head -n 1
+ls: /nada: arquivo ou diretório não encontrado
+
+$ ls /nada 2>/dev/null; echo $?
+1
+
+# 1>&2 vem antes de 2>/dev/null: a mensagem vai para o terminal.
+$ echo erro 1>&2 2>/dev/null
+erro
+
+$ mkdir /tmp/d; echo x > /tmp/d/a; ls /tmp/d
+a
+
+$ rm /tmp/d; echo $?
+rm: /tmp/d: é um diretório
+1
+
+$ rm -r /tmp/d; ls /tmp
+f
+
+# O yes morre por SIGPIPE quando o head fecha o pipe.
+$ yes | head -n 3; echo $?
+y
+y
+y
+0
+
+$ cat leiame.txt | grep -c sistema
+2
+
+$ > /tmp/vazio; wc -c /tmp/vazio
+      0 /tmp/vazio
+
+$ echo 'echo script $0 $#: $@' > /tmp/s.sh; sh /tmp/s.sh a b
+script /tmp/s.sh 2: a b

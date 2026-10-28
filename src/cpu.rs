@@ -47,6 +47,18 @@ pub fn sti_hlt() {
     unsafe { asm!("sti", "hlt", options(nomem, nostack)) }
 }
 
+/// Executa `f` com as interrupções desligadas (e portanto sem troca de
+/// tarefa, já que há um só núcleo), restaurando o estado anterior.
+pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
+    let enabled = interrupts_enabled();
+    cli();
+    let result = f();
+    if enabled {
+        sti();
+    }
+    result
+}
+
 pub fn interrupts_enabled() -> bool {
     let flags: u64;
     unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) }

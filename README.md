@@ -25,6 +25,11 @@ cargo run --release   # o mesmo que `make run`
 make iso          # target/ferrugem.iso, inicializável via GRUB
 ```
 
+Para testar: `make test`. Cada arquivo em `tests/` é uma sessão no `sh`
+(comandos e a saída esperada); o `scripts/testar.py` dá boot no QEMU,
+digita cada comando quando o prompt aparece e compara a saída. O GitHub
+Actions roda os mesmos testes a cada push.
+
 Para sair do QEMU sem janela, digite `exit` no sh e depois `desligar` no
 monitor do kernel (ou Ctrl+A e depois X).
 
@@ -80,7 +85,8 @@ contra a permissão delas, encerra o processo com SIGSEGV.
 
 - O carregador lê ELF64 estáticos (`ET_EXEC`), monta a pilha inicial no
   formato System V (argc, argv, envp, auxv) e entra no anel 3 com `iretq`.
-- `fork` copia o espaço de endereçamento e a tabela de descritores; `execve`
+- `fork` compartilha as páginas com cópia sob demanda (copy-on-write) e
+  copia a tabela de descritores; `execve`
   troca a imagem mantendo os descritores (menos os `O_CLOEXEC`); `wait4`
   colhe filhos que terminaram ou pararam (`WUNTRACED`).
 - A entrada de `syscall` troca para a pilha de kernel da tarefa e monta o

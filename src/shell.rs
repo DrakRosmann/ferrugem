@@ -160,7 +160,7 @@ fn run_program(name: &str, args: &[&str]) {
     argv.push(name);
     argv.extend_from_slice(args);
 
-    let pid = match process::spawn(&path, &argv, &ENVIRONMENT) {
+    let pid = match process::spawn(&path, &argv, &ENVIRONMENT, !background) {
         Ok(pid) => pid,
         Err(message) => return error(format_args!("{name}: {message}")),
     };
