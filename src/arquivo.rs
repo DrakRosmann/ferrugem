@@ -16,6 +16,12 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+pub const POLLIN: u16 = 0x1;
+pub const POLLOUT: u16 = 0x4;
+pub const POLLERR: u16 = 0x8;
+pub const POLLHUP: u16 = 0x10;
+pub const POLLNVAL: u16 = 0x20;
+
 pub const O_ACESSO: u64 = 3;
 pub const O_RDONLY: u64 = 0;
 pub const O_WRONLY: u64 = 1;
@@ -96,6 +102,10 @@ impl Arquivo {
                 buf.fill(0);
                 Ok(buf.len())
             }
+            vfs::Tipo::Dispositivo(Dispositivo::Aleatorio) => {
+                crate::aleatorio::preencher(buf);
+                Ok(buf.len())
+            }
         }
     }
 
@@ -130,6 +140,21 @@ impl Arquivo {
 
     pub fn flags(&self) -> u64 {
         self.flags
+    }
+
+    /// Para o `poll`: o que dá para fazer agora sem bloquear (POLLIN, POLLOUT...).
+    pub fn prontidao(&self) -> u16 {
+        match &self.tipo {
+            Tipo::LeituraPipe(pipe) => pipe.prontidao(false),
+            Tipo::EscritaPipe(pipe) => pipe.prontidao(true),
+            Tipo::No(no) => match no.tipo() {
+                Ok(vfs::Tipo::Dispositivo(Dispositivo::Terminal)) => {
+                    if tty::pode_ler() { POLLIN | POLLOUT } else { POLLOUT }
+                }
+                Ok(_) => POLLIN | POLLOUT, // arquivos comuns nunca bloqueiam
+                Err(_) => POLLERR,
+            },
+        }
     }
 
     /// `lseek`: 0 = a partir do início, 1 = da posição atual, 2 = do fim.
@@ -198,6 +223,25 @@ impl Pipe {
             ponta(Tipo::LeituraPipe(pipe.clone()), O_RDONLY),
             ponta(Tipo::EscritaPipe(pipe), O_WRONLY),
         )
+    }
+
+    fn prontidao(&self, escrita: bool) -> u16 {
+        let tamanho = self.dados.lock().len();
+        if escrita {
+            if self.leitores.load(Ordering::Relaxed) == 0 {
+                POLLERR // escrever agora daria EPIPE
+            } else if tamanho < CAPACIDADE_PIPE {
+                POLLOUT
+            } else {
+                0
+            }
+        } else {
+            let mut r = if tamanho > 0 { POLLIN } else { 0 };
+            if self.escritores.load(Ordering::Relaxed) == 0 {
+                r |= POLLHUP; // fim de arquivo: ler devolve 0 na hora
+            }
+            r
+        }
     }
 
     /// O "canal" onde leitores e escritores dormem: o endereço do próprio pipe.

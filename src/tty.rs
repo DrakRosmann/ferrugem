@@ -244,6 +244,12 @@ pub fn ler(buf: &mut [u8]) -> Result<usize, i64> {
     }
 }
 
+/// Há algo para ler (uma linha pronta, ou um Ctrl+D)?
+pub fn pode_ler() -> bool {
+    let tty = TTY.lock();
+    !tty.prontos.is_empty() || tty.fins > 0
+}
+
 pub fn escrever(dados: &[u8]) {
     print!("{}", String::from_utf8_lossy(dados));
 }

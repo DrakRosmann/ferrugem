@@ -1,7 +1,10 @@
 /* testec.c — testa a libc (musl) rodando no FerrugemOS: stdio, malloc
  * grande (mmap), arquivos, processos, pipes, sinais, tempo e números
  * de ponto flutuante. Tudo com as funções padrão do C/POSIX. */
+#include <dirent.h>
 #include <errno.h>
+#include <poll.h>
+#include <sys/select.h>
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
@@ -24,6 +27,100 @@ static volatile sig_atomic_t recebido = 0;
 static void ao_receber(int s) { recebido = s; }
 
 static int compara(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+
+static long agora_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static void testar_poll_e_select(void) {
+    int p[2];
+    pipe(p);
+    struct pollfd pf = { .fd = p[0], .events = POLLIN };
+    long antes = agora_ms();
+    int r = poll(&pf, 1, 100);
+    long ms = agora_ms() - antes;
+    CONFERIR(r == 0 && ms >= 100 && ms < 200, "poll sem dados espera o prazo (100 ms)");
+
+    write(p[1], "x", 1);
+    r = poll(&pf, 1, -1);
+    CONFERIR(r == 1 && (pf.revents & POLLIN), "poll vê dados no pipe");
+
+    fd_set conjunto;
+    FD_ZERO(&conjunto);
+    FD_SET(p[0], &conjunto);
+    struct timeval zero = {0, 0};
+    CONFERIR(select(p[0] + 1, &conjunto, NULL, NULL, &zero) == 1 && FD_ISSET(p[0], &conjunto), "select");
+
+    char c;
+    read(p[0], &c, 1);
+    close(p[1]);
+    pf.revents = 0;
+    CONFERIR(poll(&pf, 1, 0) == 1 && (pf.revents & POLLHUP), "poll vê o fim do pipe (POLLHUP)");
+    close(p[0]);
+
+    /* poll dorme e acorda quando outro processo escreve */
+    pipe(p);
+    pid_t filho = fork();
+    if (filho == 0) {
+        usleep(50000);
+        write(p[1], "y", 1);
+        _exit(0);
+    }
+    pf.fd = p[0];
+    pf.revents = 0;
+    antes = agora_ms();
+    r = poll(&pf, 1, 2000);
+    ms = agora_ms() - antes;
+    waitpid(filho, NULL, 0);
+    CONFERIR(r == 1 && ms >= 50 && ms < 500, "poll acorda quando outro processo escreve");
+    close(p[0]);
+    close(p[1]);
+}
+
+static void testar_proc_e_aleatorio(void) {
+    unsigned char a[16], b[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    CONFERIR(fd >= 0 && read(fd, a, 16) == 16 && read(fd, b, 16) == 16 && memcmp(a, b, 16) != 0, "/dev/urandom");
+    close(fd);
+
+    char linha[128];
+    int pid_lido = -1;
+    FILE *f = fopen("/proc/self/status", "r");
+    while (f && fgets(linha, sizeof linha, f))
+        if (sscanf(linha, "Pid:\t%d", &pid_lido) == 1) break;
+    if (f) fclose(f);
+    CONFERIR(pid_lido == getpid(), "/proc/self/status");
+
+    char alvo[32] = {0};
+    readlink("/proc/self", alvo, sizeof alvo - 1);
+    CONFERIR(atoi(alvo) == getpid(), "/proc/self é um link para o próprio pid");
+
+    f = fopen("/proc/meminfo", "r");
+    long total = 0;
+    if (f) {
+        fscanf(f, "MemTotal: %ld kB", &total);
+        fclose(f);
+    }
+    CONFERIR(total > 100000, "/proc/meminfo");
+
+    f = fopen("/proc/self/cmdline", "r");
+    char cmd[32] = {0};
+    if (f) {
+        fread(cmd, 1, sizeof cmd - 1, f);
+        fclose(f);
+    }
+    CONFERIR(strcmp(cmd, "testec") == 0, "/proc/self/cmdline");
+
+    int processos = 0;
+    DIR *d = opendir("/proc");
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        if (e->d_name[0] >= '1' && e->d_name[0] <= '9') processos++;
+    if (d) closedir(d);
+    CONFERIR(processos >= 3, "readdir do /proc lista os processos");
+}
 
 int main(void) {
     printf("Testando a libc em C...\n");
@@ -111,6 +208,9 @@ int main(void) {
     clock_gettime(CLOCK_MONOTONIC, &depois);
     long ms = (depois.tv_sec - antes.tv_sec) * 1000 + (depois.tv_nsec - antes.tv_nsec) / 1000000;
     CONFERIR(ms >= 100 && ms < 200, "usleep de 100 ms");
+
+    testar_poll_e_select();
+    testar_proc_e_aleatorio();
 
     char data[32];
     strftime(data, sizeof data, "%Y-%m-%d %H:%M", tm);

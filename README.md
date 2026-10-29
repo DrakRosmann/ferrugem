@@ -72,8 +72,11 @@ interrompe o programa que está rodando.
   teclado em segundo plano, `kill` para um grupo inteiro.
 - **Usuários e permissões:** uid/gid real e efetivo, `rwx` + setuid, setgid e
   sticky em todo arquivo (memória e ext2), `chmod`, `chown`, `umask`, `setuid`.
+- **`/proc`** (gerado na hora): `self`, `<pid>/status|stat|cmdline|cwd|exe`,
+  `meminfo`, `uptime`, `cpuinfo`, `mounts`, `loadavg`. `/dev/random` e
+  `/dev/urandom` com a RDRAND da CPU, quando existe. Montagens genéricas.
 - **Syscalls** pela instrução `syscall` (ou `int 0x80`), com os mesmos números
-  e estruturas do Linux — umas 80, o suficiente para a musl: `read`, `writev`,
+  e estruturas do Linux — umas 100, o suficiente para a musl: `poll`, `select`, `read`, `writev`,
   `openat`, `newfstatat`, `mmap`, `brk`, `clone` (do jeito do `posix_spawn`),
   `fcntl`, `pipe2`, `dup3`, `ioctl` de terminal, `arch_prctl`, `getrandom`...
   Ponteiros inválidos viram `EFAULT`.

@@ -28,7 +28,7 @@ mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E root_owner=100
         printf '%s\r' "$comando"
         sleep 10
     done
-} | timeout 70 qemu-system-x86_64 -kernel build/ferrugem.bin -initrd build/initrd.tar -m 256M \
+} | timeout 70 qemu-system-x86_64 -cpu max -kernel build/ferrugem.bin -initrd build/initrd.tar -m 256M \
         -drive file="$disco",format=raw,if=ide,index=0 \
         -display none -chardev stdio,id=s0,signal=off -serial chardev:s0 -no-reboot > "$saida" 2>&1
 

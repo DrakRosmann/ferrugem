@@ -47,6 +47,8 @@ pub use crate::sinal::{SIGFPE, SIGILL, SIGINT, SIGKILL, SIGPIPE, SIGSEGV};
 pub const CANAL_TERMINAL: usize = 1;
 pub const CANAL_TEMPO: usize = 2;
 pub const CANAL_PAUSA: usize = 3;
+/// Quem está num `poll`/`select` dorme aqui; qualquer evento de E/S acorda.
+pub const CANAL_POLL: usize = 4;
 fn canal_filhos(pid: Pid) -> usize {
     0x1_0000 + pid as usize
 }
@@ -71,6 +73,13 @@ pub struct Processo {
     /// Parou e o pai ainda não soube (o `wait` com WUNTRACED conta para ele).
     parada_a_relatar: Option<u32>,
     pub nome: String,
+    /// A linha de comando e o caminho do programa (para o /proc).
+    pub argumentos: Vec<String>,
+    pub executavel: String,
+    /// Quando nasceu (ms desde a partida).
+    pub inicio_ms: u64,
+    /// Até quando um `poll` com prazo pode dormir (ms desde a partida; 0 = sem prazo).
+    pub prazo_ms: u64,
     pub estado: Estado,
     rsp_salvo: u64,
     pilha_kernel: Vec<u8>,
@@ -114,6 +123,10 @@ impl Processo {
             pgid: 0,
             sid: 0,
             parada_a_relatar: None,
+            argumentos: Vec::new(),
+            executavel: String::new(),
+            inicio_ms: pit::milissegundos(),
+            prazo_ms: 0,
             nome,
             estado: Estado::Pronto,
             rsp_salvo: 0,
@@ -293,8 +306,11 @@ pub fn dormir(canal: usize) {
 }
 
 pub fn acordar(canal: usize) {
+    // Todo evento de E/S (pipe, terminal, filho...) também acorda quem está
+    // num poll: ele confere de novo os descritores que está vigiando.
+    let tambem_poll = canal != CANAL_TEMPO;
     for p in tabela().processos.iter_mut() {
-        if p.estado == Estado::Dormindo(canal) {
+        if p.estado == Estado::Dormindo(canal) || tambem_poll && p.estado == Estado::Dormindo(CANAL_POLL) {
             p.estado = Estado::Pronto;
         }
     }
@@ -308,6 +324,11 @@ pub fn tique() {
     atual().tiques += 1;
     acordar(CANAL_TEMPO);
     let agora = pit::milissegundos();
+    for p in tabela().processos.iter_mut() {
+        if p.estado == Estado::Dormindo(CANAL_POLL) && p.prazo_ms != 0 && agora >= p.prazo_ms {
+            p.estado = Estado::Pronto; // o prazo do poll venceu
+        }
+    }
     let vencidos: Vec<Pid> = tabela()
         .processos
         .iter()
@@ -540,6 +561,8 @@ pub fn criar_init(caminho: &str) -> Result<(), i64> {
     let imagem = carregar_programa(caminho, &[caminho.to_string()], &ambiente, vfs::Cred { uid: 0, gid: 0 })?;
     let mut p = Processo::novo(0, "init".to_string());
     (p.pgid, p.sid) = (p.pid, p.pid);
+    p.argumentos = alloc::vec![caminho.to_string()];
+    p.executavel = caminho.to_string();
     unsafe { *p.contexto() = Contexto::usuario(imagem.entrada, imagem.rsp) };
     p.espaco = Some(imagem.espaco);
     p.brk_inicio = imagem.brk;
@@ -554,6 +577,8 @@ pub fn fork(ctx: &Contexto) -> Result<Pid, i64> {
     let pai = atual();
     let espaco = pai.espaco.as_ref().ok_or(EINVAL)?.clonar().ok_or(ENOMEM)?;
     let mut filho = Processo::novo(pai.pid, pai.nome.clone());
+    filho.argumentos = pai.argumentos.clone();
+    filho.executavel = pai.executavel.clone();
     (filho.pgid, filho.sid) = (pai.pgid, pai.sid);
     filho.espaco = Some(espaco);
     filho.arquivos = pai.arquivos.clone();
@@ -601,6 +626,8 @@ pub fn exec(ctx: &mut Contexto, caminho: &str, args: Vec<String>, ambiente: Vec<
     p.brk_inicio = imagem.brk;
     p.brk = imagem.brk;
     p.nome = caminho.rsplit('/').next().unwrap_or(caminho).to_string();
+    p.executavel = caminho.to_string();
+    p.argumentos = args;
     p.sinais.ao_executar();
     p.mmap_topo = MMAP_TOPO;
     // Descritores marcados com close-on-exec não passam para o programa novo.
@@ -869,35 +896,61 @@ pub fn falha_do_programa(descricao: core::fmt::Arguments, numero: u32) {
 
 pub struct Resumo {
     pub pid: Pid,
+    pub tgid: Pid,
     pub pai: Pid,
     pub pgid: Pid,
+    pub sid: Pid,
     pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub threads: u32,
     pub estado: u32,
     pub memoria_kib: u64,
+    pub paginas: u64,
     pub tiques: u64,
+    pub inicio_ms: u64,
     pub nome: String,
+    pub argumentos: Vec<String>,
+    pub diretorio: String,
+    pub executavel: String,
+}
+
+fn resumir(p: &Processo) -> Resumo {
+    let paginas = p.espaco.as_ref().map_or(0, |e| e.paginas() as u64);
+    Resumo {
+        pid: p.pid,
+        tgid: p.pid,
+        pai: p.pai,
+        pgid: p.pgid,
+        sid: p.sid,
+        uid: p.uid,
+        gid: p.gid,
+        euid: p.euid,
+        egid: p.egid,
+        threads: 1,
+        estado: match p.estado {
+            Estado::Pronto => 0,
+            Estado::Rodando => 1,
+            Estado::Dormindo(_) => 2,
+            Estado::Zumbi => 3,
+            Estado::Parado => 4,
+        },
+        memoria_kib: paginas * 4 + p.pilha_kernel.len() as u64 / 1024,
+        paginas,
+        tiques: p.tiques,
+        inicio_ms: p.inicio_ms,
+        nome: p.nome.clone(),
+        argumentos: p.argumentos.clone(),
+        diretorio: p.diretorio.clone(),
+        executavel: p.executavel.clone(),
+    }
 }
 
 pub fn listar() -> Vec<Resumo> {
-    tabela()
-        .processos
-        .iter()
-        .map(|p| Resumo {
-            pid: p.pid,
-            pai: p.pai,
-            pgid: p.pgid,
-            uid: p.uid,
-            estado: match p.estado {
-                Estado::Pronto => 0,
-                Estado::Rodando => 1,
-                Estado::Dormindo(_) => 2,
-                Estado::Zumbi => 3,
-                Estado::Parado => 4,
-            },
-            memoria_kib: p.espaco.as_ref().map_or(0, |e| e.paginas() as u64 * 4)
-                + p.pilha_kernel.len() as u64 / 1024,
-            tiques: p.tiques,
-            nome: p.nome.clone(),
-        })
-        .collect()
+    tabela().processos.iter().map(|p| resumir(p)).collect()
+}
+
+pub fn resumo(pid: Pid) -> Option<Resumo> {
+    tabela().processos.iter().find(|p| p.pid == pid).map(|p| resumir(p))
 }

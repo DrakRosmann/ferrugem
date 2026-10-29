@@ -50,7 +50,7 @@ USUARIO_SRC := $(wildcard usuario/src/*.rs usuario/src/bin/*.rs) $(wildcard comu
                usuario/Cargo.toml usuario/usuario.ld
 ARQUIVOS_RAIZ := $(shell find raiz -type f)
 
-QEMU := qemu-system-x86_64 -kernel $(KERNEL) -initrd $(INITRD) -m 256M \
+QEMU := qemu-system-x86_64 -cpu max -kernel $(KERNEL) -initrd $(INITRD) -m 256M \
         -drive file=$(DISCO),format=raw,if=ide,index=0
 
 .PHONY: all run run-nox teste clean disco musl lua

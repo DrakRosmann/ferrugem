@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+mod aleatorio;
 mod arquivo;
 mod ata;
 mod elf;
@@ -25,6 +26,7 @@ mod pic;
 mod pit;
 mod porta;
 mod processo;
+mod procfs;
 mod quadros;
 mod rtc;
 mod serial;
@@ -104,6 +106,7 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     ));
 
     rtc::init();
+    aleatorio::init();
     vfs::init();
     let Some(modulo) = info.modulos().next() else {
         panic!("nenhum initrd: rode com `make run` (que passa -initrd ao QEMU)");
@@ -117,7 +120,7 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
         None => println!("  [ -- ] nenhum disco ATA: /disco não vai existir"),
         Some(setores) => match ext2::Ext2::montar() {
             Ok(fs) => {
-                let _ = vfs::montar("/disco", fs);
+                let _ = vfs::montar("/disco", vfs::Vnode::Disco(fs, ext2::RAIZ), "/dev/hda", "ext2");
                 ok(format_args!("disco ATA de {} MiB com ext2 montado em /disco", setores / 2048));
             }
             Err(motivo) => println!("  [ -- ] disco ATA de {} MiB, mas {}", setores / 2048, motivo),

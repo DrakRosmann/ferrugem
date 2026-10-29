@@ -8,7 +8,7 @@
 //!
 //! Os números e o formato das estruturas são os mesmos do Linux x86_64.
 
-use crate::arquivo::{Arquivo, Pipe, Tipo};
+use crate::arquivo::{Arquivo, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, Pipe, Tipo};
 use crate::erro::*;
 use crate::interrupcoes::Contexto;
 use crate::paginacao::{ESCRITA, EspacoEnderecos, USUARIO};
@@ -56,18 +56,21 @@ type Resultado = Result<u64, i64>;
 
 pub fn tratar(ctx: &mut Contexto) {
     let numero = ctx.rax;
-    let (a1, a2, a3) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    let (a1, a2, a3, a4, a5) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r10, ctx.r8);
     let resultado = match numero {
         0 => sys_read(a1, a2, a3),
         1 => sys_write(a1, a2, a3),
         2 => sys_open(a1, a2, a3),
-        6 => caminho(a1).and_then(|c| stat_caminho(&c, a2, false)), // lstat: não segue o link
+        // lstat: não segue o link (a não ser com uma barra no fim, como "link/")
+        6 => caminho(a1).and_then(|c| stat_caminho(&c, a2, termina_em_barra(a1))),
+        7 => sys_poll(a1, a2, if a3 as i32 >= 0 { Some(a3 as i32 as u64) } else { None }),
         9 => sys_mmap(a1, a2, ctx.r10, ctx.r8),
         10 => Ok(0), // mprotect: todas as páginas ficam leitura+escrita (simplificação)
         11 => sys_munmap(a1, a2),
         19 => sys_vetorial(a1, a2, a3, false),
         20 => sys_vetorial(a1, a2, a3, true),
         21 => sys_access(caminho(a1), a2),
+        23 => prazo_de_timeval(a5).and_then(|prazo| sys_select(a1, a2, a3, a4, prazo)),
         24 => {
             processo::escalonar(); // sched_yield: cede a vez
             Ok(0)
@@ -133,6 +136,8 @@ pub fn tratar(ctx: &mut Contexto) {
         258 => caminho_at(a1, a2).and_then(|c| mkdir_caminho(c, a3)),
         234 => processo::pode_sinalizar(a2 as u32).and_then(|_| processo::enviar_sinal(a2 as u32, a3 as u32)).map(|_| 0), // tgkill
         262 => sys_newfstatat(a1, a2, a3, ctx.r10),
+        270 => prazo_de_timespec(a5).and_then(|prazo| sys_select(a1, a2, a3, a4, prazo)), // pselect6 (sem máscara)
+        271 => prazo_de_timespec(a3).and_then(|prazo| sys_poll(a1, a2, prazo)), // ppoll (sem máscara)
         265 => sys_link(caminho_at(a1, a2), caminho_at(a3, ctx.r10)),
         266 => sys_symlink(a1, caminho_at(a2, a3)),
         267 => sys_readlink(caminho_at(a1, a2), a3, ctx.r10),
@@ -191,6 +196,11 @@ fn caminho(ptr: u64) -> Result<String, i64> {
         return Err(ENOENT);
     }
     Ok(vfs::normalizar(&processo::atual().diretorio, &texto))
+}
+
+/// "dir/" obriga a seguir um link no fim do caminho (e exige que dê num diretório).
+fn termina_em_barra(ptr: u64) -> bool {
+    espaco().ler_string(ptr, 4096).is_some_and(|s| s.len() > 1 && s.ends_with('/'))
 }
 
 fn arquivo(fd: u64) -> Result<Arc<Arquivo>, i64> {
@@ -474,7 +484,7 @@ fn sys_newfstatat(dirfd: u64, ptr: u64, buf: u64, flags: u64) -> Resultado {
     if flags & AT_EMPTY_PATH != 0 && vazio {
         return sys_fstat(dirfd, buf);
     }
-    stat_caminho(&caminho_at(dirfd, ptr)?, buf, flags & AT_SYMLINK_NOFOLLOW == 0)
+    stat_caminho(&caminho_at(dirfd, ptr)?, buf, flags & AT_SYMLINK_NOFOLLOW == 0 || termina_em_barra(ptr))
 }
 
 fn sys_renameat(dir_de: u64, de: u64, dir_para: u64, para: u64) -> Resultado {
@@ -541,22 +551,137 @@ fn sys_munmap(endereco: u64, tamanho: u64) -> Resultado {
     Ok(0)
 }
 
-/// `getrandom`: não há fonte de entropia de verdade; misturamos o contador de
-/// ciclos da CPU (bom o bastante para sementes, ruim para criptografia).
+/// `getrandom`: da RDRAND, se a CPU tiver (veja aleatorio.rs).
 fn sys_getrandom(buf: u64, tamanho: u64) -> Resultado {
-    let tamanho = (tamanho as usize).min(4096);
-    let mut estado = unsafe { core::arch::x86_64::_rdtsc() } | 1;
-    let mut dados = Vec::with_capacity(tamanho);
-    while dados.len() < tamanho {
-        // xorshift64*
-        estado ^= estado >> 12;
-        estado ^= estado << 25;
-        estado ^= estado >> 27;
-        dados.extend(estado.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes());
-    }
-    dados.truncate(tamanho);
+    let mut dados = vec![0u8; (tamanho as usize).min(4096)];
+    crate::aleatorio::preencher(&mut dados);
     escrever_usuario(buf, &dados)?;
-    Ok(tamanho as u64)
+    Ok(dados.len() as u64)
+}
+
+// -----------------------------------------------------------------------------
+// poll e select: esperar vários descritores ao mesmo tempo
+// -----------------------------------------------------------------------------
+
+/// O coração do poll/select: confere todos os descritores e, se nenhum estiver
+/// pronto, dorme até um evento de E/S (ou até o prazo). `prazo_ms`: None espera
+/// para sempre; Some(0) só confere.
+fn esperar_descritores(pedidos: &[(i32, u16)], prazo_ms: Option<u64>) -> Result<Vec<u16>, i64> {
+    let limite = prazo_ms.map(|ms| pit::milissegundos() + ms);
+    loop {
+        let respostas: Vec<u16> = pedidos
+            .iter()
+            .map(|&(fd, eventos)| {
+                if fd < 0 {
+                    return 0;
+                }
+                match arquivo(fd as u64) {
+                    // POLLERR, POLLHUP e POLLNVAL sempre valem, mesmo sem pedir
+                    Ok(arq) => arq.prontidao() & (eventos | POLLERR | POLLHUP),
+                    Err(_) => POLLNVAL,
+                }
+            })
+            .collect();
+        let agora = pit::milissegundos();
+        if respostas.iter().any(|&r| r != 0) || limite.is_some_and(|l| agora >= l) {
+            return Ok(respostas);
+        }
+        if processo::tem_sinal_pendente() {
+            return Err(EINTR);
+        }
+        processo::atual().prazo_ms = limite.unwrap_or(0);
+        processo::dormir(processo::CANAL_POLL);
+        processo::atual().prazo_ms = 0;
+    }
+}
+
+/// `poll(fds, n, timeout_ms)`: cada `struct pollfd` tem 8 bytes: fd, eventos, resposta.
+fn sys_poll(ptr: u64, quantos: u64, prazo_ms: Option<u64>) -> Resultado {
+    if quantos > 1024 {
+        return Err(EINVAL);
+    }
+    let bruto = ler_usuario(ptr, quantos as usize * 8)?;
+    let pedidos: Vec<(i32, u16)> = bruto
+        .chunks_exact(8)
+        .map(|c| (i32::from_le_bytes(c[..4].try_into().unwrap()), u16::from_le_bytes([c[4], c[5]])))
+        .collect();
+    let respostas = esperar_descritores(&pedidos, prazo_ms)?;
+    let mut saida = bruto;
+    for (i, r) in respostas.iter().enumerate() {
+        saida[i * 8 + 6..i * 8 + 8].copy_from_slice(&r.to_le_bytes());
+    }
+    escrever_usuario(ptr, &saida)?;
+    Ok(respostas.iter().filter(|&&r| r != 0).count() as u64)
+}
+
+/// Prazo em milissegundos a partir de um `struct timespec` (ponteiro nulo = sem prazo).
+fn prazo_de_timespec(ptr: u64) -> Result<Option<u64>, i64> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let b = ler_usuario(ptr, 16)?;
+    let s = u64::from_le_bytes(b[..8].try_into().unwrap());
+    let ns = u64::from_le_bytes(b[8..].try_into().unwrap());
+    Ok(Some(s * 1000 + ns / 1_000_000))
+}
+
+fn prazo_de_timeval(ptr: u64) -> Result<Option<u64>, i64> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let b = ler_usuario(ptr, 16)?;
+    let s = u64::from_le_bytes(b[..8].try_into().unwrap());
+    let us = u64::from_le_bytes(b[8..].try_into().unwrap());
+    Ok(Some(s * 1000 + us / 1000))
+}
+
+/// `select(n, leitura, escrita, exceção, prazo)`: conjuntos de bits de descritores.
+fn sys_select(n: u64, leitura: u64, escrita: u64, excecao: u64, prazo_ms: Option<u64>) -> Resultado {
+    let n = (n as usize).min(MAX_ARQUIVOS);
+    let ler_conjunto = |ptr: u64| -> Result<u64, i64> {
+        if ptr == 0 { Ok(0) } else { Ok(u64::from_le_bytes(ler_usuario(ptr, 8)?.try_into().unwrap())) }
+    };
+    let (l, e, x) = (ler_conjunto(leitura)?, ler_conjunto(escrita)?, ler_conjunto(excecao)?);
+    let mut pedidos = Vec::new();
+    for fd in 0..n {
+        let bit = 1u64 << fd;
+        let mut eventos = 0;
+        if l & bit != 0 {
+            eventos |= POLLIN;
+        }
+        if e & bit != 0 {
+            eventos |= POLLOUT;
+        }
+        if (l | e | x) & bit != 0 {
+            pedidos.push((fd as i32, eventos));
+        }
+    }
+    let respostas = esperar_descritores(&pedidos, prazo_ms)?;
+    let (mut rl, mut re, mut rx, mut total) = (0u64, 0u64, 0u64, 0);
+    for (&(fd, _), &r) in pedidos.iter().zip(&respostas) {
+        let bit = 1u64 << fd;
+        if r & POLLNVAL != 0 {
+            return Err(EBADF);
+        }
+        if l & bit != 0 && r & (POLLIN | POLLHUP | POLLERR) != 0 {
+            rl |= bit;
+            total += 1;
+        }
+        if e & bit != 0 && r & (POLLOUT | POLLERR) != 0 {
+            re |= bit;
+            total += 1;
+        }
+        if x & bit != 0 && r & POLLERR != 0 {
+            rx |= bit;
+            total += 1;
+        }
+    }
+    for (ptr, valor) in [(leitura, rl), (escrita, re), (excecao, rx)] {
+        if ptr != 0 {
+            escrever_usuario(ptr, &valor.to_le_bytes())?;
+        }
+    }
+    Ok(total)
 }
 
 fn sys_gettimeofday(ptr: u64) -> Resultado {

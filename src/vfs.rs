@@ -32,6 +32,7 @@
 
 use crate::erro::*;
 use crate::ext2::{self, Ext2};
+use crate::procfs::NoProc;
 use crate::rtc;
 use crate::spin::Mutex;
 use alloc::collections::BTreeMap;
@@ -45,6 +46,8 @@ pub enum Dispositivo {
     Terminal,
     Nulo,
     Zero,
+    /// /dev/random e /dev/urandom
+    Aleatorio,
 }
 
 /// Um nó da árvore em memória.
@@ -54,8 +57,9 @@ pub enum Conteudo {
     Dispositivo(Dispositivo),
     /// Link simbólico: o caminho para onde aponta.
     Link(String),
-    /// Ponto de montagem: daqui para baixo, quem responde é o disco.
-    Montagem(Arc<Ext2>),
+    /// Ponto de montagem: daqui para baixo, quem responde é outro sistema de
+    /// arquivos (o disco ext2, o /proc...), a partir desta raiz.
+    Montagem(Vnode),
 }
 
 pub struct No {
@@ -118,16 +122,19 @@ pub enum Tipo {
     Link,
 }
 
-/// Qualquer arquivo ou diretório, esteja na memória ou no disco.
+/// Qualquer arquivo ou diretório, esteja na memória, no disco ou no /proc.
 #[derive(Clone)]
 pub enum Vnode {
     Memoria(Arc<No>),
     Disco(Arc<Ext2>, u32),
+    Proc(NoProc),
 }
 
 static PROXIMO_ID: AtomicU64 = AtomicU64::new(1);
 static RAIZ: Mutex<Option<Arc<No>>> = Mutex::new(None);
 static DISCO: Mutex<Option<Arc<Ext2>>> = Mutex::new(None);
+/// (dispositivo, ponto de montagem, tipo) — o que o /proc/mounts mostra.
+static MONTAGENS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
 
 impl No {
     fn novo(conteudo: Conteudo, meta: Meta) -> Arc<No> {
@@ -152,10 +159,10 @@ fn diretorio_vazio() -> Conteudo {
     Conteudo::Diretorio(BTreeMap::new())
 }
 
-/// Um nó em memória, ou a raiz do disco se ele for um ponto de montagem.
+/// Um nó em memória, ou a raiz do que estiver montado nele.
 fn entrar(no: Arc<No>) -> Vnode {
-    if let Conteudo::Montagem(fs) = &*no.conteudo.lock() {
-        return Vnode::Disco(fs.clone(), ext2::RAIZ);
+    if let Conteudo::Montagem(raiz) = &*no.conteudo.lock() {
+        return raiz.clone();
     }
     Vnode::Memoria(no)
 }
@@ -179,6 +186,7 @@ impl Vnode {
                     Tipo::Arquivo
                 })
             }
+            Vnode::Proc(no) => Ok(no.tipo()),
         }
     }
 
@@ -187,6 +195,7 @@ impl Vnode {
         match self {
             Vnode::Memoria(no) => no.id,
             Vnode::Disco(_, inode) => 0x1_0000_0000 + *inode as u64,
+            Vnode::Proc(no) => no.id(),
         }
     }
 
@@ -200,6 +209,11 @@ impl Vnode {
                 _ => 0,
             }),
             Vnode::Disco(fs, inode) => fs.info(*inode).map(|i| i.tamanho),
+            Vnode::Proc(no) => match no.tipo() {
+                Tipo::Diretorio => Ok(no.listar()?.len() as u64),
+                Tipo::Link => Ok(no.ler_link()?.len() as u64),
+                _ => Ok(no.conteudo()?.len() as u64),
+            },
         }
     }
 
@@ -210,6 +224,7 @@ impl Vnode {
                 let i = fs.info(*inode)?;
                 Ok(Meta { permissoes: i.permissoes, uid: i.uid, gid: i.gid, modificado: i.modificado })
             }
+            Vnode::Proc(no) => Ok(no.meta()),
         }
     }
 
@@ -226,6 +241,7 @@ impl Vnode {
                 Ok(())
             }
             Vnode::Disco(fs, inode) => fs.alterar(*inode, permissoes, uid, gid),
+            Vnode::Proc(_) => Err(EPERM),
         }
     }
 
@@ -237,6 +253,7 @@ impl Vnode {
                 _ => Err(EINVAL),
             },
             Vnode::Disco(fs, inode) => fs.ler_link(*inode),
+            Vnode::Proc(no) => no.ler_link(),
         }
     }
 
@@ -256,6 +273,7 @@ impl Vnode {
                 Ok(entrar(filho))
             }
             Vnode::Disco(fs, inode) => Ok(Vnode::Disco(fs.clone(), fs.buscar(*inode, nome)?)),
+            Vnode::Proc(no) => Ok(Vnode::Proc(no.filho(nome)?)),
         }
     }
 
@@ -271,6 +289,13 @@ impl Vnode {
                 _ => Err(EISDIR),
             },
             Vnode::Disco(fs, inode) => fs.ler(*inode, posicao, buf),
+            Vnode::Proc(no) => {
+                let dados = no.conteudo()?;
+                let inicio = (posicao as usize).min(dados.len());
+                let n = buf.len().min(dados.len() - inicio);
+                buf[..n].copy_from_slice(&dados[inicio..inicio + n]);
+                Ok(n)
+            }
         }
     }
 
@@ -290,6 +315,7 @@ impl Vnode {
                 _ => Err(EISDIR),
             },
             Vnode::Disco(fs, inode) => fs.escrever(*inode, posicao, dados),
+            Vnode::Proc(_) => Err(EACCES),
         }
     }
 
@@ -303,6 +329,7 @@ impl Vnode {
                 Ok(())
             }
             Vnode::Disco(fs, inode) => fs.truncar(*inode),
+            Vnode::Proc(_) => Err(EACCES),
         }
     }
 
@@ -342,6 +369,7 @@ impl Vnode {
                     (nome, 0x1_0000_0000 + i as u64, tipo)
                 })
                 .collect()),
+            Vnode::Proc(no) => no.listar(),
         }
     }
 
@@ -349,6 +377,7 @@ impl Vnode {
         match (self, outro) {
             (Vnode::Memoria(_), Vnode::Memoria(_)) => true,
             (Vnode::Disco(a, _), Vnode::Disco(b, _)) => Arc::ptr_eq(a, b),
+            (Vnode::Proc(_), Vnode::Proc(_)) => true,
             _ => false,
         }
     }
@@ -360,6 +389,7 @@ impl Vnode {
 
 pub fn init() {
     *RAIZ.lock() = Some(No::novo(diretorio_vazio(), Meta::de_root(0o755)));
+    MONTAGENS.lock().push((String::from("rootfs"), String::from("/"), String::from("ramfs")));
     for caminho in ["/dev", "/home", "/etc", "/bin"] {
         let _ = criar_na_memoria(caminho, diretorio_vazio(), None);
     }
@@ -368,12 +398,24 @@ pub fn init() {
     let _ = criar_na_memoria("/dev/tty", Conteudo::Dispositivo(Dispositivo::Terminal), None);
     let _ = criar_na_memoria("/dev/null", Conteudo::Dispositivo(Dispositivo::Nulo), None);
     let _ = criar_na_memoria("/dev/zero", Conteudo::Dispositivo(Dispositivo::Zero), None);
+    let _ = criar_na_memoria("/dev/random", Conteudo::Dispositivo(Dispositivo::Aleatorio), None);
+    let _ = criar_na_memoria("/dev/urandom", Conteudo::Dispositivo(Dispositivo::Aleatorio), None);
+    let _ = montar("/proc", Vnode::Proc(NoProc::Raiz), "proc", "proc");
 }
 
-/// Pendura um disco ext2 num diretório novo (como o `mount` do Unix).
-pub fn montar(caminho: &str, fs: Arc<Ext2>) -> Result<(), i64> {
-    *DISCO.lock() = Some(fs.clone());
-    criar_na_memoria(caminho, Conteudo::Montagem(fs), None).map(|_| ())
+/// Pendura um sistema de arquivos (a partir da sua raiz) num diretório novo,
+/// como o `mount` do Unix.
+pub fn montar(caminho: &str, raiz: Vnode, dispositivo: &str, tipo: &str) -> Result<(), i64> {
+    if let Vnode::Disco(fs, _) = &raiz {
+        *DISCO.lock() = Some(fs.clone());
+    }
+    criar_na_memoria(caminho, Conteudo::Montagem(raiz), None)?;
+    MONTAGENS.lock().push((String::from(dispositivo), String::from(caminho), String::from(tipo)));
+    Ok(())
+}
+
+pub fn montagens() -> Vec<(String, String, String)> {
+    MONTAGENS.lock().clone()
 }
 
 /// O disco montado, se houver.
@@ -484,6 +526,7 @@ pub fn criar_link_simbolico(caminho: &str, alvo: &str, meta: Meta) -> Result<(),
     match buscar(pai)? {
         Vnode::Memoria(_) => criar_na_memoria(caminho, Conteudo::Link(String::from(alvo)), Some(meta)),
         Vnode::Disco(fs, dir) => fs.criar_link_simbolico(dir, nome, alvo, meta.uid, meta.gid).map(|_| ()),
+        Vnode::Proc(_) => Err(EACCES),
     }
 }
 
@@ -562,6 +605,7 @@ pub fn criar(caminho: &str, diretorio: bool, meta: Meta) -> Result<Vnode, i64> {
             let inode = fs.criar(dir, nome, diretorio, meta.permissoes, meta.uid, meta.gid)?;
             Ok(Vnode::Disco(fs, inode))
         }
+        Vnode::Proc(_) => Err(EACCES),
     }
 }
 
@@ -569,6 +613,7 @@ pub fn criar(caminho: &str, diretorio: bool, meta: Meta) -> Result<Vnode, i64> {
 pub fn remover(caminho: &str, diretorio: bool) -> Result<(), i64> {
     let (pai, nome) = separar(caminho)?;
     match buscar(pai)? {
+        Vnode::Proc(_) => Err(EACCES),
         Vnode::Disco(fs, dir) => fs.remover(dir, nome, diretorio),
         Vnode::Memoria(pai) => {
             let mut c = pai.conteudo.lock();
