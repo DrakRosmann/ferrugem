@@ -101,6 +101,18 @@ impl Arquivo {
                     let tipo = Tipo::PtyMestre(no, id);
                     return Ok(Arquivo::novo(tipo, flags));
                 }
+                Dispositivo::Framebuffer => {
+                    crate::video::abrir()?;
+                    return Ok(Arquivo::novo(Tipo::No(no), flags));
+                }
+                Dispositivo::Mouse => {
+                    crate::mouse::abrir();
+                    return Ok(Arquivo::novo(Tipo::No(no), flags));
+                }
+                Dispositivo::Teclado => {
+                    crate::teclado::capturar()?;
+                    return Ok(Arquivo::novo(Tipo::No(no), flags));
+                }
                 _ => return Ok(Arquivo::novo(Tipo::No(no), flags)),
             };
             tty::abrir(terminal, flags & O_NOCTTY != 0)?;
@@ -141,6 +153,17 @@ impl Arquivo {
             vfs::Tipo::Link | vfs::Tipo::Fifo => Err(EINVAL), // o open segue links e abre FIFOs como pipe
             vfs::Tipo::Socket => Err(ENXIO),
             vfs::Tipo::Dispositivo(Dispositivo::Nulo) => Ok(0),
+            vfs::Tipo::Dispositivo(Dispositivo::Mouse) => crate::mouse::ler(buf, self.bloqueia()),
+            vfs::Tipo::Dispositivo(Dispositivo::Teclado) => crate::teclado::ler_capturado(buf, self.bloqueia()),
+            vfs::Tipo::Dispositivo(Dispositivo::Fonte) => {
+                let fonte = crate::video::fonte();
+                let mut posicao = self.posicao.lock();
+                let inicio = (*posicao as usize).min(fonte.len());
+                let n = buf.len().min(fonte.len() - inicio);
+                buf[..n].copy_from_slice(&fonte[inicio..inicio + n]);
+                *posicao += n as u64;
+                Ok(n)
+            }
             vfs::Tipo::Dispositivo(Dispositivo::Zero) => {
                 buf.fill(0);
                 Ok(buf.len())
@@ -235,6 +258,12 @@ impl Arquivo {
             Tipo::Socket(s) => s.prontidao(),
             Tipo::Epoll(e) => if e.tem_prontos() { POLLIN } else { 0 },
             Tipo::No(no) => match no.tipo() {
+                Ok(vfs::Tipo::Dispositivo(Dispositivo::Mouse)) => {
+                    if crate::mouse::pode_ler() { POLLIN } else { 0 }
+                }
+                Ok(vfs::Tipo::Dispositivo(Dispositivo::Teclado)) => {
+                    if crate::teclado::pode_ler_capturado() { POLLIN } else { 0 }
+                }
                 Ok(_) => POLLIN | POLLOUT, // arquivos comuns nunca bloqueiam
                 Err(_) => POLLERR,
             },
@@ -283,7 +312,13 @@ impl Drop for Arquivo {
             }
             Tipo::Terminal(_, id) => tty::fechou(*id),
             Tipo::PtyMestre(_, id) => tty::fechar_mestre(*id),
-            Tipo::No(_) | Tipo::Socket(_) | Tipo::Epoll(_) => {}
+            Tipo::No(no) => match no.tipo() {
+                Ok(vfs::Tipo::Dispositivo(Dispositivo::Framebuffer)) => crate::video::fechar(),
+                Ok(vfs::Tipo::Dispositivo(Dispositivo::Mouse)) => crate::mouse::fechar(),
+                Ok(vfs::Tipo::Dispositivo(Dispositivo::Teclado)) => crate::teclado::soltar(),
+                _ => {}
+            },
+            Tipo::Socket(_) | Tipo::Epoll(_) => {}
         }
     }
 }

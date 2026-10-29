@@ -117,7 +117,12 @@ pub fn alocar_zerado() -> Option<u64> {
 }
 
 /// Solta uma referência; o quadro só fica livre quando era a última.
+/// Endereços fora da RAM que gerenciamos (a memória de vídeo mapeada para o
+/// servidor de janelas) não têm dono: são ignorados aqui e nas duas abaixo.
 pub fn liberar(quadro: u64) {
+    if quadro >= LIMITE {
+        return;
+    }
     sem_interrupcoes(|| {
         let mut b = BITMAP.lock();
         let i = (quadro / TAMANHO_PAGINA) as usize;
@@ -133,6 +138,9 @@ pub fn liberar(quadro: u64) {
 
 /// Mais um dono para o quadro.
 pub fn compartilhar(quadro: u64) {
+    if quadro >= LIMITE {
+        return;
+    }
     sem_interrupcoes(|| {
         let _b = BITMAP.lock();
         referencias()[(quadro / TAMANHO_PAGINA) as usize] += 1;
@@ -140,6 +148,9 @@ pub fn compartilhar(quadro: u64) {
 }
 
 pub fn donos(quadro: u64) -> u16 {
+    if quadro >= LIMITE {
+        return 1;
+    }
     sem_interrupcoes(|| {
         let _b = BITMAP.lock();
         referencias()[(quadro / TAMANHO_PAGINA) as usize]

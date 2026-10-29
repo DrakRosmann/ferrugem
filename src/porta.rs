@@ -49,3 +49,25 @@ pub unsafe fn inb(porta: u16) -> u8 {
     }
     valor
 }
+
+/// Escreve 32 bits numa porta.
+///
+/// # Safety
+/// Idem `outb`.
+pub unsafe fn outl(porta: u16, valor: u32) {
+    unsafe {
+        asm!("out dx, eax", in("dx") porta, in("eax") valor, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Lê 32 bits de uma porta.
+///
+/// # Safety
+/// Idem `inb`.
+pub unsafe fn inl(porta: u16) -> u32 {
+    let valor: u32;
+    unsafe {
+        asm!("in eax, dx", out("eax") valor, in("dx") porta, options(nomem, nostack, preserves_flags));
+    }
+    valor
+}

@@ -427,6 +427,12 @@ fn sys_setgid(gid: u32) -> Resultado {
 /// `ioctl`: só existem os de terminal (termios, tamanho da janela).
 fn sys_ioctl(fd: u64, pedido: u64, ptr: u64) -> Resultado {
     let arq = arquivo(fd)?;
+    if let Tipo::No(no) = &arq.tipo {
+        if no.tipo()? == vfs::Tipo::Dispositivo(vfs::Dispositivo::Framebuffer) {
+            escrever_usuario(ptr, &crate::video::ioctl(pedido)?)?;
+            return Ok(0);
+        }
+    }
     let Some((terminal, mestre)) = arq.terminal() else { return Err(ENOTTY) };
     let dados = match tty::bytes_de_entrada(pedido) {
         0 => None,
@@ -582,9 +588,8 @@ fn sys_mknod(caminho: String, modo: u64) -> Resultado {
 /// as de MAP_SHARED são alocadas na hora (para um fork poder compartilhá-las).
 fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, deslocamento: u64) -> Resultado {
     const MAP_SHARED: u64 = 0x01;
-    const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-        if tamanho == 0 || tamanho > 1 << 34 || deslocamento & 0xFFF != 0 {
+    if tamanho == 0 || tamanho > 1 << 34 || deslocamento & 0xFFF != 0 {
         return Err(EINVAL);
     }
     let tamanho = (tamanho + 0xFFF) & !0xFFF;
@@ -597,6 +602,14 @@ fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, desloca
     } else {
         let arq = arquivo(fd)?;
         let Tipo::No(no) = &arq.tipo else { return Err(ENODEV) };
+        if no.tipo()? == vfs::Tipo::Dispositivo(vfs::Dispositivo::Framebuffer) {
+            // A memória de vídeo, direto na memória do programa.
+            let (fisico, total) = crate::video::memoria().ok_or(ENODEV)?;
+            if !compartilhada || deslocamento + tamanho > total {
+                return Err(EINVAL);
+            }
+            return mapear(endereco, tamanho, prot, flags, true, Fonte::Fisica { base: fisico + deslocamento });
+        }
         if no.tipo()? != vfs::Tipo::Arquivo {
             return Err(ENODEV);
         }
@@ -607,6 +620,12 @@ fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, desloca
         let total = no.tamanho()?;
         Fonte::Arquivo { no: no.clone(), deslocamento, tamanho: total.saturating_sub(deslocamento) }
     };
+    mapear(endereco, tamanho, prot, flags, compartilhada, fonte)
+}
+
+/// Cria a região de um mmap: no endereço pedido (MAP_FIXED) ou abaixo das anteriores.
+fn mapear(endereco: u64, tamanho: u64, prot: u64, flags: u64, compartilhada: bool, fonte: Fonte) -> Resultado {
+    const MAP_FIXED: u64 = 0x10;
     let p = processo::atual();
     let inicio = if flags & MAP_FIXED != 0 {
         if endereco & 0xFFF != 0 || endereco < crate::paginacao::USUARIO_INICIO {

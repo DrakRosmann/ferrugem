@@ -17,9 +17,12 @@
 //! O que se digita vai para o console que está na tela; Alt+F1..F4 troca de
 //! console (cada um com o seu login).
 
+use crate::erro::*;
 use crate::porta::inb;
+use crate::processo;
 use crate::spin::Mutex;
-use crate::{tty, vga};
+use crate::{mouse, tty, vga, video};
+use alloc::collections::VecDeque;
 
 const PORTA_DADOS: u16 = 0x60;
 const PORTA_STATUS: u16 = 0x64;
@@ -34,9 +37,78 @@ struct Estado {
     acento: Option<char>,
 }
 
-/// Entrega o caractere ao console visível.
+/// Quem abriu /dev/teclado (o servidor de janelas) recebe as teclas no
+/// lugar dos consoles: os caracteres em UTF-8, e as setas como ESC [ A..D.
+static CAPTURA: Mutex<Option<VecDeque<u8>>> = Mutex::new(None);
+
+fn canal() -> usize {
+    &raw const CAPTURA as usize
+}
+
+/// Entrega o caractere a quem capturou o teclado, ou ao console visível.
 fn receber(c: char) {
+    let mut captura = CAPTURA.lock();
+    if let Some(fila) = captura.as_mut() {
+        if fila.len() < 1024 {
+            let mut utf8 = [0u8; 4];
+            fila.extend(c.encode_utf8(&mut utf8).as_bytes());
+        }
+        drop(captura);
+        processo::acordar(canal());
+        return;
+    }
+    drop(captura);
     tty::receber(vga::ativa() as tty::IdTerminal, c);
+}
+
+/// Setas (só para quem capturou o teclado; os consoles não as usam).
+fn seta(letra: u8) {
+    let mut captura = CAPTURA.lock();
+    if let Some(fila) = captura.as_mut() {
+        fila.extend([0x1B, b'[', letra]);
+        drop(captura);
+        processo::acordar(canal());
+    }
+}
+
+pub fn capturar() -> Result<(), i64> {
+    let mut captura = CAPTURA.lock();
+    if captura.is_some() {
+        return Err(EBUSY);
+    }
+    *captura = Some(VecDeque::new());
+    Ok(())
+}
+
+pub fn soltar() {
+    *CAPTURA.lock() = None;
+}
+
+pub fn ler_capturado(buf: &mut [u8], bloquear: bool) -> Result<usize, i64> {
+    loop {
+        {
+            let mut captura = CAPTURA.lock();
+            let fila = captura.as_mut().ok_or(EIO)?;
+            if !fila.is_empty() {
+                let n = buf.len().min(fila.len());
+                for (destino, b) in buf.iter_mut().zip(fila.drain(..n)) {
+                    *destino = b;
+                }
+                return Ok(n);
+            }
+        }
+        if !bloquear {
+            return Err(EAGAIN);
+        }
+        if processo::tem_sinal_pendente() {
+            return Err(EINTR);
+        }
+        processo::dormir(canal());
+    }
+}
+
+pub fn pode_ler_capturado() -> bool {
+    CAPTURA.lock().as_ref().is_some_and(|f| !f.is_empty())
 }
 
 // Só o tratador da IRQ 1 mexe nisto, e ele nunca é interrompido: o lock nunca disputa.
@@ -60,8 +132,14 @@ pub fn init() {
 }
 
 pub fn tratar_irq() {
-    let scancode = unsafe { inb(PORTA_DADOS) };
-    ESTADO.lock().processar(scancode);
+    // O mouse usa a mesma porta: o bit 5 do status diz que o byte é dele.
+    let status = unsafe { inb(PORTA_STATUS) };
+    let byte = unsafe { inb(PORTA_DADOS) };
+    if status & 0x20 != 0 {
+        mouse::receber(byte);
+        return;
+    }
+    ESTADO.lock().processar(byte);
 }
 
 impl Estado {
@@ -79,6 +157,11 @@ impl Estado {
             // Home, AltGr etc. também chegam aqui, mas ainda não fazem nada.
             match (codigo, solta) {
                 (0x1D, _) => self.ctrl = !solta, // Ctrl da direita
+                (0x38, _) => self.alt = !solta,  // AltGr
+                (0x48, false) => seta(b'A'),
+                (0x50, false) => seta(b'B'),
+                (0x4D, false) => seta(b'C'),
+                (0x4B, false) => seta(b'D'),
                 (0x1C, false) => self.digitar('\n'),
                 (0x35, false) => self.digitar('/'),
                 _ => {}
@@ -89,6 +172,8 @@ impl Estado {
         match codigo {
             0x1D => self.ctrl = !solta,
             0x38 => self.alt = !solta,
+            // Ctrl+Alt+Backspace: derruba o modo gráfico (mata o servidor de janelas)
+            0x0E if !solta && self.ctrl && self.alt => video::emergencia(),
             // Alt+F1..F4: troca de console
             0x3B..=0x3E if !solta && self.alt => vga::ativar((codigo - 0x3B) as usize),
             0x2A => self.shift_esquerdo = !solta,

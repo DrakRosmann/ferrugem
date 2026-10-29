@@ -52,7 +52,14 @@ make lua        # baixa o Lua 5.4.9 de lua.org, confere, compila sem modificar
 
 Usuários de teste: **root** (senha `root`) e **usuario** (senha `usuario`).
 Dentro do sistema, digite `ajuda`. O teclado é ABNT2 (com acentos) e o Ctrl+C
-interrompe o programa que está rodando.
+interrompe o programa que está rodando. Alt+F1..F4 troca de console.
+
+**Interface gráfica:** com `make run`, entre na janela do QEMU e digite
+`janelas`. Clique na janela do QEMU para ele capturar o mouse (Ctrl+Alt+G
+solta). No painel: **Terminal** abre outro terminal, **Pintar** abre o
+programa de desenho e **Sair** volta ao modo texto. As janelas são arrastadas
+pelo título e fechadas no "x". Se algo travar, Ctrl+Alt+Backspace derruba a
+interface gráfica.
 
 ## O que já existe
 
@@ -119,6 +126,18 @@ interrompe o programa que está rodando.
   `/dev/tty`, `TIOCSCTTY`, `O_NOCTTY`; quando o líder da sessão sai (ou o
   mestre do pseudo-terminal fecha), o primeiro plano recebe **SIGHUP**.
 
+- **Interface gráfica:** framebuffer da placa Bochs VBE do QEMU (1024×768,
+  32 bits) em `/dev/fb0`, com os `ioctl` do Linux e `mmap` direto da memória
+  de vídeo; mouse PS/2 (IRQ 12) em `/dev/mouse`; captura do teclado em
+  `/dev/teclado`; a fonte 8×16 lida da própria VGA (`/dev/fonte`). Ao fechar
+  o framebuffer, o kernel repõe os registradores, a fonte e o texto do modo
+  texto.
+- **Servidor de janelas** (`janelas`), em modo usuário: área de trabalho,
+  painel com relógio, janelas arrastáveis, terminais (emulador com cores
+  ANSI ligado a um pseudo-terminal com um `sh`) e janelas de outros
+  programas, que conversam com o servidor por um socket Unix e desenham numa
+  memória compartilhada (`ulib::janela`; exemplo: `pintar`).
+
 **Modo usuário** (`usuario/`)
 - `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com
   `brk`, `print!`, sinais, ambiente, usuários, SHA-256.
@@ -155,6 +174,8 @@ interrompe o programa que está rodando.
 | `src/ata.rs`, `ext2.rs` | Driver de disco e sistema de arquivos ext2 |
 | `src/tty.rs`, `teclado.rs`, `serial.rs`, `vga.rs` | Consoles, pseudo-terminais e dispositivos de entrada e saída |
 | `src/socket.rs`, `epoll.rs`, `shm.rs` | Sockets Unix, epoll, memória compartilhada |
+| `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
+| `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
 | `comum/lista_livre.rs` | Alocador usado pelo kernel e pelos programas |
 | `usuario/src/lib.rs` + `sys.rs`, `io.rs` | `ulib`, a biblioteca dos programas |
 | `usuario/src/bin/*.rs` | Um programa por arquivo, todos vão para `/bin` |
@@ -205,9 +226,10 @@ versões do Linux.
    (`make lua`); depois, `dash` e `busybox`. O kernel avisa quando falta uma
    syscall: `chamada de sistema N não implementada`.
 2. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs — exige trocar o
-   "big kernel lock" por locks de verdade), boot UEFI, framebuffer.
+   "big kernel lock" por locks de verdade), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica:** mouse, servidor de janelas.
+4. **Interface gráfica:** mais programas com janela, redimensionar janelas,
+   fontes maiores, acentos completos (a fonte da VGA não tem "ã").
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

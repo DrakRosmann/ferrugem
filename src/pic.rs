@@ -46,9 +46,10 @@ pub fn init() {
         esperar();
 
         // Máscaras (bit 1 = IRQ bloqueada). Liberamos só o que sabemos tratar:
-        // timer (0), teclado (1) e COM1 (4).
-        outb(MESTRE_DADOS, !((1 << 0) | (1 << 1) | (1 << 4)));
-        outb(ESCRAVO_DADOS, 0xFF);
+        // timer (0), teclado (1), a ligação com o escravo (2), COM1 (4) e,
+        // no escravo, o mouse (12).
+        outb(MESTRE_DADOS, !((1 << 0) | (1 << 1) | (1 << 2) | (1 << 4)));
+        outb(ESCRAVO_DADOS, !(1 << (12 - 8)));
     }
 }
 

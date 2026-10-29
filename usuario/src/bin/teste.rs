@@ -1231,6 +1231,63 @@ fn pseudo_terminais() -> R {
     Ok(())
 }
 
+fn interface_grafica() -> R {
+    // O framebuffer: tamanho pelo ioctl, pixels pelo mmap, um dono por vez.
+    let fb = sys::abrir("/dev/fb0", sys::O_RDWR).map_err(|e| format!("/dev/fb0: {}", e))?;
+    let mut var = [0u8; 160];
+    sys::ioctl(fb, 0x4600, &mut var).map_err(erro)?;
+    let (largura, altura) = (u32::from_le_bytes(var[..4].try_into().unwrap()), u32::from_le_bytes(var[4..8].try_into().unwrap()));
+    if (largura, altura) != (1024, 768) {
+        return Err(format!("tela de {}x{}", largura, altura));
+    }
+    let tamanho = 1024 * 768 * 4;
+    let p = sys::mmap(tamanho, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_SHARED, fb, 0).map_err(erro)?;
+    let pixels = unsafe { core::slice::from_raw_parts_mut(p as *mut u32, 1024 * 768) };
+    pixels[1024 * 700 + 1000] = 0x00C0FFEE;
+    let lido = unsafe { core::ptr::read_volatile(&pixels[1024 * 700 + 1000]) };
+    let segundo = sys::abrir("/dev/fb0", sys::O_RDWR);
+    let _ = sys::munmap(p, tamanho);
+    let _ = sys::fechar(fb);
+    if lido != 0x00C0FFEE {
+        return Err(format!("a memória de vídeo devolveu {:#x}", lido));
+    }
+    if segundo != Err(sys::Erro(16)) {
+        return Err(String::from("um segundo open do /dev/fb0 deveria dar EBUSY"));
+    }
+    // O servidor de janelas de verdade e um cliente (socket + memória compartilhada).
+    let servidor = match sys::fork().map_err(erro)? {
+        0 => {
+            let _ = sys::executar("/bin/janelas", &["janelas"]);
+            sys::sair(127);
+        }
+        pid => pid,
+    };
+    let mut janela = None;
+    for _ in 0..60 {
+        let _ = sys::dormir_ms(50);
+        if let Ok(j) = ulib::janela::Janela::abrir(64, 32, "teste") {
+            janela = Some(j);
+            break;
+        }
+    }
+    let resultado = match janela.as_mut() {
+        Some(j) => {
+            j.quadro().retangulo(0, 0, 64, 32, 0x00FF00);
+            j.mostrar();
+            if j.quadro().pixels[64 * 31 + 63] == 0x00FF00 { Ok(()) } else { Err(String::from("pixels da janela")) }
+        }
+        None => Err(String::from("o janelas não aceitou a conexão")),
+    };
+    drop(janela);
+    let _ = sys::matar(servidor, sys::SIGTERM);
+    let _ = sys::esperar(servidor);
+    resultado?;
+    // Com o servidor morto, a tela voltou ao modo texto e o /dev/fb0 está livre.
+    let fb = sys::abrir("/dev/fb0", sys::O_RDWR).map_err(|e| format!("depois do servidor: {}", e))?;
+    let _ = sys::fechar(fb);
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1241,7 +1298,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 54] = [
+    let testes: [(&str, fn() -> R); 55] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1296,6 +1353,7 @@ fn principal(args: &[&str]) -> i32 {
         ("truncate: encolher (400 KB → 5 KB) e crescer com zeros", truncar),
         ("FIFOs: open espera a outra ponta (memória e ext2)", fifos),
         ("pseudo-terminais: eco, Ctrl+C e SIGHUP", pseudo_terminais),
+        ("interface gráfica: framebuffer, servidor de janelas e um cliente", interface_grafica),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

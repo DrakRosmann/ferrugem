@@ -36,7 +36,9 @@ mod spin;
 mod syscall;
 mod teclado;
 mod epoll;
+mod mouse;
 mod registro;
+mod video;
 mod shm;
 mod socket;
 mod tty;
@@ -121,6 +123,7 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     rtc::init();
     aleatorio::init();
     let discos = blocos::init();
+    let video = video::init(); // antes do /dev, que ganha o /dev/fb0 se houver a placa
     tty::init();
     vfs::init();
     // Com `raiz=/dev/hdX` na linha de comando, o sistema inteiro vem do disco;
@@ -151,7 +154,11 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     pic::init();
     pit::init();
     teclado::init();
-    ok(format_args!("PIC, timer a {} Hz, teclado ABNT2 e serial", pit::FREQUENCIA));
+    let mouse = if mouse::init() { ", mouse PS/2" } else { "" };
+    ok(format_args!("PIC, timer a {} Hz, teclado ABNT2{} e serial", pit::FREQUENCIA, mouse));
+    if let Some(descricao) = video {
+        ok(format_args!("{}", descricao));
+    }
 
     processo::init();
     if let Err(erro) = processo::criar_init("/bin/init") {

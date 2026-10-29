@@ -143,6 +143,8 @@ pub enum Fonte {
     /// Memória compartilhada (MAP_SHARED anônimo, shmget): as páginas são as
     /// do segmento, as mesmas para todos que o mapeiam. `pagina`: a primeira.
     Segmento { segmento: Arc<Segmento>, pagina: usize },
+    /// Memória física de um dispositivo (o framebuffer), a partir de `base`.
+    Fisica { base: u64 },
 }
 
 /// Páginas que vários espaços de endereçamento enxergam ao mesmo tempo.
@@ -229,6 +231,7 @@ impl Regiao {
                 *tamanho = tamanho.saturating_sub(bytes);
             }
             Fonte::Segmento { pagina, .. } => *pagina += (bytes / TAMANHO_PAGINA) as usize,
+            Fonte::Fisica { base } => *base += bytes,
             Fonte::Anonima => {}
         }
     }
@@ -485,6 +488,7 @@ impl EspacoEnderecos {
                 let i = primeira + ((pagina - regiao.inicio) / TAMANHO_PAGINA) as usize;
                 segmento.quadro(i)
             }
+            Fonte::Fisica { base } => Some(base + (pagina - regiao.inicio)),
             _ => quadros::alocar_zerado(),
         };
         let Some(quadro) = quadro else { return Falha::SemMemoria };

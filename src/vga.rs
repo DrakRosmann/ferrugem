@@ -75,6 +75,16 @@ pub const CONSOLES: usize = 4;
 
 /// Qual console está na placa de vídeo agora.
 static ATIVA: AtomicUsize = AtomicUsize::new(0);
+/// No modo gráfico (o servidor de janelas), ninguém escreve na memória do modo texto.
+static GRAFICO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Entra ou sai do modo gráfico (video.rs). Ao sair, redesenha o console ativo.
+pub fn modo_grafico(ligado: bool) {
+    GRAFICO.store(ligado, Ordering::Relaxed);
+    if !ligado {
+        interrupcoes::sem_interrupcoes(|| TELAS[ativa()].lock().mostrar());
+    }
+}
 
 pub fn ativa() -> usize {
     ATIVA.load(Ordering::Relaxed)
@@ -104,7 +114,7 @@ impl Tela {
     }
 
     fn visivel(&self) -> bool {
-        ativa() == self.numero
+        ativa() == self.numero && !GRAFICO.load(Ordering::Relaxed)
     }
 
     /// Consome um caractere de uma sequência de escape. Devolve `false` se
@@ -291,7 +301,7 @@ pub fn escrever(console: usize, texto: &str) {
 
 /// Troca o console que aparece na tela (Alt+F1..F4).
 pub fn ativar(console: usize) {
-    if console >= CONSOLES || console == ativa() {
+    if console >= CONSOLES || console == ativa() || GRAFICO.load(Ordering::Relaxed) {
         return;
     }
     interrupcoes::sem_interrupcoes(|| {

@@ -492,6 +492,7 @@ pub fn sinal_que_matou(status: i32) -> Option<i32> {
 }
 
 pub const SIGHUP: i32 = 1;
+pub const SIGPIPE: i32 = 13;
 pub const SIGINT: i32 = 2;
 pub const SIGKILL: i32 = 9;
 pub const SIGUSR1: i32 = 10;
@@ -802,6 +803,89 @@ pub fn enviar_para(fd: i32, dados: &[u8], caminho: &str) -> Resultado<usize> {
         resposta
     };
     conferir(r).map(|n| n as usize)
+}
+
+/// `poll`: espera algum dos descritores ficar pronto (ou `prazo_ms`; -1 = sem prazo).
+/// Cada item: (descritor, eventos pedidos); devolve os eventos de cada um.
+pub fn poll(itens: &[(i32, u16)], prazo_ms: i32) -> Resultado<Vec<u16>> {
+    let mut bruto: Vec<u8> = Vec::with_capacity(itens.len() * 8);
+    for &(fd, eventos) in itens {
+        bruto.extend_from_slice(&fd.to_le_bytes());
+        bruto.extend_from_slice(&eventos.to_le_bytes());
+        bruto.extend_from_slice(&0u16.to_le_bytes());
+    }
+    conferir(unsafe { syscall(7, bruto.as_mut_ptr() as u64, itens.len() as u64, prazo_ms as i64 as u64, 0) })?;
+    Ok(bruto.chunks_exact(8).map(|c| u16::from_le_bytes([c[6], c[7]])).collect())
+}
+
+pub const POLLIN: u16 = 0x1;
+pub const POLLOUT: u16 = 0x4;
+pub const POLLERR: u16 = 0x8;
+pub const POLLHUP: u16 = 0x10;
+
+/// O descritor fecha sozinho num `exec` (os programas que lançamos não o herdam).
+pub fn fechar_no_exec(fd: i32) {
+    unsafe { syscall(72, fd as u64, 2, 1, 0) }; // F_SETFD, FD_CLOEXEC
+}
+
+/// `ioctl` genérico: `dados` vai para o kernel e volta com a resposta.
+pub fn ioctl(fd: i32, pedido: u64, dados: &mut [u8]) -> Resultado<()> {
+    conferir(unsafe { syscall(16, fd as u64, pedido, dados.as_mut_ptr() as u64, 0) }).map(|_| ())
+}
+
+/// Diz ao terminal (ou pseudo-terminal) quantas linhas e colunas ele tem.
+pub fn definir_tamanho_terminal(fd: i32, linhas: u16, colunas: u16) -> Resultado<()> {
+    let mut janela = [0u8; 8];
+    janela[..2].copy_from_slice(&linhas.to_le_bytes());
+    janela[2..4].copy_from_slice(&colunas.to_le_bytes());
+    ioctl(fd, 0x5414, &mut janela) // TIOCSWINSZ
+}
+
+/// Quem está do outro lado de um socket Unix conectado: (pid, uid, gid).
+pub fn credenciais_do_par(fd: i32) -> Resultado<(i32, u32, u32)> {
+    let mut c = [0u32; 3];
+    let mut tamanho = 12u32;
+    let r = unsafe {
+        let resposta: i64;
+        asm!("syscall", inlateout("rax") 55i64 => resposta, in("rdi") fd as u64, in("rsi") 1u64, in("rdx") 17u64,
+             in("r10") c.as_mut_ptr() as u64, in("r8") &raw mut tamanho as u64,
+             lateout("rcx") _, lateout("r11") _, options(nostack));
+        resposta
+    };
+    conferir(r).map(|_| (c[0] as i32, c[1], c[2]))
+}
+
+// ---------------------------------------- memória compartilhada (System V)
+
+pub const IPC_PRIVATE: i32 = 0;
+pub const IPC_CREAT: u64 = 0o1000;
+
+pub fn shmget(chave: i32, tamanho: usize, flags: u64) -> Resultado<i32> {
+    conferir(unsafe { syscall(29, chave as u64, tamanho as u64, flags, 0) }).map(|id| id as i32)
+}
+
+/// Anexa o segmento; devolve o endereço onde ele ficou.
+pub fn shmat(id: i32) -> Resultado<usize> {
+    let r = unsafe { syscall(30, id as u64, 0, 0, 0) };
+    conferir(r).map(|e| e as usize)
+}
+
+pub fn shmdt(endereco: usize) -> Resultado<()> {
+    conferir(unsafe { syscall(67, endereco as u64, 0, 0, 0) }).map(|_| ())
+}
+
+/// IPC_RMID: o segmento some quando o último se desanexar.
+pub fn shm_remover(id: i32) -> Resultado<()> {
+    conferir(unsafe { syscall(31, id as u64, 0, 0, 0) }).map(|_| ())
+}
+
+/// IPC_SET: passa o segmento para outro dono (com permissão só para ele).
+pub fn shm_dar_para(id: i32, uid: u32, gid: u32) -> Resultado<()> {
+    let mut perm = [0u8; 48];
+    perm[4..8].copy_from_slice(&uid.to_le_bytes());
+    perm[8..12].copy_from_slice(&gid.to_le_bytes());
+    perm[20..22].copy_from_slice(&0o600u16.to_le_bytes());
+    conferir(unsafe { syscall(31, id as u64, 1, perm.as_mut_ptr() as u64, 0) }).map(|_| ())
 }
 
 /// As mensagens do kernel (o `dmesg`): a chamada `syslog` do Linux.

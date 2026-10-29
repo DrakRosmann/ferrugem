@@ -57,6 +57,14 @@ pub enum Dispositivo {
     Ptmx,
     /// /dev/pts/N: o lado escravo de um pseudo-terminal (pelo id do terminal).
     PtyEscravo(u32),
+    /// /dev/fb0: o framebuffer (abrir põe a tela no modo gráfico).
+    Framebuffer,
+    /// /dev/mouse: pacotes de 3 bytes do mouse PS/2.
+    Mouse,
+    /// /dev/teclado: abrir captura o teclado (as teclas deixam de ir aos consoles).
+    Teclado,
+    /// /dev/fonte: a fonte 8×16 da VGA (4096 bytes).
+    Fonte,
 }
 
 /// Um nó da árvore em memória.
@@ -460,6 +468,12 @@ pub fn init() {
         let _ = criar_na_memoria(&format!("/dev/tty{}", i + 1), Conteudo::Dispositivo(Dispositivo::Console(i as u8)), Some(meta));
     }
     let _ = criar_na_memoria("/dev/ptmx", Conteudo::Dispositivo(Dispositivo::Ptmx), None);
+    if crate::video::existe() {
+        let _ = criar_na_memoria("/dev/fb0", Conteudo::Dispositivo(Dispositivo::Framebuffer), None);
+        let _ = criar_na_memoria("/dev/fonte", Conteudo::Dispositivo(Dispositivo::Fonte), Some(Meta::de_root(0o444)));
+    }
+    let _ = criar_na_memoria("/dev/mouse", Conteudo::Dispositivo(Dispositivo::Mouse), None);
+    let _ = criar_na_memoria("/dev/teclado", Conteudo::Dispositivo(Dispositivo::Teclado), None);
     let _ = criar_na_memoria("/dev/pts", diretorio_vazio(), None);
     let _ = criar_na_memoria("/dev/null", Conteudo::Dispositivo(Dispositivo::Nulo), None);
     let _ = criar_na_memoria("/dev/zero", Conteudo::Dispositivo(Dispositivo::Zero), None);

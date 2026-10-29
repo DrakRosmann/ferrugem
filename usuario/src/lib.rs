@@ -22,7 +22,9 @@
 
 extern crate alloc;
 
+pub mod grafico;
 pub mod io;
+pub mod janela;
 #[path = "../../comum/lista_livre.rs"]
 mod lista_livre;
 mod memoria;
