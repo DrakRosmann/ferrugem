@@ -623,7 +623,7 @@ fn carregar_programa(caminho: &str, args: &[String], ambiente: &[String], cred: 
             no.permite(cred, vfs::EXECUTAR)?;
             no.ler_tudo()?
         }
-        vfs::Tipo::Diretorio | vfs::Tipo::Dispositivo(_) | vfs::Tipo::Link => return Err(EACCES),
+        vfs::Tipo::Diretorio | vfs::Tipo::Dispositivo(_) | vfs::Tipo::Link | vfs::Tipo::Fifo => return Err(EACCES),
     };
     let mut espaco = EspacoEnderecos::novo().ok_or(ENOMEM)?;
     let programa = elf::carregar(&dados, &mut espaco)?;

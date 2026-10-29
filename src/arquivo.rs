@@ -29,6 +29,7 @@ pub const O_CREAT: u64 = 0o100;
 pub const O_EXCL: u64 = 0o200;
 pub const O_TRUNC: u64 = 0o1000;
 pub const O_APPEND: u64 = 0o2000;
+pub const O_NONBLOCK: u64 = 0o4000;
 pub const O_DIRECTORY: u64 = 0o200000;
 
 pub enum Tipo {
@@ -67,6 +68,9 @@ impl Arquivo {
             }
             Err(e) => return Err(e),
         };
+        if no.tipo()? == vfs::Tipo::Fifo {
+            return Pipe::abrir_fifo(vfs::pipe_do_fifo(&no), flags);
+        }
         match no.tipo()? {
             vfs::Tipo::Diretorio if escrita => return Err(EISDIR),
             vfs::Tipo::Diretorio => {}
@@ -94,7 +98,7 @@ impl Arquivo {
                 Ok(n)
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
-            vfs::Tipo::Link => Err(EINVAL), // o open segue os links: não chega aqui
+            vfs::Tipo::Link | vfs::Tipo::Fifo => Err(EINVAL), // o open segue links e abre FIFOs como pipe
             // Ler o terminal pode dormir até alguém digitar.
             vfs::Tipo::Dispositivo(Dispositivo::Terminal) => tty::ler(buf),
             vfs::Tipo::Dispositivo(Dispositivo::Nulo) => Ok(0),
@@ -136,7 +140,7 @@ impl Arquivo {
                 Ok(n)
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
-            vfs::Tipo::Link => Err(EINVAL),
+            vfs::Tipo::Link | vfs::Tipo::Fifo => Err(EINVAL),
             vfs::Tipo::Dispositivo(Dispositivo::Terminal) => {
                 tty::escrever(dados);
                 Ok(dados.len())
@@ -177,6 +181,7 @@ impl Arquivo {
         let tamanho = match no.tipo()? {
             vfs::Tipo::Arquivo => no.tamanho()? as i64,
             vfs::Tipo::Diretorio | vfs::Tipo::Link => 0,
+            vfs::Tipo::Fifo => return Err(ESPIPE),
             vfs::Tipo::Dispositivo(Dispositivo::Bloco(i)) => {
                 crate::blocos::listar().get(i as usize).map_or(0, |b| b.tamanho() as i64)
             }
@@ -202,10 +207,12 @@ impl Drop for Arquivo {
         match &self.tipo {
             Tipo::LeituraPipe(pipe) => {
                 pipe.leitores.fetch_sub(1, Ordering::Relaxed);
+                pipe.esvaziar_se_ninguem_usa();
                 processo::acordar(pipe.canal());
             }
             Tipo::EscritaPipe(pipe) => {
                 pipe.escritores.fetch_sub(1, Ordering::Relaxed);
+                pipe.esvaziar_se_ninguem_usa();
                 processo::acordar(pipe.canal());
             }
             Tipo::No(_) => {}
@@ -225,6 +232,9 @@ pub struct Pipe {
     dados: Mutex<VecDeque<u8>>,
     leitores: AtomicUsize,
     escritores: AtomicUsize,
+    /// Quantas vezes cada ponta já foi aberta (para o open de um FIFO saber
+    /// que alguém apareceu, mesmo que já tenha ido embora).
+    aberturas: [AtomicUsize; 2],
 }
 
 impl Pipe {
@@ -234,12 +244,20 @@ impl Pipe {
             dados: Mutex::new(VecDeque::new()),
             leitores: AtomicUsize::new(1),
             escritores: AtomicUsize::new(1),
+            aberturas: [AtomicUsize::new(1), AtomicUsize::new(1)],
         });
         let ponta = |tipo, flags| Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags });
         (
             ponta(Tipo::LeituraPipe(pipe.clone()), O_RDONLY),
             ponta(Tipo::EscritaPipe(pipe), O_WRONLY),
         )
+    }
+
+    /// Num FIFO, quando todo mundo fecha, o que sobrou no pipe se perde (como no Unix).
+    fn esvaziar_se_ninguem_usa(&self) {
+        if self.leitores.load(Ordering::Relaxed) == 0 && self.escritores.load(Ordering::Relaxed) == 0 {
+            self.dados.lock().clear();
+        }
     }
 
     fn prontidao(&self, escrita: bool) -> u16 {
@@ -259,6 +277,52 @@ impl Pipe {
             }
             r
         }
+    }
+
+    /// O pipe de um FIFO: começa sem ninguém nas pontas.
+    pub fn vazio() -> Arc<Pipe> {
+        Arc::new(Pipe {
+            dados: Mutex::new(VecDeque::new()),
+            leitores: AtomicUsize::new(0),
+            escritores: AtomicUsize::new(0),
+            aberturas: [AtomicUsize::new(0), AtomicUsize::new(0)],
+        })
+    }
+
+    /// Abrir um FIFO: quem abre para ler espera alguém abrir para escrever, e
+    /// vice-versa (com O_NONBLOCK, ler não espera e escrever sem leitor dá ENXIO).
+    pub fn abrir_fifo(pipe: Arc<Pipe>, flags: u64) -> Result<Arc<Arquivo>, i64> {
+        const ENXIO: i64 = 6;
+        let escrita = match flags & O_ACESSO {
+            O_RDONLY => false,
+            O_WRONLY => true,
+            _ => return Err(EINVAL),
+        };
+        if escrita && flags & O_NONBLOCK != 0 && pipe.leitores.load(Ordering::Relaxed) == 0 {
+            return Err(ENXIO);
+        }
+        let minha_ponta = if escrita { &pipe.escritores } else { &pipe.leitores };
+        let outras_aberturas = &pipe.aberturas[!escrita as usize];
+        let antes = outras_aberturas.load(Ordering::Relaxed);
+        minha_ponta.fetch_add(1, Ordering::Relaxed);
+        pipe.aberturas[escrita as usize].fetch_add(1, Ordering::Relaxed);
+        processo::acordar(pipe.canal());
+        // Montado já agora: se a espera for interrompida, o Drop desfaz a contagem.
+        let tipo = if escrita { Tipo::EscritaPipe(pipe.clone()) } else { Tipo::LeituraPipe(pipe.clone()) };
+        let arquivo = Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags: flags & O_ACESSO });
+        let outra = if escrita { &pipe.leitores } else { &pipe.escritores };
+        // Espera alguém na outra ponta — ou que alguém tenha aparecido (e talvez
+        // já ido embora) enquanto esperávamos.
+        while flags & O_NONBLOCK == 0
+            && outra.load(Ordering::Relaxed) == 0
+            && outras_aberturas.load(Ordering::Relaxed) == antes
+        {
+            if processo::tem_sinal_pendente() {
+                return Err(EINTR);
+            }
+            processo::dormir(pipe.canal());
+        }
+        Ok(arquivo)
     }
 
     /// O "canal" onde leitores e escritores dormem: o endereço do próprio pipe.

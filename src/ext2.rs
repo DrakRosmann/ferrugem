@@ -47,9 +47,11 @@ pub const RAIZ: u32 = 2;
 const MODO_DIRETORIO: u16 = 0x4000;
 const MODO_ARQUIVO: u16 = 0x8000;
 const MODO_LINK: u16 = 0xA000;
+const MODO_FIFO: u16 = 0x1000;
 pub const TIPO_ENTRADA_ARQUIVO: u8 = 1;
 pub const TIPO_ENTRADA_DIRETORIO: u8 = 2;
 pub const TIPO_ENTRADA_LINK: u8 = 7;
+pub const TIPO_ENTRADA_FIFO: u8 = 5;
 const MAX_CACHE: usize = 2048;
 
 /// Cada sistema de arquivos montado recebe um número (para os ids dos inodes
@@ -87,11 +89,16 @@ impl Inode {
     fn eh_link_rapido(&self) -> bool {
         self.eh_link() && rd32(&self.0, 28) == 0
     }
+    fn eh_fifo(&self) -> bool {
+        self.modo() & 0xF000 == MODO_FIFO
+    }
     fn tipo_entrada(&self) -> u8 {
         if self.eh_diretorio() {
             TIPO_ENTRADA_DIRETORIO
         } else if self.eh_link() {
             TIPO_ENTRADA_LINK
+        } else if self.eh_fifo() {
+            TIPO_ENTRADA_FIFO
         } else {
             TIPO_ENTRADA_ARQUIVO
         }
@@ -127,6 +134,7 @@ impl Inode {
         InfoInode {
             diretorio: self.eh_diretorio(),
             link: self.eh_link(),
+            fifo: self.eh_fifo(),
             tamanho: self.tamanho(),
             modificado: self.modificado_em(),
             permissoes: (self.modo() & 0o7777) as u32,
@@ -146,6 +154,7 @@ impl Inode {
 pub struct InfoInode {
     pub diretorio: bool,
     pub link: bool,
+    pub fifo: bool,
     pub tamanho: u64,
     pub modificado: u64,
     pub permissoes: u32,
@@ -371,8 +380,24 @@ impl Ext2 {
     }
 
     pub fn criar(&self, dir: u32, nome: &str, diretorio: bool, permissoes: u32, uid: u32, gid: u32) -> Result<u32, i64> {
+        let tipo = if diretorio { MODO_DIRETORIO } else { MODO_ARQUIVO };
+        self.criar_do_tipo(dir, nome, tipo, permissoes, uid, gid)
+    }
+
+    /// Um FIFO (pipe com nome): só um inode, sem dados (o pipe vive no kernel).
+    pub fn criar_fifo(&self, dir: u32, nome: &str, permissoes: u32, uid: u32, gid: u32) -> Result<u32, i64> {
+        self.criar_do_tipo(dir, nome, MODO_FIFO, permissoes, uid, gid)
+    }
+
+    /// Muda o tamanho: encolher devolve os blocos que sobram; crescer só
+    /// muda o número (o meio vira um "buraco", lido como zeros).
+    pub fn truncar_para(&self, inode: u32, tamanho: u64) -> Result<(), i64> {
+        self.operar(|e| e.truncar_para(inode, tamanho))
+    }
+
+    fn criar_do_tipo(&self, dir: u32, nome: &str, tipo: u16, permissoes: u32, uid: u32, gid: u32) -> Result<u32, i64> {
         self.operar(|e| {
-            let numero = e.criar(dir, nome, diretorio)?;
+            let numero = e.criar(dir, nome, tipo)?;
             let mut i = e.ler_inode(numero)?;
             let modo = (i.modo() & 0xF000) | (permissoes & 0o7777) as u16;
             wr16(&mut i.0, 0, modo);
@@ -673,6 +698,101 @@ impl Estado {
         Ok(())
     }
 
+    fn truncar_para(&mut self, numero: u32, tamanho: u64) -> Result<(), i64> {
+        let mut inode = self.ler_inode(numero)?;
+        if inode.eh_diretorio() || inode.eh_link() {
+            return Err(EINVAL);
+        }
+        let antigo = inode.tamanho();
+        let tb = self.tamanho_bloco as u64;
+        if tamanho < antigo {
+            let manter = tamanho.div_ceil(tb) as u32;
+            for indice in manter..antigo.div_ceil(tb) as u32 {
+                self.soltar_bloco(&mut inode, indice)?;
+            }
+            self.soltar_tabelas_vazias(&mut inode, manter)?;
+            // O resto do último bloco que fica precisa virar zero: se o arquivo
+            // crescer de novo, o que estava ali não pode reaparecer.
+            if tamanho % tb != 0 {
+                let bloco = self.bloco_de(&mut inode, (tamanho / tb) as u32, false)?;
+                if bloco != 0 {
+                    let mut dados = self.ler_bloco(bloco)?;
+                    dados[(tamanho % tb) as usize..].fill(0);
+                    self.escrever_bloco(bloco, &dados)?;
+                }
+            }
+        }
+        inode.definir_tamanho(tamanho);
+        inode.tocar();
+        self.escrever_inode(numero, &inode)
+    }
+
+    /// Devolve o bloco `indice` do arquivo e zera o ponteiro para ele.
+    fn soltar_bloco(&mut self, inode: &mut Inode, indice: u32) -> Result<(), i64> {
+        let por_bloco = (self.tamanho_bloco / 4) as u32;
+        if indice < 12 {
+            let bloco = inode.bloco(indice as usize);
+            if bloco != 0 {
+                self.liberar_bloco(bloco)?;
+                inode.definir_bloco(indice as usize, 0);
+                inode.somar_setores(-(self.setores_por_bloco() as i64));
+            }
+            return Ok(());
+        }
+        let i = indice - 12;
+        if i < por_bloco {
+            let tabela = inode.bloco(12);
+            return if tabela == 0 { Ok(()) } else { self.soltar_da_tabela(inode, tabela, i) };
+        }
+        let i = i - por_bloco;
+        let t1 = inode.bloco(13);
+        if t1 == 0 || i >= por_bloco * por_bloco {
+            return Ok(());
+        }
+        let t2 = rd32(&self.ler_bloco(t1)?, (i / por_bloco) as usize * 4);
+        if t2 == 0 { Ok(()) } else { self.soltar_da_tabela(inode, t2, i % por_bloco) }
+    }
+
+    /// Zera a entrada `i` de uma tabela de índices, devolvendo o bloco a que ela apontava.
+    fn soltar_da_tabela(&mut self, inode: &mut Inode, tabela: u32, i: u32) -> Result<(), i64> {
+        let mut dados = self.ler_bloco(tabela)?;
+        let bloco = rd32(&dados, i as usize * 4);
+        if bloco != 0 {
+            self.liberar_bloco(bloco)?;
+            wr32(&mut dados, i as usize * 4, 0);
+            self.escrever_bloco(tabela, &dados)?;
+            inode.somar_setores(-(self.setores_por_bloco() as i64));
+        }
+        Ok(())
+    }
+
+    /// Depois de encolher, as tabelas de índices que só cobriam blocos
+    /// apagados também voltam a ser livres.
+    fn soltar_tabelas_vazias(&mut self, inode: &mut Inode, manter: u32) -> Result<(), i64> {
+        let por_bloco = (self.tamanho_bloco / 4) as u32;
+        let setores = self.setores_por_bloco() as i64;
+        if manter <= 12 && inode.bloco(12) != 0 {
+            self.liberar_bloco(inode.bloco(12))?;
+            inode.definir_bloco(12, 0);
+            inode.somar_setores(-setores);
+        }
+        let inicio_duplo = 12 + por_bloco;
+        let t1 = inode.bloco(13);
+        if t1 != 0 {
+            for j in 0..por_bloco {
+                if manter <= inicio_duplo + j * por_bloco {
+                    self.soltar_da_tabela(inode, t1, j)?; // a tabela j inteira já está vazia
+                }
+            }
+            if manter <= inicio_duplo {
+                self.liberar_bloco(t1)?;
+                inode.definir_bloco(13, 0);
+                inode.somar_setores(-setores);
+            }
+        }
+        Ok(())
+    }
+
     fn liberar_tabela(&mut self, tabela: u32, nivel: usize) -> Result<(), i64> {
         let dados = self.ler_bloco(tabela)?;
         for i in 0..self.tamanho_bloco / 4 {
@@ -872,10 +992,11 @@ impl Estado {
         self.escrever_inode(numero, &inode)
     }
 
-    fn criar(&mut self, dir: u32, nome: &str, diretorio: bool) -> Result<u32, i64> {
+    fn criar(&mut self, dir: u32, nome: &str, tipo: u16) -> Result<u32, i64> {
         if self.buscar(dir, nome).is_ok() {
             return Err(EEXIST);
         }
+        let diretorio = tipo == MODO_DIRETORIO;
         let numero = self.alocar_inode(diretorio)?;
         let mut inode = Inode([0; 128]);
         inode.tocar();
@@ -897,12 +1018,11 @@ impl Estado {
             self.escrever_bloco(bloco, &dados)?;
             inode.definir_tamanho(self.tamanho_bloco as u64);
         } else {
-            wr16(&mut inode.0, 0, MODO_ARQUIVO | 0o644);
+            wr16(&mut inode.0, 0, tipo | 0o644);
             inode.definir_links(1);
         }
         self.escrever_inode(numero, &inode)?;
-        let tipo = if diretorio { TIPO_ENTRADA_DIRETORIO } else { TIPO_ENTRADA_ARQUIVO };
-        self.adicionar_entrada(dir, nome, numero, tipo)?;
+        self.adicionar_entrada(dir, nome, numero, inode.tipo_entrada())?;
         if diretorio {
             self.mudar_links(dir, 1)?; // o ".." do filho aponta para o pai
         }

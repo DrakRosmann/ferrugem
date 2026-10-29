@@ -110,9 +110,11 @@ pub fn tratar(ctx: &mut Contexto) {
         63 => sys_uname(a1),
         72 => sys_fcntl(a1, a2, a3),
         74 | 75 => sys_fsync(a1), // fsync/fdatasync
+        76 => caminho(a1).and_then(|c| sys_truncate(&c, a2)),
         77 => sys_ftruncate(a1, a2),
         86 => sys_link(caminho(a1), caminho(a2)),
         88 => sys_symlink(a1, caminho(a2)),
+        133 => caminho(a1).and_then(|c| sys_mknod(c, a2)),
         89 => sys_readlink(caminho(a1), a2, a3),
         96 => sys_gettimeofday(a1),
         79 => sys_getcwd(a1, a2),
@@ -165,6 +167,7 @@ pub fn tratar(ctx: &mut Contexto) {
         262 => sys_newfstatat(a1, a2, a3, ctx.r10),
         270 => prazo_de_timespec(a5).and_then(|prazo| sys_select(a1, a2, a3, a4, prazo)), // pselect6 (sem máscara)
         271 => prazo_de_timespec(a3).and_then(|prazo| sys_poll(a1, a2, prazo)), // ppoll (sem máscara)
+        259 => caminho_at(a1, a2).and_then(|c| sys_mknod(c, a3)),
         265 => sys_link(caminho_at(a1, a2), caminho_at(a3, ctx.r10)),
         266 => sys_symlink(a1, caminho_at(a2, a3)),
         267 => sys_readlink(caminho_at(a1, a2), a3, ctx.r10),
@@ -525,14 +528,31 @@ fn sys_renameat(dir_de: u64, de: u64, dir_para: u64, para: u64) -> Resultado {
     vfs::renomear(&de, &para).map(|_| 0)
 }
 
-/// Só esvaziar (tamanho 0) é suportado; é o caso comum (`O_TRUNC` à mão).
+/// `ftruncate`: precisa ter aberto o arquivo para escrever.
 fn sys_ftruncate(fd: u64, tamanho: u64) -> Resultado {
     let arq = arquivo(fd)?;
+    if arq.flags() & 3 == 0 {
+        return Err(EINVAL);
+    }
     let Tipo::No(no) = &arq.tipo else { return Err(EINVAL) };
-    match tamanho {
-        0 => no.truncar().map(|_| 0),
-        t if t == no.tamanho()? => Ok(0),
-        _ => Err(EINVAL),
+    no.truncar_para(tamanho).map(|_| 0)
+}
+
+fn sys_truncate(caminho: &str, tamanho: u64) -> Resultado {
+    let no = vfs::buscar_como(caminho, cred())?;
+    no.permite(cred(), vfs::ESCREVER)?;
+    no.truncar_para(tamanho).map(|_| 0)
+}
+
+/// `mknod`: aqui, só FIFOs (S_IFIFO) e arquivos comuns. Dispositivos não.
+fn sys_mknod(caminho: String, modo: u64) -> Resultado {
+    pai_gravavel(&caminho)?;
+    let c = cred();
+    let meta = vfs::Meta { permissoes: permissoes_novas(modo), uid: c.uid, gid: c.gid, modificado: rtc::agora() };
+    match modo as u32 & 0o170000 {
+        S_IFIFO => vfs::criar_fifo(&caminho, meta).map(|_| 0),
+        0 | S_IFREG => vfs::criar(&caminho, false, meta).map(|_| 0),
+        _ => Err(EPERM),
     }
 }
 
@@ -818,6 +838,7 @@ fn stat_do_no(no: &Vnode) -> Result<[u8; 144], i64> {
         vfs::Tipo::Diretorio => S_IFDIR,
         vfs::Tipo::Dispositivo(_) => S_IFCHR,
         vfs::Tipo::Link => S_IFLNK,
+        vfs::Tipo::Fifo => S_IFIFO,
     };
     let m = no.meta()?;
     Ok(montar_stat(no.id(), tipo | m.permissoes, no.tamanho()?, m.modificado, m.uid, m.gid))
@@ -885,6 +906,7 @@ fn sys_getdents64(fd: u64, buf: u64, tamanho: u64) -> Resultado {
             vfs::Tipo::Arquivo => 8,         // DT_REG
             vfs::Tipo::Dispositivo(_) => 2,  // DT_CHR
             vfs::Tipo::Link => 10,           // DT_LNK
+            vfs::Tipo::Fifo => 1,            // DT_FIFO
         };
         entradas.push((nome, id, tipo));
     }

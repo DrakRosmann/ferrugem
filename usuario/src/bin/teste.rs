@@ -1055,6 +1055,71 @@ fn disco_cru() -> R {
     }
 }
 
+fn truncar_em(base: &str) -> R {
+    let caminho = format!("{}/teste-truncar", base);
+    let livres_antes = sys::statfs(base).map_err(erro)?.livres;
+    // 400 KB: no ext2, passa pelos blocos diretos, indiretos e duplo-indiretos
+    let dados: Vec<u8> = (0..400_000u32).map(|i| (i % 253) as u8 + 1).collect();
+    let fd = sys::abrir(&caminho, sys::O_RDWR | sys::O_CREAT | sys::O_TRUNC).map_err(erro)?;
+    sys::escrever_tudo(fd, &dados).map_err(erro)?;
+    sys::truncar_fd(fd, 5000).map_err(erro)?;
+    let _ = sys::fechar(fd);
+    let encolhido = sys::ler_arquivo(&caminho).map_err(erro)?;
+    if encolhido != dados[..5000] {
+        return Err(format!("depois de encolher: {} bytes", encolhido.len()));
+    }
+    // Crescer: o que vem depois tem que ser zero (não o conteúdo antigo).
+    sys::truncar(&caminho, 20_000).map_err(erro)?;
+    let crescido = sys::ler_arquivo(&caminho).map_err(erro)?;
+    if crescido.len() != 20_000 || crescido[..5000] != dados[..5000] || crescido[5000..].iter().any(|&b| b != 0) {
+        return Err(String::from("depois de crescer, o fim não é só zeros"));
+    }
+    sys::remover(&caminho).map_err(erro)?;
+    let livres_depois = sys::statfs(base).map_err(erro)?.livres;
+    if base == "/disco" && livres_antes != livres_depois {
+        return Err(format!("blocos livres: {} antes, {} depois", livres_antes, livres_depois));
+    }
+    Ok(())
+}
+
+fn truncar() -> R {
+    truncar_em("/tmp")?;
+    truncar_em("/disco")
+}
+
+fn fifo_em(base: &str) -> R {
+    let caminho = format!("{}/teste-fifo", base);
+    sys::criar_fifo(&caminho, 0o600).map_err(erro)?;
+    if !sys::stat(&caminho).map_err(erro)?.eh_fifo() {
+        return Err(String::from("stat não diz que é FIFO"));
+    }
+    if sys::abrir(&caminho, sys::O_WRONLY | sys::O_NONBLOCK) != Err(sys::Erro(6)) {
+        return Err(String::from("abrir para escrever sem leitor deveria dar ENXIO"));
+    }
+    let filho = match sys::fork() {
+        Ok(0) => {
+            let _ = sys::dormir_ms(30); // o pai já vai estar esperando no open
+            let Ok(fd) = sys::abrir(&caminho, sys::O_WRONLY) else { sys::sair(1) };
+            let _ = sys::escrever_tudo(fd, b"pelo fifo");
+            sys::sair(0);
+        }
+        Ok(pid) => pid,
+        Err(e) => return Err(erro(e)),
+    };
+    // Este open espera o filho abrir a outra ponta.
+    let fd = sys::abrir(&caminho, sys::O_RDONLY).map_err(erro)?;
+    let recebido = ler_tudo(fd);
+    let _ = sys::fechar(fd);
+    let _ = sys::esperar(filho);
+    sys::remover(&caminho).map_err(erro)?;
+    if recebido == b"pelo fifo" { Ok(()) } else { Err(format!("recebi {:?}", String::from_utf8_lossy(&recebido))) }
+}
+
+fn fifos() -> R {
+    fifo_em("/tmp")?;
+    fifo_em("/disco")
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1065,7 +1130,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 51] = [
+    let testes: [(&str, fn() -> R); 53] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1117,6 +1182,8 @@ fn principal(args: &[&str]) -> i32 {
         ("mount/umount de uma partição (hdb1) e statfs", montar_particao),
         ("tmpfs e /proc/mounts", tmpfs_e_proc),
         ("disco cru (/dev/hdb): tabela de partições; só o root lê", disco_cru),
+        ("truncate: encolher (400 KB → 5 KB) e crescer com zeros", truncar),
+        ("FIFOs: open espera a outra ponta (memória e ext2)", fifos),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

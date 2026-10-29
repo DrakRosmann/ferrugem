@@ -217,6 +217,9 @@ impl Stat {
     pub fn eh_link(&self) -> bool {
         self.modo & 0o170000 == 0o120000
     }
+    pub fn eh_fifo(&self) -> bool {
+        self.modo & 0o170000 == 0o010000
+    }
 }
 
 fn decodificar_stat(b: &[u8; 144]) -> Stat {
@@ -821,3 +824,21 @@ pub fn statfs(caminho: &str) -> Resultado<InfoSistema> {
     conferir(unsafe { syscall(137, c.as_ptr() as u64, b.as_mut_ptr() as u64, 0, 0) })?;
     Ok(InfoSistema { tipo: b[0], tamanho_bloco: b[1], blocos: b[2], livres: b[3], inodes: b[5], inodes_livres: b[6] })
 }
+
+/// Cria um FIFO (pipe com nome).
+pub fn criar_fifo(caminho: &str, permissoes: u32) -> Resultado<()> {
+    let c = string_c(caminho);
+    conferir(unsafe { syscall(133, c.as_ptr() as u64, 0o010000 | permissoes as u64, 0, 0) }).map(|_| ())
+}
+
+/// Muda o tamanho de um arquivo (encolhendo ou com um buraco de zeros no fim).
+pub fn truncar(caminho: &str, tamanho: u64) -> Resultado<()> {
+    let c = string_c(caminho);
+    conferir(unsafe { syscall(76, c.as_ptr() as u64, tamanho, 0, 0) }).map(|_| ())
+}
+
+pub fn truncar_fd(fd: i32, tamanho: u64) -> Resultado<()> {
+    conferir(unsafe { syscall(77, fd as u64, tamanho, 0, 0) }).map(|_| ())
+}
+
+pub const O_NONBLOCK: u64 = 0o4000;

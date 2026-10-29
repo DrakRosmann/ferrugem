@@ -102,6 +102,8 @@ fn mostrar(itens: &[(String, sys::Stat)], longo: bool) {
                 'd'
             } else if info.eh_dispositivo() {
                 'c'
+            } else if info.eh_fifo() {
+                'p'
             } else {
                 '-'
             };

@@ -96,7 +96,8 @@ interrompe o programa que está rodando.
 - **Discos:** os 4 discos IDE e as partições MBR (`/dev/hda`, `/dev/hdb1`...,
   legíveis cruas pelo root); `mount`/`umount` de ext2, `tmpfs` e `proc` em
   qualquer diretório; cache de disco com escrita adiada (vai para o disco no
-  `sync`, ao desmontar, ao desligar ou a cada 3 s); `statfs` e `df`.
+  `sync`, ao desmontar, ao desligar ou a cada 3 s); `statfs` e `df`;
+  `truncate` para qualquer tamanho; FIFOs (`mkfifo`) na memória e no ext2.
 - **Terminal:** edição de linha no kernel, `termios` (eco e modo canônico
   ligáveis), Ctrl+C (SIGINT) e Ctrl+Z (SIGTSTP) só para o job em primeiro
   plano, Ctrl+D vira fim de arquivo, cores ANSI tanto na VGA quanto na serial.
@@ -107,7 +108,7 @@ interrompe o programa que está rodando.
 - `init` (processo 1) → `login` → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
   `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`,
   e controle de jobs: Ctrl+Z, `jobs`, `fg`, `bg`.
-- `rastro` (um strace: `rastro ls`, `rastro -c lua script.lua`), `mount umount sync df`, `login su passwd id whoami chmod chown env ln readlink ls cat echo cp mv rm mkdir rmdir
+- `rastro` (um strace: `rastro ls`, `rastro -c lua script.lua`), `mount umount sync df mkfifo truncate`, `login su passwd id whoami chmod chown env ln readlink ls cat echo cp mv rm mkdir rmdir
   touch grep wc head ps kill sleep date uptime free df uname clear desligar
   reiniciar teste`.
 - **Em C, com a musl** (`c/`): `ola` e `testec`, a bateria de testes da libc

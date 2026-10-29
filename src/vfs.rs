@@ -60,6 +60,8 @@ pub enum Conteudo {
     Dispositivo(Dispositivo),
     /// Link simbólico: o caminho para onde aponta.
     Link(String),
+    /// FIFO (pipe com nome): o pipe em si fica na tabela FIFOS.
+    Fifo,
 }
 
 pub struct No {
@@ -120,6 +122,7 @@ pub enum Tipo {
     Diretorio,
     Dispositivo(Dispositivo),
     Link,
+    Fifo,
 }
 
 /// Qualquer arquivo ou diretório, esteja na memória, no disco ou no /proc.
@@ -144,6 +147,15 @@ struct Montagem {
 }
 
 static MONTAGENS: Mutex<Vec<Montagem>> = Mutex::new(Vec::new());
+
+/// O pipe de cada FIFO em uso (pelo id do nó): os dados de um FIFO nunca
+/// vão para o disco, só passam pelo kernel.
+static FIFOS: Mutex<BTreeMap<u64, Arc<crate::arquivo::Pipe>>> = Mutex::new(BTreeMap::new());
+
+/// O pipe por trás de um FIFO (criado na primeira abertura).
+pub fn pipe_do_fifo(no: &Vnode) -> Arc<crate::arquivo::Pipe> {
+    FIFOS.lock().entry(no.id()).or_insert_with(crate::arquivo::Pipe::vazio).clone()
+}
 
 /// Se há algo montado sobre este diretório, devolve a raiz do que está
 /// montado (a última montagem por cima vale).
@@ -188,6 +200,7 @@ impl Vnode {
                 Conteudo::Diretorio(_) => Tipo::Diretorio,
                 Conteudo::Dispositivo(d) => Tipo::Dispositivo(*d),
                 Conteudo::Link(_) => Tipo::Link,
+                Conteudo::Fifo => Tipo::Fifo,
             }),
             Vnode::Disco(fs, inode) => {
                 let info = fs.info(*inode)?;
@@ -195,6 +208,8 @@ impl Vnode {
                     Tipo::Diretorio
                 } else if info.link {
                     Tipo::Link
+                } else if info.fifo {
+                    Tipo::Fifo
                 } else {
                     Tipo::Arquivo
                 })
@@ -348,6 +363,22 @@ impl Vnode {
         }
     }
 
+    /// `truncate`: muda o tamanho do arquivo (encolhendo ou com um buraco de zeros).
+    pub fn truncar_para(&self, tamanho: u64) -> Result<(), i64> {
+        match self {
+            Vnode::Memoria(no) => match &mut *no.conteudo.lock() {
+                Conteudo::Arquivo(dados) => {
+                    dados.resize(tamanho as usize, 0);
+                    no.meta.lock().modificado = rtc::agora();
+                    Ok(())
+                }
+                _ => Err(EINVAL),
+            },
+            Vnode::Disco(fs, inode) => fs.truncar_para(*inode, tamanho),
+            Vnode::Proc(_) => Err(EACCES),
+        }
+    }
+
     /// Lê o arquivo inteiro (para o `execve`).
     pub fn ler_tudo(&self) -> Result<Vec<u8>, i64> {
         let mut dados = alloc::vec![0u8; self.tamanho()? as usize];
@@ -379,6 +410,7 @@ impl Vnode {
                     let tipo = match tipo {
                         ext2::TIPO_ENTRADA_DIRETORIO => Tipo::Diretorio,
                         ext2::TIPO_ENTRADA_LINK => Tipo::Link,
+                        ext2::TIPO_ENTRADA_FIFO => Tipo::Fifo,
                         _ => Tipo::Arquivo,
                     };
                     (nome, (fs.id as u64) << 32 | i as u64, tipo)
@@ -614,6 +646,16 @@ pub fn buscar(caminho: &str) -> Result<Vnode, i64> {
 
 pub fn buscar_sem_seguir(caminho: &str) -> Result<Vnode, i64> {
     resolver(caminho, None, false)
+}
+
+/// Cria um FIFO (o `mkfifo`).
+pub fn criar_fifo(caminho: &str, meta: Meta) -> Result<(), i64> {
+    let (pai, nome) = separar(caminho)?;
+    match buscar(pai)? {
+        Vnode::Memoria(_) => criar_na_memoria(caminho, Conteudo::Fifo, Some(meta)),
+        Vnode::Disco(fs, dir) => fs.criar_fifo(dir, nome, meta.permissoes, meta.uid, meta.gid).map(|_| ()),
+        Vnode::Proc(_) => Err(EACCES),
+    }
 }
 
 /// Cria um link simbólico em `caminho` apontando para `alvo`.
