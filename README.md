@@ -59,7 +59,10 @@ interrompe o programa que está rodando.
   programa, só ele morre, com o sinal certo (SIGSEGV, SIGFPE, SIGILL).
 - PIC 8259, timer PIT a 100 Hz, relógio CMOS (data e hora), teclado PS/2 ABNT2, serial.
 - **Memória:** alocador de quadros físicos (bitmap), heap do kernel (`Box`, `Vec`,
-  `Arc`...), um espaço de endereçamento por processo, isolado do kernel.
+  `Arc`...), um espaço de endereçamento por processo, isolado do kernel e
+  descrito por *regiões*: paginação sob demanda (a pilha cresce sozinha até
+  8 MiB), `mmap` anônimo e de arquivos (privado ou compartilhado, com `msync`),
+  `mprotect`, NX, ASLR, SMEP/SMAP e um "OOM killer" simples.
 - **Processos:** `fork` com **copy-on-write**, `execve` (carregador ELF, com
   argumentos, ambiente e vetor auxiliar como no Linux), `exit`, `wait`, órfãos
   adotados pelo init, escalonador round-robin **preemptivo**. Registradores
@@ -163,15 +166,14 @@ versões do Linux.
 
 ## Próximos passos
 
-1. **Portar mais programas de verdade:** o Lua já tem script pronto (`make lua`);
-   depois, `dash` e `busybox`. Para eles devem faltar algumas syscalls (o kernel
-   avisa qual: `chamada de sistema N não implementada`).
-2. **Mapear arquivos com `mmap`** (hoje só memória anônima).
-3. **Threads** (`clone` com `CLONE_THREAD`, futex) — exigem trocar o "big kernel
+1. **Portar mais programas de verdade:** o Lua 5.4 já roda sem modificações
+   (`make lua`); depois, `dash` e `busybox`. O kernel avisa quando falta uma
+   syscall: `chamada de sistema N não implementada`.
+2. **Threads** (`clone` com `CLONE_THREAD`, futex) — exigem trocar o "big kernel
    lock" por locks de verdade, o mesmo trabalho que o SMP.
-4. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs), boot UEFI, framebuffer.
-5. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-6. **Interface gráfica:** mouse, servidor de janelas.
+3. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs), boot UEFI, framebuffer.
+4. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
+5. **Interface gráfica:** mouse, servidor de janelas.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

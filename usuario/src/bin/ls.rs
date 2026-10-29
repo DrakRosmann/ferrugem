@@ -128,6 +128,14 @@ fn mostrar(itens: &[(String, sys::Stat)], longo: bool) {
         }
         return;
     }
+    // Para um pipe ou arquivo, um nome por linha (é o que `ls | wc -l` espera);
+    // para o terminal, em colunas.
+    if !sys::eh_terminal(1) {
+        for (nome, _) in itens {
+            println!("{}", nome_visivel(nome));
+        }
+        return;
+    }
     // Em colunas, como o ls de verdade
     let largura = itens.iter().map(|(n, i)| nome_visivel(n).chars().count() + i.eh_diretorio() as usize).max().unwrap_or(0) + 2;
     let por_linha = (78 / largura.max(1)).max(1);

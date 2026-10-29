@@ -160,6 +160,12 @@ pub fn mudar_gid(gid: u32) -> Resultado<()> {
     conferir(unsafe { syscall(106, gid as u64, 0, 0, 0) }).map(|_| ())
 }
 
+/// O descritor é um terminal? (o `isatty` do C)
+pub fn eh_terminal(fd: i32) -> bool {
+    let mut termios = [0u8; 60];
+    unsafe { syscall(16, fd as u64, 0x5401, termios.as_mut_ptr() as u64, 0) >= 0 }
+}
+
 /// Liga ou desliga o eco do terminal (para digitar senhas).
 pub fn eco(fd: i32, ligado: bool) -> Resultado<()> {
     let mut termios = [0u8; 60];
@@ -671,4 +677,45 @@ pub fn formatar_data(segundos: u64) -> String {
     let ano = ano_da_era + era * 400 + (mes <= 2) as i64;
     let s = segundos % 86400;
     alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", ano, mes, dia, s / 3600, s / 60 % 60, s % 60)
+}
+
+// -----------------------------------------------------------------------------
+// Memória: mmap e companhia
+// -----------------------------------------------------------------------------
+
+pub const PROT_NONE: u64 = 0;
+pub const PROT_READ: u64 = 1;
+pub const PROT_WRITE: u64 = 2;
+pub const PROT_EXEC: u64 = 4;
+pub const MAP_SHARED: u64 = 0x01;
+pub const MAP_PRIVATE: u64 = 0x02;
+pub const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Mapeia `tamanho` bytes: de um arquivo (`fd`), ou memória zerada (MAP_ANONYMOUS, fd = -1).
+pub fn mmap(tamanho: usize, prot: u64, flags: u64, fd: i32, deslocamento: u64) -> Resultado<usize> {
+    let r = unsafe {
+        let resposta: i64;
+        asm!(
+            "syscall",
+            inlateout("rax") 9i64 => resposta,
+            in("rdi") 0u64, in("rsi") tamanho as u64, in("rdx") prot,
+            in("r10") flags, in("r8") fd as i64 as u64, in("r9") deslocamento,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack),
+        );
+        resposta
+    };
+    conferir(r).map(|e| e as usize)
+}
+
+pub fn munmap(endereco: usize, tamanho: usize) -> Resultado<()> {
+    conferir(unsafe { syscall(11, endereco as u64, tamanho as u64, 0, 0) }).map(|_| ())
+}
+
+pub fn mprotect(endereco: usize, tamanho: usize, prot: u64) -> Resultado<()> {
+    conferir(unsafe { syscall(10, endereco as u64, tamanho as u64, prot, 0) }).map(|_| ())
+}
+
+pub fn msync(endereco: usize, tamanho: usize) -> Resultado<()> {
+    conferir(unsafe { syscall(26, endereco as u64, tamanho as u64, 4, 0) }).map(|_| ())
 }

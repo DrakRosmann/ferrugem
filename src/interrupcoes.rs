@@ -272,12 +272,14 @@ fn irq(numero: u8) {
 fn excecao(ctx: &Contexto) {
     let nome = NOMES_EXCECOES[ctx.vetor as usize];
 
-    // Escrita numa página compartilhada pelo fork: copia e tenta de novo.
-    let escrita_em_pagina_presente = ctx.codigo_erro & 0b11 == 0b11;
-    if ctx.vetor == 14 && ctx.veio_do_usuario() && escrita_em_pagina_presente {
-        let espaco = processo::atual().espaco.as_ref();
-        if espaco.is_some_and(|e| e.tratar_escrita(ler_cr2())) {
-            return;
+    // Page fault de um programa: pode ser só uma página que ainda não existe
+    // (paginação sob demanda) ou um copy-on-write. Resolvido, a instrução roda de novo.
+    if ctx.vetor == 14 && ctx.veio_do_usuario() {
+        let (escrita, execucao) = (ctx.codigo_erro & 2 != 0, ctx.codigo_erro & 16 != 0);
+        match processo::falha_de_pagina(ler_cr2(), escrita, execucao) {
+            crate::paginacao::Falha::Resolvida => return,
+            crate::paginacao::Falha::SemMemoria => processo::sem_memoria(),
+            crate::paginacao::Falha::Invalida => {}
         }
     }
 
@@ -289,7 +291,13 @@ fn excecao(ctx: &Contexto) {
             _ => processo::SIGSEGV,
         };
         if ctx.vetor == 14 {
-            let acao = if ctx.codigo_erro & 2 != 0 { "escrever em" } else { "ler" };
+            let acao = if ctx.codigo_erro & 16 != 0 {
+                "executar"
+            } else if ctx.codigo_erro & 2 != 0 {
+                "escrever em"
+            } else {
+                "ler"
+            };
             processo::falha_do_programa(
                 format_args!("falha de segmentação ao {} {:#x} (RIP {:#x})", acao, ler_cr2(), ctx.rip),
                 sinal,

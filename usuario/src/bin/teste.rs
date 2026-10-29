@@ -683,12 +683,182 @@ fn links_no_disco() -> R {
     if livres == depois { Ok(()) } else { Err(format!("blocos livres: {} antes, {} depois", livres, depois)) }
 }
 
+// ------------------------------------------------------------------ memória
+
+fn livre_kib() -> u64 {
+    sys::memoria().livre_kib
+}
+
+fn paginas_sob_demanda() -> R {
+    let antes = livre_kib();
+    let tamanho = 64 * 1024 * 1024;
+    let m = sys::mmap(tamanho, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS, -1, 0)
+        .map_err(erro)?;
+    let depois_do_mmap = livre_kib();
+    for i in (0..tamanho).step_by(1024 * 1024) {
+        unsafe { core::ptr::write_volatile((m + i) as *mut u8, 7) }; // uma página por MiB
+    }
+    let depois_de_tocar = livre_kib();
+    sys::munmap(m, tamanho).map_err(erro)?;
+    let depois_do_munmap = livre_kib();
+    let custo_mmap = antes - depois_do_mmap;
+    let custo_toque = depois_do_mmap - depois_de_tocar;
+    if custo_mmap <= 8 && (256..512).contains(&custo_toque) && depois_do_munmap + 8 >= antes {
+        Ok(())
+    } else {
+        Err(format!("mmap de 64 MiB gastou {} KiB; tocar 64 páginas, {} KiB", custo_mmap, custo_toque))
+    }
+}
+
+fn pilha_cresce() -> R {
+    fn recursiva(n: u32) -> u64 {
+        let local = black_box([n as u8; 16 * 1024]); // 16 KiB por chamada
+        if n == 0 { local[0] as u64 } else { recursiva(n - 1) + local[100] as u64 }
+    }
+    // 200 chamadas ≈ 3 MiB de pilha, bem mais que o que existe no começo
+    let status = em_filho(|| (recursiva(200) % 256) as i32)?;
+    match sys::codigo_de_saida(status) {
+        Some(_) => Ok(()),
+        None => Err(format!("morreu: {:#x}", status)),
+    }
+}
+
+fn pilha_estoura() -> R {
+    #[allow(unconditional_recursion)] // é de propósito: até estourar a pilha
+    fn sem_fim(n: u64) -> u64 {
+        let local = black_box([n as u8; 64 * 1024]);
+        sem_fim(n + 1) + local[1] as u64
+    }
+    let status = em_filho(|| sem_fim(0) as i32)?; // passa dos 8 MiB
+    morto_por(status, 11)
+}
+
+fn nx_na_pilha() -> R {
+    let status = em_filho(|| {
+        let codigo = black_box([0xC3u8; 16]); // `ret`, na pilha
+        let funcao: extern "C" fn() = unsafe { core::mem::transmute(codigo.as_ptr()) };
+        funcao();
+        0
+    })?;
+    morto_por(status, 11)
+}
+
+fn mprotect_funciona() -> R {
+    let m = sys::mmap(4096, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS, -1, 0)
+        .map_err(erro)?;
+    unsafe { core::ptr::write_volatile(m as *mut u8, 1) };
+    sys::mprotect(m, 4096, sys::PROT_READ).map_err(erro)?;
+    let status = em_filho(|| {
+        unsafe { core::ptr::write_volatile(m as *mut u8, 2) };
+        0
+    })?;
+    morto_por(status, 11)?;
+    sys::mprotect(m, 4096, sys::PROT_READ | sys::PROT_WRITE).map_err(erro)?;
+    unsafe { core::ptr::write_volatile(m as *mut u8, 3) };
+    let lido = unsafe { core::ptr::read_volatile(m as *const u8) };
+    sys::munmap(m, 4096).map_err(erro)?;
+    if lido == 3 { Ok(()) } else { Err(String::from("leitura errada")) }
+}
+
+fn mmap_de_arquivo_em(base: &str) -> R {
+    let caminho = format!("{}/teste-mmap", base);
+    let conteudo: Vec<u8> = (0..10_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let fd = sys::abrir(&caminho, sys::O_RDWR | sys::O_CREAT | sys::O_TRUNC).map_err(erro)?;
+    sys::escrever_tudo(fd, &conteudo).map_err(erro)?;
+
+    // privado: lê o arquivo; escrever não muda o arquivo
+    let m = sys::mmap(10_000, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_PRIVATE, fd, 0).map_err(erro)?;
+    let visto = unsafe { core::slice::from_raw_parts(m as *const u8, 10_000) };
+    if visto != &conteudo[..] {
+        return Err(String::from("mapeamento privado com conteúdo errado"));
+    }
+    unsafe { core::ptr::write_volatile((m + 5000) as *mut u8, b'#') };
+    sys::munmap(m, 10_000).map_err(erro)?;
+    if sys::ler_arquivo(&caminho).map_err(erro)?[5000] != conteudo[5000] {
+        return Err(String::from("escrita num MAP_PRIVATE chegou ao arquivo"));
+    }
+
+    // compartilhado, a partir da segunda página: escrever muda o arquivo
+    let m = sys::mmap(4096, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_SHARED, fd, 4096).map_err(erro)?;
+    unsafe { core::ptr::write_volatile((m + 10) as *mut u8, b'!') };
+    sys::msync(m, 4096).map_err(erro)?;
+    let depois_do_msync = sys::ler_arquivo(&caminho).map_err(erro)?[4096 + 10];
+    sys::munmap(m, 4096).map_err(erro)?;
+    let _ = sys::fechar(fd);
+    let final_ = sys::ler_arquivo(&caminho).map_err(erro)?;
+    sys::remover(&caminho).map_err(erro)?;
+    if depois_do_msync == b'!' && final_.len() == 10_000 && final_[4096 + 10] == b'!' {
+        Ok(())
+    } else {
+        Err(String::from("escrita num MAP_SHARED não voltou para o arquivo"))
+    }
+}
+
+fn mmap_de_arquivo() -> R {
+    mmap_de_arquivo_em("/tmp")?;
+    if sys::stat("/disco").is_ok() { mmap_de_arquivo_em("/disco") } else { Ok(()) }
+}
+
+fn compartilhada_entre_processos() -> R {
+    let m = sys::mmap(4096, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_SHARED | sys::MAP_ANONYMOUS, -1, 0)
+        .map_err(erro)?;
+    em_filho(|| {
+        unsafe { core::ptr::write_volatile(m as *mut u32, 0xF0F0) };
+        0
+    })?;
+    let visto = unsafe { core::ptr::read_volatile(m as *const u32) };
+    sys::munmap(m, 4096).map_err(erro)?;
+    if visto == 0xF0F0 { Ok(()) } else { Err(format!("o pai viu {:#x}", visto)) }
+}
+
+fn aslr() -> R {
+    let mut enderecos = Vec::new();
+    for _ in 0..2 {
+        let (leitura, escrita) = sys::pipe().map_err(erro)?;
+        em_filho(|| {
+            let _ = sys::duplicar_para(escrita, 1);
+            sys::executar("/bin/teste", &["teste", "--endereco-da-pilha"]);
+            1
+        })?;
+        let _ = sys::fechar(escrita);
+        enderecos.push(String::from_utf8(ler_tudo(leitura)).unwrap_or_default());
+        let _ = sys::fechar(leitura);
+    }
+    if !enderecos[0].is_empty() && enderecos[0] != enderecos[1] {
+        Ok(())
+    } else {
+        Err(format!("a pilha ficou no mesmo lugar: {:?}", enderecos))
+    }
+}
+
+fn sem_memoria() -> R {
+    // Pede 2 GiB (o QEMU tem 256 MiB) e toca tudo: o kernel tem que matar só este.
+    let status = em_filho(|| {
+        let tamanho = 2usize << 30;
+        let Ok(m) = sys::mmap(tamanho, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS, -1, 0)
+        else {
+            return 1;
+        };
+        for i in (0..tamanho).step_by(4096) {
+            unsafe { core::ptr::write_volatile((m + i) as *mut u8, 1) };
+        }
+        0
+    })?;
+    morto_por(status, sys::SIGKILL)?;
+    if livre_kib() > 100_000 { Ok(()) } else { Err(String::from("a memória não voltou")) }
+}
+
 fn principal(args: &[&str]) -> i32 {
+    if args.get(1) == Some(&"--endereco-da-pilha") {
+        let local = 0u8;
+        print!("{:p}", &raw const local);
+        return 0;
+    }
     if args.get(1) == Some(&"--identidade") {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 34] = [
+    let testes: [(&str, fn() -> R); 43] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -723,6 +893,15 @@ fn principal(args: &[&str]) -> i32 {
         ("kill(-grupo) atinge só o grupo", sinal_para_grupo),
         ("links simbólicos e físicos na memória", links_na_memoria),
         ("links simbólicos e físicos no ext2", links_no_disco),
+        ("páginas sob demanda: mmap de 64 MiB só gasta o que é tocado", paginas_sob_demanda),
+        ("a pilha cresce sozinha (3 MiB)", pilha_cresce),
+        ("pilha estourada (> 8 MiB) dá SIGSEGV", pilha_estoura),
+        ("NX: código na pilha não executa", nx_na_pilha),
+        ("mprotect tira e devolve a escrita", mprotect_funciona),
+        ("mmap de arquivo: privado e compartilhado (memória e ext2)", mmap_de_arquivo),
+        ("MAP_SHARED anônimo é o mesmo no pai e no filho", compartilhada_entre_processos),
+        ("ASLR: a pilha muda de lugar a cada execução", aslr),
+        ("sem memória: só o culpado morre", sem_memoria),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

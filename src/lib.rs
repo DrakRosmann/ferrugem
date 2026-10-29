@@ -98,11 +98,12 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
 
     let livres = quadros::init(&info);
     heap::init();
-    paginacao::init();
+    let protecoes = paginacao::init();
     ok(format_args!(
-        "memória: {} MiB livres em quadros de 4 KiB; heap do kernel de {} MiB",
+        "memória: {} MiB livres, heap do kernel de {} MiB; proteções: {}",
         livres * 4 / 1024,
-        heap::TAMANHO / 1024 / 1024
+        heap::TAMANHO / 1024 / 1024,
+        protecoes
     ));
 
     rtc::init();

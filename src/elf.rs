@@ -5,11 +5,18 @@
 //! para o endereço virtual V, e zere o resto até M bytes" (o resto é o .bss).
 
 use crate::erro::*;
-use crate::paginacao::{ESCRITA, EspacoEnderecos, USUARIO, USUARIO_INICIO};
-use crate::processo::{PILHA_TAMANHO, PILHA_TOPO};
+use crate::paginacao::{
+    ESCRITA, EspacoEnderecos, Fonte, NAO_EXECUTAR, PROT_ESCREVER, PROT_EXECUTAR, PROT_LER, Regiao, USUARIO,
+    USUARIO_INICIO,
+};
+
+/// O programa (código, dados e .bss) precisa caber abaixo de 256 GiB; acima
+/// ficam o mmap e a pilha.
+pub const LIMITE_IMAGEM: u64 = 0x40_0000_0000;
 
 const PT_LOAD: u32 = 1;
 const PT_PHDR: u32 = 6;
+const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
 /// O que o carregador descobre sobre o programa.
@@ -49,7 +56,7 @@ pub fn carregar(dados: &[u8], espaco: &mut EspacoEnderecos) -> Result<Programa, 
     let tabela = u64_em(dados, 32)? as usize;
     let tamanho_entrada = u16_em(dados, 54)? as usize;
     let quantidade = u16_em(dados, 56)? as usize;
-    let limite = PILHA_TOPO - PILHA_TAMANHO;
+    let limite = LIMITE_IMAGEM;
 
     let mut fim_imagem = USUARIO_INICIO;
     let mut cabecalhos = 0;
@@ -76,10 +83,28 @@ pub fn carregar(dados: &[u8], espaco: &mut EspacoEnderecos) -> Result<Programa, 
         }
         let conteudo = dados.get(deslocamento..deslocamento + no_arquivo).ok_or(ENOEXEC)?;
 
-        let permissao = USUARIO | if flags & PF_W != 0 { ESCRITA } else { 0 };
+        // Só o código é executável (NX no resto); só os dados são graváveis.
+        let mut permissao = USUARIO;
+        let mut prot = PROT_LER;
+        if flags & PF_W != 0 {
+            permissao |= ESCRITA;
+            prot |= PROT_ESCREVER;
+        }
+        if flags & PF_X != 0 {
+            prot |= PROT_EXECUTAR;
+        } else {
+            permissao |= NAO_EXECUTAR;
+        }
         if !espaco.alocar_regiao(virt, fim, permissao) {
             return Err(ENOMEM);
         }
+        espaco.registrar_regiao(Regiao {
+            inicio: virt & !0xFFF,
+            fim: (fim + 0xFFF) & !0xFFF,
+            prot,
+            compartilhada: false,
+            fonte: Fonte::Anonima, // as páginas já estão carregadas
+        });
         // As páginas novas já vêm zeradas: o .bss não precisa de mais nada.
         if !espaco.gravar(virt, conteudo) {
             return Err(EFAULT);

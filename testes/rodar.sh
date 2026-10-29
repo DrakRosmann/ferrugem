@@ -17,6 +17,10 @@ if [ -f build/raiz/bin/testec ]; then
 else
     echo "(sem a musl: pulando os testes da libc; rode 'make musl' para incluí-los)"
 fi
+# O Lua (de lua.org, sem modificações), se estiver instalado (`make lua`).
+if [ -f build/raiz/bin/lua ]; then
+    comandos="$comandos lua_teste"
+fi
 
 mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E root_owner=1000:1000 -d disco-inicial "$disco" 32M >/dev/null 2>&1
 
@@ -25,6 +29,11 @@ mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E root_owner=100
     # login como root (os testes de permissão começam como root e viram o usuário 1000)
     printf 'root\r'; sleep 0.5; printf 'root\r'; sleep 1.5
     for comando in $comandos desligar; do
+        if [ "$comando" = lua_teste ]; then
+            printf '%s\r' "lua -e 'local t = {} for i = 1, 5 do t[i] = i * i end print(\"lua:\", table.concat(t, \",\"), #io.popen(\"ls /bin\"):read(\"a\") > 0)'"
+            sleep 3
+            continue
+        fi
         printf '%s\r' "$comando"
         sleep 10
     done
@@ -37,6 +46,14 @@ sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida" | sed -n '/Rodando/,/testes /p;/Testan
 falhou=0
 libc_ok=true
 [[ $comandos == *testec* ]] && ! grep -q "testes da libc passaram" "$saida" && libc_ok=false
+if [[ $comandos == *lua_teste* ]]; then
+    if grep -q "lua:	1,4,9,16,25	true" "$saida"; then
+        echo "  [ OK ] Lua 5.4 (sem modificações): tabelas, strings e io.popen"
+    else
+        echo "  [FALHOU] Lua"
+        libc_ok=false
+    fi
+fi
 if ! grep -q "testes passaram" "$saida" || [ $libc_ok = false ]; then
     echo "==> os testes FALHARAM (saída completa abaixo)"
     sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida" | tail -40

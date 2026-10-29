@@ -19,7 +19,7 @@
 use crate::arquivo::Arquivo;
 use crate::erro::*;
 use crate::interrupcoes::Contexto;
-use crate::paginacao::{self, ESCRITA, EspacoEnderecos, USUARIO};
+use crate::paginacao::{self, EspacoEnderecos, Falha, Fonte, PROT_ESCREVER, PROT_LER, Regiao};
 use crate::sinal::{self, Sinais};
 use crate::{elf, gdt, pit, println, syscall, vfs};
 use alloc::boxed::Box;
@@ -36,10 +36,14 @@ pub type Pid = u32;
 const TAMANHO_PILHA_KERNEL: usize = 64 * 1024;
 pub const MAX_ARQUIVOS: usize = 32;
 
-pub const PILHA_TOPO: u64 = 0x7F_0000_0000;
-pub const PILHA_TAMANHO: u64 = 256 * 1024;
-/// O `mmap` entrega memória daqui para baixo (o heap do `brk` cresce de baixo para cima).
-pub const MMAP_TOPO: u64 = 0x70_0000_0000;
+/// A pilha começa até 1 GiB abaixo daqui (o deslocamento é sorteado: ASLR).
+const PILHA_TOPO_MAXIMO: u64 = 0x7F_0000_0000;
+/// Quanto a pilha pode crescer (as páginas só existem quando são usadas).
+const PILHA_MAXIMA: u64 = 8 * 1024 * 1024;
+/// Um número de páginas sorteado, de 0 até `maximo` - 1, para o ASLR.
+fn paginas_aleatorias(maximo: u64) -> u64 {
+    (crate::aleatorio::proximo() % maximo) * 4096
+}
 
 pub use crate::sinal::{SIGFPE, SIGILL, SIGINT, SIGKILL, SIGPIPE, SIGSEGV};
 
@@ -134,7 +138,7 @@ impl Processo {
             espaco: None,
             arquivos: Vec::new(),
             fecha_no_exec: 0,
-            mmap_topo: MMAP_TOPO,
+            mmap_topo: 0,
             diretorio: String::from("/"),
             brk_inicio: 0,
             brk: 0,
@@ -462,6 +466,7 @@ struct Imagem {
     entrada: u64,
     rsp: u64,
     brk: u64,
+    mmap_topo: u64,
     meta: vfs::Meta,
 }
 
@@ -476,13 +481,23 @@ fn carregar_programa(caminho: &str, args: &[String], ambiente: &[String], cred: 
     };
     let mut espaco = EspacoEnderecos::novo().ok_or(ENOMEM)?;
     let programa = elf::carregar(&dados, &mut espaco)?;
-    if !espaco.alocar_regiao(PILHA_TOPO - PILHA_TAMANHO, PILHA_TOPO, USUARIO | ESCRITA) {
-        return Err(ENOMEM);
-    }
+
+    // ASLR: pilha, mmap e heap em posições sorteadas a cada execução, para que
+    // um ataque não saiba de antemão onde estão.
+    let pilha_topo = PILHA_TOPO_MAXIMO - paginas_aleatorias(1 << 18);
+    espaco.criar_regiao(Regiao {
+        inicio: pilha_topo - PILHA_MAXIMA,
+        fim: pilha_topo,
+        prot: PROT_LER | PROT_ESCREVER,
+        compartilhada: false,
+        fonte: Fonte::Anonima,
+    });
+    let mmap_topo = pilha_topo - PILHA_MAXIMA - 0x1000_0000 - paginas_aleatorias(1 << 18);
+    let brk = ((programa.fim + 0xFFF) & !0xFFF) + paginas_aleatorias(8192);
+
     let meta = no.meta()?;
-    let rsp = montar_pilha(&espaco, args, ambiente, &programa, cred, meta)?;
-    let brk = (programa.fim + 0xFFF) & !0xFFF;
-    Ok(Imagem { espaco, entrada: programa.entrada, rsp, brk, meta })
+    let rsp = montar_pilha(&espaco, pilha_topo, args, ambiente, &programa, cred, meta)?;
+    Ok(Imagem { espaco, entrada: programa.entrada, rsp, brk, mmap_topo, meta })
 }
 
 /// Monta a pilha inicial no formato da ABI System V (a mesma do Linux):
@@ -496,13 +511,14 @@ fn carregar_programa(caminho: &str, args: &[String], ambiente: &[String], cred: 
 /// estão os program headers do executável, o tamanho da página, quem é o usuário...
 fn montar_pilha(
     espaco: &EspacoEnderecos,
+    topo: u64,
     args: &[String],
     ambiente: &[String],
     programa: &elf::Programa,
     cred: vfs::Cred,
     meta: vfs::Meta,
 ) -> Result<u64, i64> {
-    let mut sp = PILHA_TOPO;
+    let mut sp = topo;
     let mut empilhar = |bytes: &[u8]| -> Result<u64, i64> {
         sp -= bytes.len() as u64;
         if espaco.gravar(sp, bytes) { Ok(sp) } else { Err(EFAULT) }
@@ -567,6 +583,7 @@ pub fn criar_init(caminho: &str) -> Result<(), i64> {
     p.espaco = Some(imagem.espaco);
     p.brk_inicio = imagem.brk;
     p.brk = imagem.brk;
+    p.mmap_topo = imagem.mmap_topo;
     p.preparar_primeira_execucao();
     tabela().processos.push(p);
     Ok(())
@@ -629,7 +646,7 @@ pub fn exec(ctx: &mut Contexto, caminho: &str, args: Vec<String>, ambiente: Vec<
     p.executavel = caminho.to_string();
     p.argumentos = args;
     p.sinais.ao_executar();
-    p.mmap_topo = MMAP_TOPO;
+    p.mmap_topo = imagem.mmap_topo;
     // Descritores marcados com close-on-exec não passam para o programa novo.
     for (fd, arquivo) in p.arquivos.iter_mut().enumerate() {
         if p.fecha_no_exec & (1 << fd) != 0 {
@@ -875,6 +892,23 @@ pub fn grupo_e_sessao(pid: Pid) -> Result<(Pid, Pid), i64> {
 
 pub fn tem_sinal_pendente() -> bool {
     atual().sinais.entregaveis() != 0
+}
+
+/// Um page fault do programa: página ainda não materializada, copy-on-write
+/// ou acesso inválido?
+pub fn falha_de_pagina(endereco: u64, escrita: bool, execucao: bool) -> Falha {
+    match &atual().espaco {
+        Some(espaco) => espaco.tratar_falha(endereco, escrita, execucao),
+        None => Falha::Invalida,
+    }
+}
+
+/// Acabou a memória física no meio de um page fault: quem pediu é encerrado
+/// (um "OOM killer" bem simples), e o resto do sistema segue.
+pub fn sem_memoria() -> ! {
+    let p = atual();
+    println!("[{}] {}: sem memória: encerrado pelo kernel", p.pid, p.nome);
+    sair(SIGKILL as i32)
 }
 
 /// Uma exceção da CPU em modo usuário. Se o programa tiver um tratador para

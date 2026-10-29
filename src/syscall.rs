@@ -11,8 +11,9 @@
 use crate::arquivo::{Arquivo, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, Pipe, Tipo};
 use crate::erro::*;
 use crate::interrupcoes::Contexto;
-use crate::paginacao::{ESCRITA, EspacoEnderecos, USUARIO};
-use crate::processo::{self, MAX_ARQUIVOS, PILHA_TAMANHO, PILHA_TOPO};
+use crate::paginacao::EspacoEnderecos;
+use crate::paginacao::{Fonte, Regiao};
+use crate::processo::{self, MAX_ARQUIVOS};
 use crate::vfs::{self, Vnode};
 use crate::{heap, pit, porta, println, quadros, rtc, sinal, tty};
 use alloc::string::String;
@@ -64,8 +65,8 @@ pub fn tratar(ctx: &mut Contexto) {
         // lstat: não segue o link (a não ser com uma barra no fim, como "link/")
         6 => caminho(a1).and_then(|c| stat_caminho(&c, a2, termina_em_barra(a1))),
         7 => sys_poll(a1, a2, if a3 as i32 >= 0 { Some(a3 as i32 as u64) } else { None }),
-        9 => sys_mmap(a1, a2, ctx.r10, ctx.r8),
-        10 => Ok(0), // mprotect: todas as páginas ficam leitura+escrita (simplificação)
+        9 => sys_mmap(a1, a2, a3, a4, a5, ctx.r9),
+        10 => sys_mprotect(a1, a2, a3),
         11 => sys_munmap(a1, a2),
         19 => sys_vetorial(a1, a2, a3, false),
         20 => sys_vetorial(a1, a2, a3, true),
@@ -75,6 +76,7 @@ pub fn tratar(ctx: &mut Contexto) {
             processo::escalonar(); // sched_yield: cede a vez
             Ok(0)
         }
+        26 => sys_msync(a1, a2),
         28 => Ok(0), // madvise: só um conselho; pode ser ignorado
         3 => sys_close(a1),
         4 => sys_stat(a1, a2),
@@ -505,49 +507,84 @@ fn sys_ftruncate(fd: u64, tamanho: u64) -> Resultado {
     }
 }
 
-/// `mmap` anônimo: memória zerada, nova, só deste processo. Mapear arquivos
-/// ainda não é suportado. Devolve o endereço.
-fn sys_mmap(endereco: u64, tamanho: u64, flags: u64, fd: u64) -> Resultado {
+/// `mmap`: uma região nova na memória do processo, zerada (MAP_ANONYMOUS)
+/// ou com o conteúdo de um arquivo. As páginas só existem quando tocadas;
+/// as de MAP_SHARED são alocadas na hora (para um fork poder compartilhá-las).
+fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, deslocamento: u64) -> Resultado {
+    const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    let _ = fd; // só mmap anônimo: o descritor é ignorado
-    if flags & MAP_ANONYMOUS == 0 {
-        return Err(ENOSYS); // mapear arquivos ainda não é suportado
-    }
-    if tamanho == 0 || tamanho > 1 << 32 {
+    const ENODEV: i64 = 19;
+    if tamanho == 0 || tamanho > 1 << 34 || deslocamento & 0xFFF != 0 {
         return Err(EINVAL);
     }
     let tamanho = (tamanho + 0xFFF) & !0xFFF;
+    let compartilhada = flags & MAP_SHARED != 0;
+    let fonte = if flags & MAP_ANONYMOUS != 0 {
+        Fonte::Anonima
+    } else {
+        let arq = arquivo(fd)?;
+        let Tipo::No(no) = &arq.tipo else { return Err(ENODEV) };
+        if no.tipo()? != vfs::Tipo::Arquivo {
+            return Err(ENODEV);
+        }
+        let acesso = arq.flags() & 3;
+        if acesso == 1 || compartilhada && prot & 2 != 0 && acesso != 2 {
+            return Err(EACCES); // precisa ter aberto para ler (e para escrever, se for gravar de volta)
+        }
+        let total = no.tamanho()?;
+        Fonte::Arquivo { no: no.clone(), deslocamento, tamanho: total.saturating_sub(deslocamento) }
+    };
     let p = processo::atual();
     let inicio = if flags & MAP_FIXED != 0 {
-        if endereco & 0xFFF != 0 {
+        if endereco & 0xFFF != 0 || endereco < crate::paginacao::USUARIO_INICIO {
             return Err(EINVAL);
         }
         endereco
     } else {
         let inicio = p.mmap_topo - tamanho;
-        if inicio < (p.brk + 0x1000_0000) {
-            return Err(ENOMEM); // encostou no heap
+        if inicio < p.brk + 0x1000_0000 {
+            return Err(ENOMEM); // encostaria no heap
         }
         p.mmap_topo = inicio;
         inicio
     };
+    let regiao = Regiao { inicio, fim: inicio + tamanho, prot: prot as u8 & 7, compartilhada, fonte };
     let espaco = p.espaco.as_mut().ok_or(EINVAL)?;
-    if flags & MAP_FIXED != 0 {
-        espaco.desalocar_regiao(inicio, inicio + tamanho); // MAP_FIXED substitui o que havia
-    }
-    if !espaco.alocar_regiao(inicio, inicio + tamanho, USUARIO | ESCRITA) {
-        return Err(ENOMEM);
+    if compartilhada {
+        if !espaco.criar_regiao_ja_alocada(regiao) {
+            espaco.remover_faixa(inicio, inicio + tamanho);
+            return Err(ENOMEM);
+        }
+    } else {
+        espaco.criar_regiao(regiao);
     }
     Ok(inicio)
 }
 
-fn sys_munmap(endereco: u64, tamanho: u64) -> Resultado {
-    if endereco & 0xFFF != 0 || endereco < crate::paginacao::USUARIO_INICIO {
+fn faixa_valida(endereco: u64, tamanho: u64) -> Result<(u64, u64), i64> {
+    if endereco & 0xFFF != 0 || endereco < crate::paginacao::USUARIO_INICIO || tamanho > 1 << 40 {
         return Err(EINVAL);
     }
+    Ok((endereco, endereco + ((tamanho + 0xFFF) & !0xFFF)))
+}
+
+fn sys_munmap(endereco: u64, tamanho: u64) -> Resultado {
+    let (inicio, fim) = faixa_valida(endereco, tamanho)?;
+    processo::atual().espaco.as_mut().ok_or(EINVAL)?.remover_faixa(inicio, fim);
+    Ok(0)
+}
+
+fn sys_mprotect(endereco: u64, tamanho: u64, prot: u64) -> Resultado {
+    let (inicio, fim) = faixa_valida(endereco, tamanho)?;
     let espaco = processo::atual().espaco.as_mut().ok_or(EINVAL)?;
-    espaco.desalocar_regiao(endereco, endereco + ((tamanho + 0xFFF) & !0xFFF));
+    if espaco.proteger(inicio, fim, prot as u8 & 7) { Ok(0) } else { Err(ENOMEM) }
+}
+
+/// `msync`: grava agora, no arquivo, o que foi escrito num mapeamento MAP_SHARED.
+fn sys_msync(endereco: u64, tamanho: u64) -> Resultado {
+    let (inicio, fim) = faixa_valida(endereco, tamanho)?;
+    processo::atual().espaco.as_ref().ok_or(EINVAL)?.sincronizar(inicio, fim);
     Ok(0)
 }
 
@@ -963,16 +1000,13 @@ fn sys_wait4(pid: u64, ptr_status: u64, opcoes: u64) -> Resultado {
 /// `brk`: move o fim do heap do programa. É o que o `malloc` usa por baixo.
 fn sys_brk(novo: u64) -> Resultado {
     let p = processo::atual();
-    if novo < p.brk_inicio || novo >= PILHA_TOPO - PILHA_TAMANHO - 0x10_0000 {
+    if novo < p.brk_inicio || novo >= p.mmap_topo.saturating_sub(0x1000_0000) {
         return Ok(p.brk);
     }
-    if novo > p.brk {
-        let espaco = p.espaco.as_mut().ok_or(EINVAL)?;
-        if !espaco.alocar_regiao((p.brk + 0xFFF) & !0xFFF, novo, USUARIO | ESCRITA) {
-            return Ok(p.brk);
-        }
-    }
-    // Encolher só ajusta o número: as páginas continuam lá (simplificação).
+    // O heap é uma região como as outras: crescer não aloca nada (as páginas
+    // vêm sob demanda); encolher devolve as páginas que sobraram.
+    let espaco = p.espaco.as_mut().ok_or(EINVAL)?;
+    espaco.redimensionar_regiao(p.brk_inicio, p.brk, novo);
     p.brk = novo;
     Ok(novo)
 }
@@ -1056,10 +1090,14 @@ fn sys_nanosleep(ptr: u64) -> Resultado {
     Ok(0)
 }
 
-/// Relógio 0 (REALTIME): data e hora. Relógio 1 (MONOTONIC): tempo desde a partida.
+/// Relógios: 0 e 5 (REALTIME): data e hora; 2 e 3 (CPUTIME): tempo de CPU
+/// gasto pelo processo (o `clock()` do C); os outros: tempo desde a partida.
 fn sys_clock_gettime(relogio: u64, ptr: u64) -> Resultado {
-    let ms = pit::milissegundos();
-    let segundos = if relogio == 0 { rtc::agora() } else { ms / 1000 };
+    let ms = match relogio {
+        2 | 3 => processo::atual().tiques * 1000 / pit::FREQUENCIA as u64,
+        _ => pit::milissegundos(),
+    };
+    let segundos = if matches!(relogio, 0 | 5) { rtc::agora() } else { ms / 1000 };
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&segundos.to_le_bytes());
     b[8..].copy_from_slice(&((ms % 1000) * 1_000_000).to_le_bytes());
