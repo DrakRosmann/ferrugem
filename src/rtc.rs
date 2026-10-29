@@ -1,83 +1,52 @@
-//! Relógio de tempo real (RTC) do CMOS: a data e a hora de parede.
+//! Relógio de tempo real (RTC) do chip CMOS: a data e a hora que a placa-mãe
+//! mantém mesmo desligada (com a bateria). No QEMU, é a hora do computador (em UTC).
 //!
-//! Lido uma vez no boot; depois, a hora atual é a do boot mais o tempo
-//! contado pelo timer. O RTC guarda a hora em UTC (é o que o QEMU usa).
+//! Lemos uma vez na partida e, dali em diante, somamos o tempo do timer.
 
+use crate::pit;
+use crate::porta::{inb, outb};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cpu::{inb, outb};
-use crate::timer;
+static NA_PARTIDA: AtomicU64 = AtomicU64::new(0);
 
-static BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
-
-fn read_register(register: u8) -> u8 {
+fn ler(registrador: u8) -> u8 {
     unsafe {
-        outb(0x70, register | 0x80); // o bit 7 mantém a NMI desligada
+        outb(0x70, registrador);
         inb(0x71)
     }
 }
 
-fn updating() -> bool {
-    read_register(0x0A) & 0x80 != 0
-}
-
-/// (segundos, minutos, horas, dia, mês, ano, século), crus.
-fn snapshot() -> [u8; 7] {
-    while updating() {}
-    [0x00, 0x02, 0x04, 0x07, 0x08, 0x09, 0x32].map(read_register)
-}
-
-/// Dias desde 1970-01-01 (algoritmo de Howard Hinnant, `days_from_civil`).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+/// Dias desde 1970-01-01 (algoritmo de Howard Hinnant, "days_from_civil").
+fn dias_desde_1970(ano: i64, mes: i64, dia: i64) -> i64 {
+    let ano = if mes <= 2 { ano - 1 } else { ano };
+    let era = ano.div_euclid(400);
+    let ano_da_era = ano - era * 400;
+    let dia_do_ano = (153 * ((mes + 9) % 12) + 2) / 5 + dia - 1;
+    let dia_da_era = ano_da_era * 365 + ano_da_era / 4 - ano_da_era / 100 + dia_do_ano;
+    era * 146097 + dia_da_era - 719468
 }
 
 pub fn init() {
-    // Lê até duas leituras seguidas darem o mesmo resultado (o RTC pode
-    // virar o segundo no meio da leitura).
-    let mut raw = snapshot();
-    loop {
-        let again = snapshot();
-        if again == raw {
-            break;
-        }
-        raw = again;
-    }
-    let status_b = read_register(0x0B);
-    let binary = status_b & 0x04 != 0;
-    let hours_24 = status_b & 0x02 != 0;
-    let decode = |value: u8| if binary { value } else { (value & 0x0F) + (value >> 4) * 10 };
-
-    let [seconds, minutes, hours, day, month, year, century] = raw;
-    let pm = hours & 0x80 != 0;
-    let mut hours = decode(hours & 0x7F) as i64;
-    if !hours_24 {
-        hours %= 12;
-        if pm {
-            hours += 12;
+    while ler(0x0A) & 0x80 != 0 {} // espera o chip terminar de atualizar
+    let mut valores = [ler(0x00), ler(0x02), ler(0x04), ler(0x07), ler(0x08), ler(0x09)];
+    let formato = ler(0x0B);
+    let pm = valores[2] & 0x80 != 0;
+    valores[2] &= 0x7F;
+    if formato & 0x04 == 0 {
+        // Os números vêm em BCD: 0x59 quer dizer 59.
+        for v in valores.iter_mut() {
+            *v = (*v >> 4) * 10 + (*v & 0x0F);
         }
     }
-    let century = match decode(century) {
-        c @ 19..=21 => c as i64,
-        _ => 20,
-    };
-    let year = century * 100 + decode(year) as i64;
-    let days = days_from_civil(year, decode(month) as i64, decode(day) as i64);
-    let epoch = days * 86_400 + hours * 3600 + decode(minutes) as i64 * 60 + decode(seconds) as i64;
-    BOOT_EPOCH.store((epoch.max(0) as u64).saturating_sub(timer::uptime_ms() / 1000), Ordering::Relaxed);
+    let [segundo, minuto, mut hora, dia, mes, ano] = valores.map(|v| v as i64);
+    if formato & 0x02 == 0 && pm {
+        hora = (hora + 12) % 24; // relógio de 12 horas
+    }
+    let agora = dias_desde_1970(2000 + ano, mes, dia) * 86400 + hora * 3600 + minuto * 60 + segundo;
+    NA_PARTIDA.store(agora as u64, Ordering::Relaxed);
 }
 
-/// Segundos desde 1970-01-01 00:00 UTC.
-pub fn now() -> u64 {
-    BOOT_EPOCH.load(Ordering::Relaxed) + timer::uptime_ms() / 1000
-}
-
-/// Hora atual em milissegundos desde 1970 (para `clock_gettime`).
-pub fn now_ms() -> u64 {
-    BOOT_EPOCH.load(Ordering::Relaxed) * 1000 + timer::uptime_ms()
+/// Segundos desde 1970-01-01 00:00 UTC (o "tempo Unix").
+pub fn agora() -> u64 {
+    NA_PARTIDA.load(Ordering::Relaxed) + pit::milissegundos() / 1000
 }

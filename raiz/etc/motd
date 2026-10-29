@@ -1,0 +1,5 @@
+
+  Bem-vindo ao FerrugemOS!
+  Digite `ajuda` para ver os comandos. Experimente:
+     ls -l /bin     ps     id     cat ~/LEIAME.txt | wc     teste
+

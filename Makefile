@@ -1,52 +1,137 @@
-KERNEL  := target/x86_64-unknown-none/release/ferrugem
-ISO     := target/ferrugem.iso
-DISCO   := target/disco.img
-BUSYBOX := target/busybox/busybox
+# =============================================================================
+#  FerrugemOS — build
+#
+#    make          compila o kernel e os programas -> build/ferrugem.bin + build/initrd.tar
+#    make run      roda no QEMU (janela + terminal na serial)
+#    make run-nox  roda só no terminal (sem janela; Ctrl+A depois X para sair)
+#    make teste    boota, roda a bateria de testes (/bin/teste) e desliga
+#    make disco    recria o disco ext2 (disco.img) do zero
+#    make musl     baixa e compila a musl (libc) para os programas em C de c/
+#    make lua      baixa e compila o Lua 5.4 (sem modificações) para /bin/lua
+#    make clean
+# =============================================================================
 
-.PHONY: build run run-serial test disco busybox iso run-iso clean
+# Alvo "bare metal" do Rust (sem sistema operacional por baixo).
+# Fedora: sudo dnf install rust-std-static-x86_64-unknown-none
+# rustup: rustup target add x86_64-unknown-none
+TARGET ?= x86_64-unknown-none
 
-build:
-	cargo build --release
+BUILD   := build
+KERNEL  := $(BUILD)/ferrugem.bin
+ELF64   := $(BUILD)/kernel.elf
+BOOT_O  := $(BUILD)/boot.o
+ISR_O   := $(BUILD)/interrupcoes.o
+RUSTLIB := target/$(TARGET)/release/libferrugem.a
 
-# Janela do QEMU com a tela VGA; a saída serial aparece no terminal.
-run: build $(DISCO)
-	scripts/qemu.sh $(KERNEL)
+INITRD    := $(BUILD)/initrd.tar
+# Fora de build/ de propósito: o `make clean` não apaga o que você gravou no disco.
+DISCO     := disco.img
+RAIZ      := $(BUILD)/raiz
+USUARIO_OK := $(BUILD)/usuario.ok
+USUARIO_BIN := usuario/target/$(TARGET)/release
+PROGRAMAS := $(basename $(notdir $(wildcard usuario/src/bin/*.rs)))
 
-# Sem janela: use o shell pelo próprio terminal.
-run-serial: build $(DISCO)
-	FERRUGEM_DISPLAY=none scripts/qemu.sh $(KERNEL)
+# Programas em C, compilados com a musl (`make musl` instala). Ligados em 1 GiB,
+# onde começa a memória de usuário do FerrugemOS (o padrão do Linux é 4 MiB).
+MUSL_GCC   := ferramentas/musl/bin/musl-gcc
+PROGRAMAS_C := $(if $(wildcard $(MUSL_GCC)),$(basename $(notdir $(wildcard c/*.c))))
+BINARIOS_C := $(addprefix $(BUILD)/c/,$(PROGRAMAS_C))
+FLAGS_C    := -static -no-pie -O2 -Wall -Wl,-Ttext-segment=0x40000000
+# Programas de terceiros, sem nenhuma modificação (`make lua`).
+LUA        := $(wildcard ferramentas/lua/lua)
 
-# O disco só é criado se não existir, para não perder o que foi gravado nele.
-$(DISCO): | $(BUSYBOX)
-	$(MAKE) build
-	scripts/disco.sh $(DISCO)
+# Kernel: código "estático" (sem relocação dinâmica), pois não existe loader de ELF dinâmico.
+FLAGS_KERNEL := -C relocation-model=static -C code-model=small
+# Programas: o mesmo, ligados pelo ld.lld no endereço 1 GiB (veja usuario/usuario.ld).
+FLAGS_USUARIO := -C linker=ld.lld -C relocation-model=static -C link-arg=-T$(CURDIR)/usuario/usuario.ld
 
-# Refaz o disco com os programas atuais, preservando o /home.
-disco: build $(BUSYBOX)
-	scripts/disco.sh $(DISCO)
+RUST_SRC    := $(wildcard src/*.rs) $(wildcard comum/*.rs) Cargo.toml
+USUARIO_SRC := $(wildcard usuario/src/*.rs usuario/src/bin/*.rs) $(wildcard comum/*.rs) \
+               usuario/Cargo.toml usuario/usuario.ld
+ARQUIVOS_RAIZ := $(shell find raiz -type f)
 
-# O busybox com a musl (baixa os fontes na primeira vez).
-$(BUSYBOX):
-	scripts/busybox.sh
+QEMU := qemu-system-x86_64 -kernel $(KERNEL) -initrd $(INITRD) -m 256M \
+        -drive file=$(DISCO),format=raw,if=ide,index=0
 
-busybox:
-	scripts/busybox.sh
+.PHONY: all run run-nox teste clean disco musl lua
 
-# Testes de integração: cada tests/*.txt é uma sessão no sh, no QEMU.
-test: build $(BUSYBOX)
-	python3 scripts/testar.py
+all: $(KERNEL) $(INITRD) $(DISCO)
 
-# Imagem inicializável com GRUB (para pendrive ou outras VMs).
-iso: build
-	rm -rf target/iso
-	mkdir -p target/iso/boot/grub
-	objcopy -O binary $(KERNEL) target/iso/boot/ferrugem.bin
-	printf 'set timeout=0\nmenuentry "FerrugemOS" {\n  multiboot /boot/ferrugem.bin\n  boot\n}\n' \
-		> target/iso/boot/grub/grub.cfg
-	grub2-mkrescue -o $(ISO) target/iso
+$(BUILD):
+	mkdir -p $(BUILD)
 
-run-iso: iso $(DISCO)
-	qemu-system-x86_64 -cdrom $(ISO) -m 128M -serial stdio -drive file=$(DISCO),format=raw,if=ide
+$(BOOT_O): boot/boot.asm | $(BUILD)
+	nasm -f elf64 $< -o $@
+
+$(ISR_O): src/interrupcoes.asm | $(BUILD)
+	nasm -f elf64 $< -o $@
+
+$(RUSTLIB): $(RUST_SRC)
+	RUSTFLAGS="$(FLAGS_KERNEL)" cargo build --release --target $(TARGET)
+
+# 1) liga boot.o + interrupções + Rust num ELF de 64 bits
+# 2) converte para ELF32, que é o formato que o carregador Multiboot do QEMU aceita
+$(KERNEL): $(BOOT_O) $(ISR_O) $(RUSTLIB) linker.ld
+	ld -n -m elf_x86_64 --gc-sections -z noexecstack --no-warn-rwx-segments -T linker.ld -o $(ELF64) $(BOOT_O) $(ISR_O) $(RUSTLIB)
+	objcopy -O elf32-i386 $(ELF64) $@
+	@echo "==> $@ pronto"
+
+$(USUARIO_OK): $(USUARIO_SRC) | $(BUILD)
+	cd usuario && RUSTFLAGS="$(FLAGS_USUARIO)" cargo build --release --target $(TARGET)
+	touch $@
+
+musl:
+	./ferramentas/musl.sh
+
+# Baixa o Lua 5.4.9 de lua.org, confere o SHA-256, compila com a musl e põe em /bin/lua.
+lua: musl
+	./ferramentas/lua.sh
+	rm -f $(INITRD)
+	$(MAKE) $(INITRD)
+
+$(BUILD)/c/%: c/%.c $(MUSL_GCC) | $(BUILD)
+	mkdir -p $(BUILD)/c
+	$(MUSL_GCC) $(FLAGS_C) -o $@ $<
+
+# O initrd é um tar com a árvore de arquivos inicial: raiz/ + os programas em /bin
+$(INITRD): $(USUARIO_OK) $(ARQUIVOS_RAIZ) $(BINARIOS_C) $(LUA)
+	@$(if $(PROGRAMAS_C),,echo "(sem a musl: os programas em c/ ficam de fora; rode 'make musl')")
+	rm -rf $(RAIZ)
+	mkdir -p $(RAIZ)/bin
+	cp -r raiz/. $(RAIZ)/
+	for p in $(PROGRAMAS); do strip -o $(RAIZ)/bin/$$p $(USUARIO_BIN)/$$p; done
+	for p in $(PROGRAMAS_C); do strip -o $(RAIZ)/bin/$$p $(BUILD)/c/$$p; done
+	$(if $(LUA),strip -o $(RAIZ)/bin/lua $(LUA))
+	chmod 4755 $(RAIZ)/bin/su $(RAIZ)/bin/passwd    # setuid root
+	chmod 600 $(RAIZ)/etc/shadow
+	chmod 700 $(RAIZ)/root
+	# Tudo é do root, menos o /home/usuario, que é do usuário 1000.
+	tar --format=ustar --numeric-owner --owner=0 --group=0 --exclude=./home/usuario -cf $@ -C $(RAIZ) .
+	tar --format=ustar --numeric-owner --owner=1000 --group=1000 -rf $@ -C $(RAIZ) ./home/usuario
+	@echo "==> $@ pronto ($(words $(PROGRAMAS)) programas em Rust, $(words $(PROGRAMAS_C)) em C)"
+
+# Disco de 32 MiB com ext2 (blocos de 1 KiB, sem recursos modernos que o
+# kernel não sabe gravar), já com o conteúdo de disco-inicial/.
+$(DISCO):
+	mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E root_owner=1000:1000 -L ferrugem -d disco-inicial $@ 32M >/dev/null 2>&1
+	@echo "==> $@ criado"
+
+# Recria o disco do zero (apaga o que foi gravado nele!)
+disco:
+	rm -f $(DISCO)
+	$(MAKE) $(DISCO)
+
+# signal=off: o Ctrl+C vai para o FerrugemOS em vez de matar o QEMU.
+run: all
+	$(QEMU) -chardev stdio,id=serial0,signal=off -serial chardev:serial0
+
+run-nox: all
+	$(QEMU) -display none -chardev stdio,id=serial0,mux=on,signal=off -serial chardev:serial0 -mon chardev=serial0
+
+teste: all
+	./testes/rodar.sh
 
 clean:
 	cargo clean
+	cd usuario && cargo clean
+	rm -rf $(BUILD)

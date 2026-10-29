@@ -1,0 +1,1 @@
+Este é o diretório do root (permissões rwx------): só ele entra aqui.

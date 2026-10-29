@@ -1,105 +1,98 @@
-//! Leitura de executáveis ELF64 estáticos (o formato dos binários do Linux).
+//! Carregador de executáveis ELF (o formato de programas do Linux e da maioria dos Unix).
+//!
+//! Um ELF tem um cabeçalho e uma lista de "program headers". Os do tipo
+//! `PT_LOAD` dizem: "copie N bytes do arquivo, a partir do deslocamento X,
+//! para o endereço virtual V, e zere o resto até M bytes" (o resto é o .bss).
 
-use alloc::vec::Vec;
-
-use crate::paging::USER_TOP;
+use crate::erro::*;
+use crate::paginacao::{ESCRITA, EspacoEnderecos, USUARIO, USUARIO_INICIO};
+use crate::processo::{PILHA_TAMANHO, PILHA_TOPO};
 
 const PT_LOAD: u32 = 1;
-const PT_INTERP: u32 = 3;
-const ET_EXEC: u16 = 2;
-const ET_DYN: u16 = 3;
-const EM_X86_64: u16 = 0x3E;
+const PT_PHDR: u32 = 6;
+const PF_W: u32 = 2;
 
-pub const PF_X: u32 = 1;
-pub const PF_W: u32 = 2;
-pub const PF_R: u32 = 4;
-
-/// Um segmento a carregar: `file_size` bytes do arquivo a partir de
-/// `offset` vão para `vaddr`, e o resto até `mem_size` é zerado (o .bss).
-pub struct Segment {
-    pub vaddr: u64,
-    pub mem_size: u64,
-    pub offset: usize,
-    pub file_size: usize,
-    pub flags: u32,
+/// O que o carregador descobre sobre o programa.
+pub struct Programa {
+    pub entrada: u64,
+    /// Onde a imagem termina (o heap começa logo depois).
+    pub fim: u64,
+    /// Endereço dos program headers na memória (a libc procura o TLS neles), ou 0.
+    pub cabecalhos: u64,
+    pub quantidade_cabecalhos: u64,
 }
 
-pub struct Image {
-    pub entry: u64,
-    pub segments: Vec<Segment>,
+fn ler<const N: usize>(dados: &[u8], deslocamento: usize) -> Result<[u8; N], i64> {
+    dados
+        .get(deslocamento..deslocamento + N)
+        .and_then(|b| b.try_into().ok())
+        .ok_or(ENOEXEC)
 }
 
-fn u16_at(data: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes(data[at..at + 2].try_into().unwrap())
+fn u16_em(d: &[u8], o: usize) -> Result<u64, i64> {
+    Ok(u16::from_le_bytes(ler(d, o)?) as u64)
+}
+fn u32_em(d: &[u8], o: usize) -> Result<u32, i64> {
+    Ok(u32::from_le_bytes(ler(d, o)?))
+}
+fn u64_em(d: &[u8], o: usize) -> Result<u64, i64> {
+    Ok(u64::from_le_bytes(ler(d, o)?))
 }
 
-fn u32_at(data: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
-}
+/// Carrega os segmentos no espaço do processo.
+pub fn carregar(dados: &[u8], espaco: &mut EspacoEnderecos) -> Result<Programa, i64> {
+    // "\x7fELF", 64 bits, little-endian, executável (2), x86_64 (0x3E)
+    if dados.get(0..6) != Some(b"\x7fELF\x02\x01") || u16_em(dados, 16)? != 2 || u16_em(dados, 18)? != 0x3E {
+        return Err(ENOEXEC);
+    }
+    let entrada = u64_em(dados, 24)?;
+    let tabela = u64_em(dados, 32)? as usize;
+    let tamanho_entrada = u16_em(dados, 54)? as usize;
+    let quantidade = u16_em(dados, 56)? as usize;
+    let limite = PILHA_TOPO - PILHA_TAMANHO;
 
-fn u64_at(data: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(data[at..at + 8].try_into().unwrap())
-}
-
-pub fn is_elf(data: &[u8]) -> bool {
-    data.starts_with(b"\x7fELF")
-}
-
-pub fn parse(data: &[u8]) -> Result<Image, &'static str> {
-    if data.len() < 64 || !is_elf(data) {
-        return Err("não é um executável ELF");
-    }
-    if data[4] != 2 || data[5] != 1 {
-        return Err("só ELF de 64 bits little-endian é suportado");
-    }
-    if u16_at(data, 18) != EM_X86_64 {
-        return Err("o executável não é para x86_64");
-    }
-    match u16_at(data, 16) {
-        ET_EXEC => {}
-        ET_DYN => return Err("executáveis PIE/dinâmicos ainda não são suportados (use -static -no-pie)"),
-        _ => return Err("o ELF não é um executável"),
-    }
-
-    let entry = u64_at(data, 24);
-    if entry >= USER_TOP {
-        return Err("ponto de entrada fora do espaço de usuário");
-    }
-    let ph_offset = u64_at(data, 32) as usize;
-    let ph_size = u16_at(data, 54) as usize;
-    let ph_count = u16_at(data, 56) as usize;
-    if ph_size < 56 || ph_offset.checked_add(ph_size * ph_count).is_none_or(|end| end > data.len()) {
-        return Err("tabela de cabeçalhos de programa inválida");
-    }
-
-    let mut segments = Vec::new();
-    for i in 0..ph_count {
-        let ph = &data[ph_offset + i * ph_size..];
-        match u32_at(ph, 0) {
-            PT_INTERP => return Err("o executável precisa de ligação dinâmica"),
-            PT_LOAD => {}
-            _ => continue,
+    let mut fim_imagem = USUARIO_INICIO;
+    let mut cabecalhos = 0;
+    for i in 0..quantidade {
+        let o = tabela + i * tamanho_entrada;
+        let tipo = u32_em(dados, o)?;
+        if tipo == PT_PHDR {
+            cabecalhos = u64_em(dados, o + 16)?;
         }
-        let segment = Segment {
-            flags: u32_at(ph, 4),
-            offset: u64_at(ph, 8) as usize,
-            vaddr: u64_at(ph, 16),
-            file_size: u64_at(ph, 32) as usize,
-            mem_size: u64_at(ph, 40),
-        };
-        let file_end = segment.offset.checked_add(segment.file_size);
-        let mem_end = segment.vaddr.checked_add(segment.mem_size);
-        if file_end.is_none_or(|end| end > data.len())
-            || segment.file_size as u64 > segment.mem_size
-            || segment.vaddr < 0x1000
-            || mem_end.is_none_or(|end| end > USER_TOP)
-        {
-            return Err("segmento ELF inválido");
+        if tipo != PT_LOAD {
+            continue;
         }
-        segments.push(segment);
+        let flags = u32_em(dados, o + 4)?;
+        let deslocamento = u64_em(dados, o + 8)? as usize;
+        let virt = u64_em(dados, o + 16)?;
+        let no_arquivo = u64_em(dados, o + 32)? as usize;
+        let na_memoria = u64_em(dados, o + 40)?;
+        if na_memoria == 0 {
+            continue;
+        }
+        let fim = virt.checked_add(na_memoria).ok_or(ENOEXEC)?;
+        if virt < USUARIO_INICIO || fim > limite || no_arquivo as u64 > na_memoria {
+            return Err(ENOEXEC);
+        }
+        let conteudo = dados.get(deslocamento..deslocamento + no_arquivo).ok_or(ENOEXEC)?;
+
+        let permissao = USUARIO | if flags & PF_W != 0 { ESCRITA } else { 0 };
+        if !espaco.alocar_regiao(virt, fim, permissao) {
+            return Err(ENOMEM);
+        }
+        // As páginas novas já vêm zeradas: o .bss não precisa de mais nada.
+        if !espaco.gravar(virt, conteudo) {
+            return Err(EFAULT);
+        }
+        fim_imagem = fim_imagem.max(fim);
+        // Sem PT_PHDR: se a tabela de headers estiver dentro deste segmento, achamos o endereço.
+        let t = tabela as u64;
+        if cabecalhos == 0 && (deslocamento as u64..(deslocamento + no_arquivo) as u64).contains(&t) {
+            cabecalhos = virt + (t - deslocamento as u64);
+        }
     }
-    if segments.is_empty() {
-        return Err("o executável não tem segmentos carregáveis");
+    if !(USUARIO_INICIO..fim_imagem).contains(&entrada) {
+        return Err(ENOEXEC);
     }
-    Ok(Image { entry, segments })
+    Ok(Programa { entrada, fim: fim_imagem, cabecalhos, quantidade_cabecalhos: quantidade as u64 })
 }

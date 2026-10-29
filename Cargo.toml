@@ -1,15 +1,14 @@
 [package]
 name = "ferrugem"
-version = "0.3.0"
+version = "0.1.0"
 edition = "2024"
-description = "FerrugemOS: um sistema operacional x86_64 escrito do zero em Rust"
-license = "GPL-3.0-or-later"
-repository = "https://github.com/DrakRosmann/ferrugem"
 
-# Nenhuma dependência: tudo (boot, interrupções, memória, alocador,
-# escalonador, sistema de arquivos e shell) é implementado aqui.
-[dependencies]
+[lib]
+# O Rust gera uma biblioteca estática (.a) que o `ld` junta com o boot.o
+crate-type = ["staticlib"]
+path = "src/lib.rs"
 
+# Num kernel não existe "desenrolar a pilha" em caso de pânico: só paramos.
 [profile.dev]
 panic = "abort"
 

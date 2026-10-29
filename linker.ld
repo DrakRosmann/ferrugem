@@ -1,52 +1,26 @@
 /*
- * O kernel é carregado no endereço físico 1 MiB, mas ligado na "metade
- * alta" (KERNEL_VMA + endereço físico), deixando a metade baixa do espaço
- * de endereçamento livre para os processos de usuário.
+ * Linker script do FerrugemOS.
+ * Diz ao linker onde cada pedaço do kernel fica na memória.
+ * O kernel é carregado a partir de 1 MiB (abaixo disso fica BIOS, VGA etc.).
  */
 ENTRY(_start)
 
-KERNEL_VMA = 0xFFFFFFFF80000000;
-
-PHDRS
-{
-    text   PT_LOAD FLAGS(5);   /* R-X */
-    rodata PT_LOAD FLAGS(4);   /* R-- */
-    data   PT_LOAD FLAGS(6);   /* RW- */
-}
-
 SECTIONS
 {
-    . = KERNEL_VMA + 1M;
-    __kernel_start = .;
+    . = 1M;
 
-    .text : AT(ADDR(.text) - KERNEL_VMA)
-    {
-        KEEP(*(.multiboot))
-        *(.text.boot)
-        *(.text .text.*)
-    } :text
+    /* O header Multiboot precisa vir primeiro (bootloader procura nos primeiros 8 KiB) */
+    .boot : { KEEP(*(.multiboot)) }
 
-    .rodata : AT(ADDR(.rodata) - KERNEL_VMA) ALIGN(4K)
-    {
-        *(.rodata .rodata.*)
-        *(.eh_frame .eh_frame_hdr)
-    } :rodata
+    .text   : ALIGN(4K) { *(.text .text.*) }
+    .rodata : ALIGN(4K) { *(.rodata .rodata.*) }
+    .data   : ALIGN(4K) { *(.data .data.*) }
+    .bss    : ALIGN(4K) { *(COMMON) *(.bss .bss.*) }
 
-    .data : AT(ADDR(.data) - KERNEL_VMA) ALIGN(4K)
-    {
-        *(.data .data.*)
-        *(.got .got.plt)
-    } :data
-    __data_end = .;
-
-    .bss : AT(ADDR(.bss) - KERNEL_VMA) ALIGN(4K)
-    {
-        *(COMMON)
-        *(.bss .bss.*)
-    } :data
-
+    /* Daqui para cima a memória é do alocador de quadros */
     . = ALIGN(4K);
-    __kernel_end = .;
+    __fim_kernel = .;
 
-    /DISCARD/ : { *(.comment) *(.note .note.*) }
+    /* Não temos unwinding nem precisamos de metadados do compilador */
+    /DISCARD/ : { *(.eh_frame*) *(.comment) *(.note*) }
 }

@@ -1,0 +1,8 @@
+Este arquivo está no disco (disco.img, formato ext2).
+
+Diferente do resto do sistema, que vive na memória, o que você gravar
+em /disco continua lá depois de desligar e ligar de novo.
+
+O disco usa o mesmo formato do Linux. No Linux, dá para conferir com:
+    e2fsck -fn disco.img
+    debugfs -R 'ls -l /' disco.img

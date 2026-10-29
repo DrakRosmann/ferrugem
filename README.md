@@ -1,279 +1,174 @@
 # FerrugemOS
 
-Um sistema operacional x86_64 escrito do zero em Rust: sem `std` e sem
-nenhum crate externo. O kernel tem memória virtual, processos isolados no
-anel 3 com `fork`/`execve`, pipes, sinais, um terminal com controle de jobs
-e chamadas de sistema compatíveis com as do Linux, de modo que binários
-estáticos simples feitos para o Linux rodam nele sem mudança. A raiz fica
-num disco ext2 (lido e gravado pelo próprio kernel, compatível com o Linux),
-os comandos Unix são os do [busybox](https://busybox.net) (compilado com a
-musl, sem nenhuma mudança: `vi`, `awk`, `sed`, `find`, `tar`, o shell
-`ash`...) e, no boot, ele abre o `/bin/sh`, um shell escrito para ele.
+Um sistema operacional tipo Unix para x86_64, escrito do zero em Rust (com um
+pouco de assembly). Kernel com memória virtual (com copy-on-write), processos,
+multitarefa preemptiva, sinais, usuários e permissões, chamadas de sistema
+compatíveis com as do Linux, pipes, sistema de arquivos e driver de disco ext2
+— e, em cima dele, `login`, um shell e mais de 30 programas em modo usuário.
+Programas em C compilados com a **musl** (a libc do Alpine Linux) também rodam.
 
-## Requisitos (Fedora)
-
-```sh
-sudo dnf install rust-std-static-x86_64-unknown-none qemu-system-x86 binutils gcc e2fsprogs make curl bzip2
-# opcional, para gerar a ISO: grub2-tools-extra grub2-pc-modules xorriso
+```
+ferrugem login: usuario
+Senha:
+usuario@ferrugem:~$ cat /etc/shadow
+cat: /etc/shadow: permissão negada
+usuario@ferrugem:~$ echo "olá" > /disco/nota.txt        # sobrevive ao desligar
+usuario@ferrugem:~$ ola                                 # um programa em C, com a musl
+Olá do C! Rodando em FerrugemOS 0.4.0 (x86_64), pid 4
+usuario@ferrugem:~$ su
+Senha:
+root@ferrugem:/home/usuario# ps
+  PID   PAI  USUÁRIO   ESTADO      MEMÓRIA     CPU  NOME
+    0     0  root      pronto         0 KiB    8.71s  ocioso
+    1     0  root      dormindo     408 KiB    0.02s  init
+    2     1  usuario   dormindo     444 KiB    0.03s  sh
+    3     2  root      dormindo     444 KiB    0.03s  sh
+    9     3  root      rodando      416 KiB    0.00s  ps
 ```
 
-Não precisa de nightly: tudo compila no Rust estável.
+## Como rodar (Fedora / Arch)
 
-## Rodando
+```bash
+# Fedora
+sudo dnf install nasm qemu-system-x86 binutils make lld e2fsprogs rust-std-static-x86_64-unknown-none
+# Arch
+sudo pacman -S nasm qemu-desktop binutils make lld e2fsprogs
+rustup target add x86_64-unknown-none        # se o Rust veio do rustup
 
-```sh
-make run          # janela do QEMU (tela VGA) + serial no terminal
-make run-serial   # sem janela: o shell roda no próprio terminal
-cargo run --release   # o mesmo que `make run`
-make disco        # refaz o disco com os programas atuais (o /home é mantido)
-make busybox      # recompila o busybox
-make iso          # target/ferrugem.iso, inicializável via GRUB
+make run        # janela do QEMU + terminal na serial (dá para digitar nos dois)
+make run-nox    # só no terminal; para sair: Ctrl+A e depois X
+make teste      # boota, roda os testes do kernel e da libc, desliga e confere o disco com e2fsck
+make disco      # recria o disco (disco.img) do zero
+
+make musl       # baixa (de musl.libc.org, conferindo o SHA-256) e compila a musl:
+                # depois disso os programas em c/ entram no sistema
+make lua        # baixa o Lua 5.4.9 de lua.org, confere, compila sem modificar
+                # nada e põe em /bin/lua
 ```
 
-Na primeira vez, o `make run` baixa e compila a musl e o busybox (cerca de
-um minuto; os fontes são conferidos pelo SHA-256) e cria `target/disco.img`:
-um disco ext2 de 64 MiB com `/bin`, `/sbin`, `/usr`, `/etc` e `/home` (de
-`sistema/`), gerado sem root pelo `mkfs.ext2 -d`. O que você grava nele continua lá no próximo boot. Depois
-de mudar os programas de `user/`, rode `make disco` para atualizá-los no
-disco. No Linux, a imagem pode ser inspecionada com `debugfs`, verificada
-com `e2fsck -f` ou montada (`sudo mount -o loop target/disco.img /mnt`).
-Sem disco, o kernel usa uma raiz em memória com os programas embutidos.
+Usuários de teste: **root** (senha `root`) e **usuario** (senha `usuario`).
+Dentro do sistema, digite `ajuda`. O teclado é ABNT2 (com acentos) e o Ctrl+C
+interrompe o programa que está rodando.
 
-Para testar: `make test`. Cada arquivo em `tests/` é uma sessão no `sh`
-(comandos e a saída esperada); o `scripts/testar.py` dá boot no QEMU com
-um disco novo, digita cada comando quando o prompt aparece e compara a
-saída. No fim, desliga o sistema e roda o `e2fsck` no disco: qualquer
-inconsistência deixada pelo ext2 do kernel é uma falha. O GitHub Actions
-roda os mesmos testes a cada push, com blocos de 1 e de 4 KiB.
+## O que já existe
 
-Para sair do QEMU sem janela, digite `exit` no sh e depois `desligar` no
-monitor do kernel (ou Ctrl+A e depois X).
+**Kernel**
+- Boot Multiboot → modo longo (64 bits) → Rust; GDT, TSS e IDT próprias.
+- Exceções da CPU: no kernel, tela de pânico com os registradores; num
+  programa, só ele morre, com o sinal certo (SIGSEGV, SIGFPE, SIGILL).
+- PIC 8259, timer PIT a 100 Hz, relógio CMOS (data e hora), teclado PS/2 ABNT2, serial.
+- **Memória:** alocador de quadros físicos (bitmap), heap do kernel (`Box`, `Vec`,
+  `Arc`...), um espaço de endereçamento por processo, isolado do kernel.
+- **Processos:** `fork` com **copy-on-write**, `execve` (carregador ELF, com
+  argumentos, ambiente e vetor auxiliar como no Linux), `exit`, `wait`, órfãos
+  adotados pelo init, escalonador round-robin **preemptivo**. Registradores
+  SSE/FPU e TLS (FS) salvos por processo.
+- **Sinais:** tratadores próprios (`sigaction`, `rt_sigreturn`), máscara
+  (`sigprocmask`), `SA_RESTART`, `alarm`, `pause`, `kill`, SIGCHLD, SIGPIPE.
+- **Usuários e permissões:** uid/gid real e efetivo, `rwx` + setuid, setgid e
+  sticky em todo arquivo (memória e ext2), `chmod`, `chown`, `umask`, `setuid`.
+- **Syscalls** pela instrução `syscall` (ou `int 0x80`), com os mesmos números
+  e estruturas do Linux — umas 80, o suficiente para a musl: `read`, `writev`,
+  `openat`, `newfstatat`, `mmap`, `brk`, `clone` (do jeito do `posix_spawn`),
+  `fcntl`, `pipe2`, `dup3`, `ioctl` de terminal, `arch_prctl`, `getrandom`...
+  Ponteiros inválidos viram `EFAULT`.
+- **Arquivos:** VFS com descritores, posição, pipes e dispositivos (`/dev/tty`,
+  `/dev/null`, `/dev/zero`). A raiz fica em memória (vinda do initrd) e
+  `/disco` é um **disco ext2 de verdade** (driver ATA PIO), que persiste e que o
+  Linux consegue ler.
+- **Terminal:** edição de linha no kernel, `termios` (eco e modo canônico
+  ligáveis), Ctrl+C vira SIGINT, Ctrl+D vira fim de arquivo, cores ANSI tanto
+  na VGA quanto na serial.
 
-## Experimente
+**Modo usuário** (`usuario/`)
+- `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com
+  `brk`, `print!`, sinais, ambiente, usuários, SHA-256.
+- `init` (processo 1) → `login` → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
+  `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`.
+- `login su passwd id whoami chmod chown env ls cat echo cp mv rm mkdir rmdir
+  touch grep wc head ps kill sleep date uptime free df uname clear desligar
+  reiniciar teste`.
+- **Em C, com a musl** (`c/`): `ola` e `testec`, a bateria de testes da libc
+  (stdio, `malloc` de 8 MiB, `double`, arquivos, `fork`+`execl`, `system`, `popen`, sinais, tempo).
 
-No `sh` (`ajuda` resume a sintaxe):
+## Estrutura
 
-```text
-$ ls /bin                          # os arquivos em verde são programas
-$ ola a b c                        # roda no anel 3 e mostra pid, argumentos, CS
-$ cat leiame.txt | grep -c sistema # pipes
-$ echo oi > /tmp/a; echo tchau >> /tmp/a; wc -l < /tmp/a
-$ ls /nada 2>&1 | head -n 1        # redirecionamento de erros
-$ make || echo "falhou com $?"     # listas: ; && ||
-$ pi 100000000 &                   # segundo plano; rode três e veja `jobs`
-$ yes > /dev/null                  # Ctrl+Z para; depois bg, jobs, kill %1
-$ sleep 30                         # Ctrl+Z, fg, Ctrl+C
-$ falha                            # lê a memória do kernel e morre (SIGSEGV)
-$ sh -c 'echo $0 $1' a b           # também roda scripts: sh arquivo args...
-$ echo fica > nota.txt             # no disco: continua lá depois de reiniciar
-$ mkdir -p a/b; mv nota.txt a/b; ln -s a/b/nota.txt atalho; ls -l
-$ yes | head -n 100000 > grande    # arquivo de 200 KB (blocos indiretos do ext2)
-$ date                             # hora do relógio da máquina (RTC), em UTC
-$ vi nota.txt                      # o vi do busybox (i, ESC, :wq)
-$ find / -name '*.txt' | xargs wc -l
-$ ls /usr/bin | wc -l              # os comandos do busybox
-$ ash                              # o shell POSIX do busybox (if, for, funções...)
-$ exit                             # volta ao monitor do kernel
-```
-
-No monitor do kernel (`ajuda` lista os comandos):
-
-```text
-ferrugem> ps                 # anel, grupo, CPU e memória residente de cada tarefa
-ferrugem> memoria 30000 &    # heap, mmap e pilha sob demanda; veja no `ps`
-ferrugem> df                 # o que está montado onde, e o espaço livre no disco
-ferrugem> sh                 # reabre o shell
-```
-
-Os mesmos binários de `user/` rodam no Linux:
-`target/user/x86_64-unknown-linux-gnu/release/ola`.
-
-## Como funciona
-
-### Memória virtual
-
-```text
-0x0000_0000_0000_0000 .. 0x0000_8000_0000_0000   processo (um espaço por processo)
-0xFFFF_8000_0000_0000 .. +4 GiB                   mapa direto da RAM física
-0xFFFF_FFFF_8000_0000 .. +1 GiB                   imagem do kernel
-```
-
-O boot entra no modo longo com um mapeamento 1:1 temporário, salta para a
-metade alta e o kernel desfaz o 1:1 (um ponteiro nulo no kernel passa a
-dar falha de página). Cada processo tem sua tabela P4; a metade alta é
-compartilhada, mas sem o bit USER. A memória de um processo é descrita por
-regiões (imagem do ELF, heap, pilha, `mmap`), e as páginas só são criadas
-quando tocadas, no tratador de falha de página. Acesso fora das regiões, ou
-contra a permissão delas, encerra o processo com SIGSEGV.
-
-### Processos e chamadas de sistema
-
-- O carregador lê ELF64 estáticos (`ET_EXEC`), monta a pilha inicial no
-  formato System V (argc, argv, envp, auxv) e entra no anel 3 com `iretq`.
-- `fork` compartilha as páginas com cópia sob demanda (copy-on-write) e
-  copia a tabela de descritores; `execve`
-  troca a imagem mantendo os descritores (menos os `O_CLOEXEC`); `wait4`
-  colhe filhos que terminaram ou pararam (`WUNTRACED`).
-- A entrada de `syscall` troca para a pilha de kernel da tarefa e monta o
-  mesmo frame de uma interrupção. Assim, uma syscall pode bloquear (`read`,
-  `nanosleep`) ou trocar de tarefa (`exit`, `sched_yield`) pelo mesmo
-  caminho do escalonador.
-- Na troca de tarefa mudam junto o CR3, o estado da FPU/SSE (`fxsave`), a
-  base do FS (TLS) e o rsp0 do TSS.
-- Sinais POSIX: pendentes por tarefa, com máscara, `rt_sigaction` e
-  tratadores no anel 3 (quadro na pilha do usuário + `rt_sigreturn`).
-- Syscalls implementadas, com os números do Linux:
-  - arquivos: `read`, `write`, `readv`, `writev`, `open`, `openat`,
-    `close`, `lseek`, `stat`, `fstat`, `lstat`, `newfstatat`,
-    `getdents64`, `dup`, `dup2`, `dup3`, `fcntl`, `pipe`, `pipe2`,
-    `ioctl`, `getcwd`, `chdir`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
-    `unlinkat`, `access`, `faccessat`, `rename`, `renameat`, `renameat2`,
-    `link`, `linkat`, `symlink`, `symlinkat`, `readlink`, `readlinkat`,
-    `truncate`, `ftruncate`, `utimensat`, `sync`, `fsync`, `fdatasync`,
-    `pread64`, `pwrite64`, `sendfile`, `poll`, `ppoll`, `select`,
-    `pselect6`, `chmod`, `fchmod`, `fchmodat`, `chown`, `fchown`, `lchown`,
-    `fchownat`, `umask`;
-  - processos: `fork`, `vfork`, `clone` (só a forma do `fork`), `execve`,
-    `exit`, `exit_group`, `wait4`, `kill`, `getpid`, `getppid`, `gettid`,
-    `setpgid`, `getpgid`, `getpgrp`, `setsid`, `getsid`, `getuid` e afins;
-  - sinais: `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`,
-    `rt_sigsuspend`;
-  - memória e outras: `mmap` (anônimo), `munmap`, `brk`, `sched_yield`,
-    `nanosleep`, `uname`, `arch_prctl`, `set_tid_address`,
-    `clock_gettime` (`CLOCK_REALTIME` vem do RTC), `sysinfo`, `getgroups`.
-
-  As que faltam devolvem ENOSYS e são registradas na serial.
-
-### Sistemas de arquivos
-
-O VFS (`vfs.rs`) monta a árvore única do Unix a partir de vários sistemas
-de arquivos, cada um implementando o trait `Inode`:
-
-```text
-/      ext2 no disco ATA (ou, sem disco, um memfs com os programas embutidos)
-/dev   memfs com null, zero, tty e console
-/tmp   memfs (some ao desligar, como o tmpfs do Linux)
-```
-
-A resolução de caminhos segue links simbólicos (até 40 por caminho) e
-troca de sistema de arquivos ao passar por um ponto de montagem; `rename`
-e `link` entre sistemas diferentes dão `EXDEV`, como no Linux.
-
-O driver ATA (`block.rs`) usa PIO no canal primário. O ext2 (`ext2.rs`) lê e
-grava blocos de 1, 2 ou 4 KiB, com ponteiros diretos e indiretos (simples,
-duplos e triplos), bitmaps de blocos e inodes, diretórios, links físicos e
-simbólicos (curtos dentro do inode). Cada alteração vai direto para o disco
-(write-through), e o sistema é marcado como "não limpo" enquanto montado:
-se a energia cair, o `e2fsck` sabe que precisa verificar. Imagens com
-recursos de ext3/ext4 (journal, extents) são recusadas; diretórios com
-índice (`dir_index`) viram lineares ao serem alterados.
-
-### Terminal e shell
-
-O terminal (`tty.rs`) tem disciplina de linha com `termios` (modo canônico
-ou cru, eco, UTF-8: o backspace apaga um "ç" inteiro), uma sessão e um grupo
-em primeiro plano: Ctrl+C, Ctrl+Z e
-Ctrl+\\ viram SIGINT, SIGTSTP e SIGQUIT para esse grupo, e um grupo em
-segundo plano que tenta ler recebe SIGTTIN.
-
-A tela VGA (`vga.rs`) interpreta as sequências ANSI de um terminal "linux"
-(posição do cursor, apagar e inserir linhas e caracteres, vídeo reverso), o
-bastante para o `vi` e o `less`; a serial repassa tudo ao terminal do host.
-Se a fila de entrada enche (texto colado), a serial para de ser esvaziada e
-os bytes esperam na UART, sem se perder.
-
-O `/bin/sh` (`user/src/bin/sh.rs`) separa a linha em tokens respeitando
-aspas, monta listas (`;`, `&&`, `||`, `&`) de pipelines de comandos com
-redirecionamentos, e só expande `$VAR`, `$?`, `~` etc. na hora de executar
-cada comando. Cada pipeline vira um job num grupo de processos próprio,
-que recebe o terminal (`tcsetpgrp`) enquanto roda em primeiro plano.
-Comandos internos: `cd`, `pwd`, `export`, `unset`, `jobs`, `fg`, `bg`,
-`wait`, `kill` (aceita `%n`), `umask`, `exit` e `ajuda`.
-
-### Busybox
-
-O `scripts/busybox.sh` compila a musl (para `target/musl`, sem root) e com
-ela o busybox estático. O `disco.sh` instala o executável em `/bin/busybox` e
-um link para cada um dos ~400 comandos no lugar de costume (`/bin/ls`,
-`/usr/bin/awk`, `/sbin/...`); eles substituem as versões simples escritas
-para o FerrugemOS, que continuam embutidas no kernel para o modo sem disco.
-As mensagens do busybox são em inglês (a musl não tem traduções).
-
-### Arquivos
-
-| Arquivo | Papel |
+| Onde | O quê |
 |---|---|
-| `src/boot.s` | Cabeçalho Multiboot; tabelas de página iniciais, modo longo, salto para a metade alta |
-| `src/main.rs` | `kernel_main`: ordem de inicialização, barra de status, handler de pânico |
-| `src/paging.rs` | Tabelas de 4 níveis, `AddressSpace` por processo, mapa direto |
-| `src/memory.rs`, `src/multiboot.rs` | Mapa de memória do carregador e alocador de quadros físicos (bitmap) |
-| `src/heap.rs` | `#[global_allocator]` do kernel (lista livre com fusão de blocos) |
-| `src/process.rs`, `src/elf.rs` | Carregador de ELF, regiões de memória, paginação sob demanda, `brk`/`mmap` |
-| `src/syscall/` | Entrada de `syscall` e despacho (`mod.rs`); syscalls de arquivos (`fs.rs`) e de processos e sinais (`proc.rs`) |
-| `src/task.rs` | Escalonador preemptivo: threads do kernel e processos, zumbis, `wait4`, grupos e sessões |
-| `src/signal.rs` | Sinais: ações, máscara, entrega no retorno ao anel 3 e `rt_sigreturn` |
-| `src/gdt.rs` | Segmentos do kernel e do usuário, TSS (rsp0 e pilha IST da falta dupla) |
-| `src/isr.s`, `src/interrupts.rs` | 256 stubs de interrupção, IDT, PIC 8259, exceções (que matam só o processo culpado) |
-| `src/tty.rs`, `src/input.rs` | Terminal: termios, disciplina de linha, grupo em primeiro plano, Ctrl+C/Z; fila de entrada |
-| `src/keyboard.rs`, `src/serial.rs`, `src/timer.rs` | Teclado PS/2 (layout US), UART 16550, PIT a 100 Hz |
-| `src/vga.rs`, `src/console.rs` | Modo texto 80x25 com cores e `print!` espelhado na serial |
-| `src/vfs.rs` | VFS: trait `Inode`, tabela de montagem, caminhos e links simbólicos |
-| `src/ext2.rs`, `src/block.rs` | ext2 com leitura e escrita; driver ATA PIO |
-| `src/memfs.rs` | Sistema de arquivos em memória (`/tmp`, `/dev` e a raiz sem disco) |
-| `src/file.rs`, `src/pipe.rs` | Arquivos abertos e tabela de descritores; pipes |
-| `src/rtc.rs` | Relógio CMOS: data e hora de parede |
-| `src/shell.rs` | Monitor do kernel: inicia o `/bin/sh` e tem comandos de diagnóstico |
-| `src/sync.rs`, `src/cpu.rs`, `src/power.rs` | Trava giratória sem interrupções; instruções de baixo nível; reiniciar e desligar |
-| `user/` | Biblioteca de usuário (`_start`, syscalls, `print!`, alocador sobre `brk`) e programas: `sh`, `ls`, `cat`, `cp`, `mv`, `ln`, `rm`, `mkdir`, `touch`, `truncate`, `grep`, `wc`, `head`, `date`, `kill`... |
-| `sistema/` | Arquivos que vão para o disco (`/etc`, `/home`) |
-| `scripts/` | `qemu.sh` (roda), `disco.sh` (cria o disco), `busybox.sh` (musl + busybox), `testar.py` (testes) |
-| `tests/` | Sessões de teste do sh, com a saída esperada |
+| `boot/boot.asm` | Header Multiboot, checagem da CPU, tabelas de página iniciais, salto para 64 bits |
+| `src/interrupcoes.asm` | 256 pontos de entrada de interrupção, `troca_contexto`, entrada do `syscall` |
+| `src/lib.rs` | `kmain`: a ordem de inicialização |
+| `src/gdt.rs`, `interrupcoes.rs` | GDT/TSS, IDT, tratador central, exceções |
+| `src/pic.rs`, `pit.rs`, `rtc.rs` | Controlador de interrupções, timer, relógio |
+| `src/quadros.rs`, `heap.rs`, `paginacao.rs` | Memória física, heap do kernel, memória virtual |
+| `src/processo.rs` | Processos, escalonador, `fork`/`exec`/`exit`/`wait`, sinais |
+| `src/syscall.rs` | Todas as chamadas de sistema |
+| `src/elf.rs`, `initrd.rs` | Carregador de executáveis, leitor de tar |
+| `src/vfs.rs`, `arquivo.rs` | Sistema de arquivos virtual, arquivos abertos, pipes |
+| `src/ata.rs`, `ext2.rs` | Driver de disco e sistema de arquivos ext2 |
+| `src/tty.rs`, `teclado.rs`, `serial.rs`, `vga.rs` | Terminal e dispositivos de entrada e saída |
+| `comum/lista_livre.rs` | Alocador usado pelo kernel e pelos programas |
+| `usuario/src/lib.rs` + `sys.rs`, `io.rs` | `ulib`, a biblioteca dos programas |
+| `usuario/src/bin/*.rs` | Um programa por arquivo, todos vão para `/bin` |
+| `raiz/` | Arquivos que vão para o initrd (`/etc/motd`, `/home`...) |
+| `disco-inicial/` | Conteúdo inicial do disco ext2 |
+| `src/sinal.rs` | Sinais: ações, máscara, quadro do tratador na pilha do usuário |
+| `usuario/src/usuarios.rs`, `sha256.rs` | /etc/passwd, /etc/group, /etc/shadow e o hash das senhas |
+| `c/` | Programas em C, compilados com a musl |
+| `ferramentas/` | Scripts que baixam e compilam a musl e o Lua |
+| `testes/rodar.sh` | O `make teste` |
 
-O `build.rs` compila `user/` para `x86_64-unknown-linux-gnu` (binários
-estáticos, sem libc) e os programas em `user/c/` com o gcc. Eles vão para
-o `/bin` do disco (via `target/programas/` e `scripts/disco.sh`) e também
-ficam embutidos no kernel, para a raiz em memória de quando não há disco.
+## Como as peças se encaixam
 
-O kernel é entregue ao carregador como binário plano (`objcopy -O binary`)
-com os endereços físicos no cabeçalho Multiboot, porque o ELF ligado na
-metade alta não cabe no formato de 32 bits que o `-kernel` do QEMU aceita.
+### Memória de cada processo
 
-## Escrevendo um programa
-
-Crie `user/src/bin/meuprog.rs`:
-
-```rust
-#![no_std]
-#![no_main]
-
-extern crate alloc;
-
-use ferrugem_user::{entry, println, rt};
-
-entry!(main);
-
-fn main() -> i32 {
-    println!("argumentos: {:?}", rt::args().collect::<alloc::vec::Vec<_>>());
-    0
-}
+```
+0       .. 1 GiB      kernel: o mesmo em todos, mapeado só para o anel 0
+1 GiB   .. ...        programa (ELF) e logo depois o heap, que cresce com brk
+...     .. 508 GiB    pilha do usuário (256 KiB), crescendo para baixo
 ```
 
-Depois rode `make disco run` e digite `meuprog` no shell.
+### Uma chamada de sistema
+
+```
+programa: mov rax, 1 (write) ; syscall
+  └► entrada_syscall (asm): troca para a pilha de kernel do processo,
+     monta o mesmo quadro de uma interrupção ─► isr_comum: salva tudo
+       └► tratar_interrupcao ─► syscall::tratar ─► sys_write ─► Arquivo::escrever
+     ◄─ RAX = bytes escritos (ou -errno) ◄─ iretq de volta ao anel 3
+```
+
+### Multitarefa
+
+Cada processo tem sua própria pilha de kernel. Trocar de processo é trocar
+de pilha (`troca_contexto`). O timer interrompe o programa 100 vezes por
+segundo e, na volta para o modo usuário, o escalonador pode escolher outro.
+Quem espera alguma coisa (teclado, pipe, filho, tempo) dorme num "canal" e
+é acordado quando o evento acontece.
+
+O kernel roda sempre com interrupções desligadas (elas só ficam ligadas em modo
+usuário e no processo ocioso). Numa CPU só, isso faz o kernel inteiro funcionar
+como uma grande seção crítica, a mesma ideia do "big kernel lock" das primeiras
+versões do Linux.
 
 ## Próximos passos
 
-- Usuários e permissões verificadas (`/etc/passwd`, setuid), `/sbin/init` e `login`
-- `/proc`, para `ps`, `top`, `free` e `df` do busybox; depois threads e rede
-- `mmap` de arquivos e executáveis PIE/dinâmicos
-- Subshells `( ... )`, substituição de comandos `$(...)` e globs (`*.txt`) no sh
-- Disco mais rápido: DMA ou virtio-blk, com interrupções em vez de espera ativa
+1. **Portar mais programas de verdade:** o Lua já tem script pronto (`make lua`);
+   depois, `dash` e `busybox`. Para eles devem faltar algumas syscalls (o kernel
+   avisa qual: `chamada de sistema N não implementada`).
+2. **Mapear arquivos com `mmap`** e links simbólicos.
+3. **Grupos de processos e controle de jobs** (Ctrl+Z, `fg`, `bg`), e o Ctrl+C
+   indo só para o programa em primeiro plano.
+4. **Threads** (`clone` com `CLONE_THREAD`, futex) — exigem trocar o "big kernel
+   lock" por locks de verdade, o mesmo trabalho que o SMP.
+5. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs), boot UEFI, framebuffer.
+6. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
+7. **Interface gráfica:** mouse, servidor de janelas.
+
+Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
+[OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)
+(MIT), [Redox OS](https://www.redox-os.org/) e a [especificação do ext2](https://www.nongnu.org/ext2-doc/ext2.html).
 
 ## Licença
 
-Copyright (C) 2026 DrakRosmann
-
-Este programa é software livre: você pode redistribuí-lo e/ou modificá-lo
-sob os termos da GNU General Public License, como publicada pela Free
-Software Foundation, na versão 3 da licença ou (a seu critério) qualquer
-versão posterior. Ele é distribuído na esperança de ser útil, mas SEM
-NENHUMA GARANTIA. Veja o texto completo em [LICENSE](LICENSE).
+GPL-3.0-or-later (veja o arquivo `LICENSE`).

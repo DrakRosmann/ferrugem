@@ -1,490 +1,505 @@
-//! Sistema de arquivos virtual (VFS): a árvore única de caminhos do Unix,
-//! montada a partir de vários sistemas de arquivos.
+//! Sistema de arquivos virtual (VFS): uma árvore única de diretórios, não
+//! importa onde os dados estejam.
 //!
-//! Cada sistema de arquivos (ext2 no disco, memfs na memória) implementa o
-//! trait `Inode`. A tabela de montagem diz qual sistema aparece em cada
-//! diretório; com um disco, por exemplo:
+//! - A raiz (`/`) vive na memória (como o tmpfs do Linux): na partida,
+//!   o conteúdo do initrd é copiado para cá. Tudo some ao desligar.
+//! - Em `/disco` fica *montado* o disco ext2: o que se grava ali sobrevive.
 //!
-//! ```text
-//! /      ext2 (disco ATA)     /dev   memfs com null, zero, tty, console
-//! /tmp   memfs (some ao desligar)
-//! ```
+//! Quem usa o VFS não precisa saber a diferença: tudo é um `Vnode`, com as
+//! mesmas operações (ler, escrever, listar, criar...). É a mesma ideia do
+//! VFS do Linux, que esconde dezenas de sistemas de arquivos atrás de uma
+//! interface só.
 //!
-//! Sem disco, a raiz é um memfs com os programas embutidos no kernel.
+//! Os caminhos que chegam aqui já estão normalizados e absolutos
+//! (`/home/../bin/./ls` vira `/bin/ls`; veja `normalizar`).
+//!
+//! ## Permissões
+//!
+//! Todo arquivo tem um dono, um grupo e 9 bits de permissão, em três trios:
+//! dono, grupo e "os outros". `rwxr-x---` = o dono lê, escreve e executa; o
+//! grupo lê e executa; os outros, nada. Num diretório, `r` deixa listar, `w`
+//! deixa criar e apagar dentro dele, e `x` deixa *atravessá-lo* num caminho.
+//! Mais três bits especiais: setuid (o programa roda com a identidade do dono
+//! do arquivo), setgid, e sticky (num diretório como o /tmp: cada um só apaga
+//! o que é seu). O root (uid 0) pode tudo, menos executar um arquivo sem nenhum `x`.
 
+use crate::erro::*;
+use crate::ext2::{self, Ext2};
+use crate::rtc;
+use crate::spin::Mutex;
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::sync::SpinLock;
-use crate::syscall::{
-    EBUSY, EEXIST, EINVAL, EISDIR, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, EPERM, EXDEV, Errno,
-};
-
-const MAX_NAME: usize = 255;
-/// Quantos links simbólicos seguir num caminho antes de desistir (ELOOP).
-const MAX_SYMLINKS: usize = 40;
-
-pub type NodeRef = Arc<dyn Inode>;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Device {
-    Null,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dispositivo {
+    Terminal,
+    Nulo,
     Zero,
-    Tty,
 }
 
-impl Device {
-    /// Número do dispositivo (major << 8 | minor), como no Linux.
-    pub fn rdev(self) -> u64 {
-        match self {
-            Device::Null => 1 << 8 | 3,
-            Device::Zero => 1 << 8 | 5,
-            Device::Tty => 5 << 8,
-        }
-    }
-
-    pub fn from_rdev(rdev: u64) -> Option<Device> {
-        match rdev {
-            0x103 => Some(Device::Null),
-            0x105 => Some(Device::Zero),
-            0x500 | 0x501 | 0x400 => Some(Device::Tty), // tty, console, tty0
-            _ => None,
-        }
-    }
+/// Um nó da árvore em memória.
+pub enum Conteudo {
+    Arquivo(Vec<u8>),
+    Diretorio(BTreeMap<String, Arc<No>>),
+    Dispositivo(Dispositivo),
+    /// Ponto de montagem: daqui para baixo, quem responde é o disco.
+    Montagem(Arc<Ext2>),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    File,
-    Directory,
-    Symlink,
-    Device(Device),
-    /// FIFOs, sockets e dispositivos que o kernel não conhece.
-    Special,
+pub struct No {
+    pub id: u64,
+    pub conteudo: Mutex<Conteudo>,
+    meta: Mutex<Meta>,
 }
 
-/// O que criar num diretório.
-pub enum NewNode<'a> {
-    File,
-    Directory,
-    Symlink(&'a str),
+/// Dono, grupo, permissões e data de modificação.
+#[derive(Clone, Copy)]
+pub struct Meta {
+    /// Os 12 bits baixos do modo: rwxrwxrwx + setuid, setgid e sticky.
+    pub permissoes: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub modificado: u64,
 }
 
-pub struct DirEntry {
-    pub name: String,
-    pub ino: u64,
-    /// Tipo no formato de `getdents64` (DT_REG, DT_DIR...).
-    pub dtype: u8,
-}
-
-pub const DT_FIFO: u8 = 1;
-pub const DT_CHR: u8 = 2;
-pub const DT_DIR: u8 = 4;
-pub const DT_REG: u8 = 8;
-pub const DT_LNK: u8 = 10;
-
-pub const S_IFIFO: u32 = 0o010000;
-pub const S_IFCHR: u32 = 0o020000;
-pub const S_IFDIR: u32 = 0o040000;
-pub const S_IFREG: u32 = 0o100000;
-pub const S_IFLNK: u32 = 0o120000;
-
-impl Kind {
-    pub fn dtype(self) -> u8 {
-        match self {
-            Kind::File => DT_REG,
-            Kind::Directory => DT_DIR,
-            Kind::Symlink => DT_LNK,
-            Kind::Device(_) => DT_CHR,
-            Kind::Special => 0,
-        }
-    }
-
-    pub fn type_bits(self) -> u32 {
-        match self {
-            Kind::File => S_IFREG,
-            Kind::Directory => S_IFDIR,
-            Kind::Symlink => S_IFLNK,
-            Kind::Device(_) => S_IFCHR,
-            Kind::Special => S_IFIFO,
-        }
+impl Meta {
+    pub fn de_root(permissoes: u32) -> Self {
+        Meta { permissoes, uid: 0, gid: 0, modificado: rtc::agora() }
     }
 }
 
-/// Um arquivo, diretório, link ou dispositivo de algum sistema de arquivos.
-/// As operações que não fazem sentido para o tipo do nó têm um padrão que
-/// devolve o erro adequado.
-pub trait Inode: Send + Sync {
-    fn ino(&self) -> u64;
-    /// Identifica o sistema de arquivos (o `st_dev` do `stat`).
-    fn dev(&self) -> u64;
-    fn kind(&self) -> Kind;
-    /// `st_mode` completo: tipo (S_IFREG...) e permissões.
-    fn mode(&self) -> u32;
-    fn size(&self) -> u64;
-    fn nlink(&self) -> u64;
-    /// Última modificação, em segundos desde 1970.
-    fn mtime(&self) -> u64 {
-        0
-    }
-    fn set_mtime(&self, _seconds: u64) -> Result<(), Errno> {
-        Ok(())
-    }
-    fn rdev(&self) -> u64 {
-        0
-    }
-    fn uid(&self) -> u32 {
-        0
-    }
-    fn gid(&self) -> u32 {
-        0
-    }
-    /// `chmod`: troca os 12 bits de permissão.
-    fn set_permissions(&self, _permissions: u32) -> Result<(), Errno> {
-        Err(EPERM)
-    }
-    /// `chown`: `None` mantém o valor atual.
-    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), Errno> {
-        Err(EPERM)
-    }
+pub const SETUID: u32 = 0o4000;
+pub const SETGID: u32 = 0o2000;
+pub const STICKY: u32 = 0o1000;
 
-    // Arquivos regulares.
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, Errno> {
-        Err(if self.kind() == Kind::Directory { EISDIR } else { EINVAL })
-    }
-    fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize, Errno> {
-        Err(if self.kind() == Kind::Directory { EISDIR } else { EINVAL })
-    }
-    fn truncate(&self, _size: u64) -> Result<(), Errno> {
-        Err(if self.kind() == Kind::Directory { EISDIR } else { EINVAL })
-    }
+pub const LER: u32 = 4;
+pub const ESCREVER: u32 = 2;
+pub const EXECUTAR: u32 = 1;
 
-    // Diretórios. `name` nunca é "." nem "..": o VFS cuida deles.
-    fn lookup(&self, _name: &str) -> Result<NodeRef, Errno> {
-        Err(ENOTDIR)
-    }
-    /// As entradas, sem "." e "..".
-    fn entries(&self) -> Result<Vec<DirEntry>, Errno> {
-        Err(ENOTDIR)
-    }
-    fn create(&self, _name: &str, _node: NewNode, _permissions: u32) -> Result<NodeRef, Errno> {
-        Err(ENOTDIR)
-    }
-    /// Nova entrada `name` para o nó `target` (link físico).
-    fn link(&self, _name: &str, _target: &NodeRef) -> Result<(), Errno> {
-        Err(ENOTDIR)
-    }
-    /// Remove um arquivo (`directory = false`) ou um diretório vazio.
-    fn unlink(&self, _name: &str, _directory: bool) -> Result<(), Errno> {
-        Err(ENOTDIR)
-    }
-    /// Move a entrada `name` para `new_name` em `new_dir`, que é do mesmo
-    /// sistema de arquivos e ainda não tem essa entrada.
-    fn rename(&self, _name: &str, _new_dir: &NodeRef, _new_name: &str) -> Result<(), Errno> {
-        Err(ENOTDIR)
-    }
-
-    fn readlink(&self) -> Result<String, Errno> {
-        Err(EINVAL)
-    }
-
-    /// Chamado ao desligar, na raiz de cada sistema montado.
-    fn unmount(&self) {}
-
-    /// Para um sistema de arquivos achar o tipo concreto de outro nó seu.
-    fn as_any(&self) -> &dyn Any;
+/// Quem está pedindo: o uid e o gid *efetivos* do processo.
+#[derive(Clone, Copy)]
+pub struct Cred {
+    pub uid: u32,
+    pub gid: u32,
 }
 
-impl dyn Inode {
-    pub fn is_dir(&self) -> bool {
-        self.kind() == Kind::Directory
+/// A regra de permissões do Unix. `acesso` combina LER, ESCREVER e EXECUTAR.
+pub fn permitido(meta: &Meta, cred: Cred, acesso: u32, diretorio: bool) -> bool {
+    if cred.uid == 0 {
+        return acesso & EXECUTAR == 0 || diretorio || meta.permissoes & 0o111 != 0;
     }
-
-    pub fn same_as(&self, other: &NodeRef) -> bool {
-        self.dev() == other.dev() && self.ino() == other.ino()
-    }
-}
-
-// --- Montagens ---------------------------------------------------------------
-
-struct Mount {
-    path: String,
-    root: NodeRef,
-    fstype: &'static str,
-    source: String,
-}
-
-static MOUNTS: SpinLock<Vec<Mount>> = SpinLock::new(Vec::new());
-
-/// Monta `root` em `path` (absoluto e normalizado).
-pub fn mount(path: &str, root: NodeRef, fstype: &'static str, source: &str) {
-    let mut mounts = MOUNTS.lock();
-    mounts.retain(|m| m.path != path);
-    mounts.push(Mount { path: path.to_string(), root, fstype, source: source.to_string() });
-}
-
-fn mounted_at(path: &str) -> Option<NodeRef> {
-    MOUNTS.lock().iter().find(|m| m.path == path).map(|m| m.root.clone())
-}
-
-/// (origem, ponto de montagem, tipo) de cada montagem.
-pub fn mounts() -> Vec<(String, String, &'static str)> {
-    MOUNTS.lock().iter().map(|m| (m.source.clone(), m.path.clone(), m.fstype)).collect()
-}
-
-/// Avisa cada sistema montado de que o sistema vai desligar.
-pub fn unmount_all() {
-    let roots: Vec<NodeRef> = MOUNTS.lock().iter().map(|m| m.root.clone()).collect();
-    for root in roots {
-        root.unmount();
-    }
-}
-
-pub fn root() -> NodeRef {
-    mounted_at("/").expect("nada montado na raiz")
-}
-
-// --- Caminhos ------------------------------------------------------------------
-
-/// Um caminho resolvido: o nó e o caminho canônico (absoluto, sem `.`, `..`
-/// nem links simbólicos).
-pub struct Resolved {
-    pub node: NodeRef,
-    pub path: String,
-}
-
-fn components(path: &str) -> impl DoubleEndedIterator<Item = &str> {
-    path.split('/').filter(|c| !c.is_empty())
-}
-
-fn join(stack: &[String]) -> String {
-    if stack.is_empty() {
-        return String::from("/");
-    }
-    stack.iter().fold(String::new(), |path, name| path + "/" + name)
-}
-
-/// O nó de um caminho canônico (já sem links nem `..`).
-fn node_at(stack: &[String]) -> Result<NodeRef, Errno> {
-    let mut node = root();
-    for depth in 1..=stack.len() {
-        node = match mounted_at(&join(&stack[..depth])) {
-            Some(mounted) => mounted,
-            None => node.lookup(&stack[depth - 1])?,
-        };
-    }
-    Ok(node)
-}
-
-/// Resolve `path` a partir do diretório `cwd` (canônico). Links simbólicos
-/// no meio do caminho são sempre seguidos; o do fim, só com `follow`.
-pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<Resolved, Errno> {
-    if path.is_empty() {
-        return Err(ENOENT);
-    }
-    let mut stack: Vec<String> =
-        if path.starts_with('/') { Vec::new() } else { components(cwd).map(String::from).collect() };
-    let mut node = node_at(&stack)?;
-    // Componentes a visitar, em ordem inversa (o próximo fica no fim).
-    let mut todo: Vec<String> = components(path).rev().map(String::from).collect();
-    let mut links = 0;
-    while let Some(name) = todo.pop() {
-        match name.as_str() {
-            "." => {}
-            ".." => {
-                stack.pop();
-                node = node_at(&stack)?;
-            }
-            _ => {
-                if !node.is_dir() {
-                    return Err(ENOTDIR);
-                }
-                if name.len() > MAX_NAME {
-                    return Err(ENAMETOOLONG);
-                }
-                stack.push(name);
-                let child = match mounted_at(&join(&stack)) {
-                    Some(mounted) => mounted,
-                    None => node.lookup(stack.last().unwrap())?,
-                };
-                if child.kind() == Kind::Symlink && (follow || !todo.is_empty()) {
-                    links += 1;
-                    if links > MAX_SYMLINKS {
-                        return Err(ELOOP);
-                    }
-                    stack.pop();
-                    let target = child.readlink()?;
-                    if target.starts_with('/') {
-                        stack.clear();
-                        node = root();
-                    }
-                    todo.extend(components(&target).rev().map(String::from));
-                    continue;
-                }
-                node = child;
-            }
-        }
-    }
-    Ok(Resolved { node, path: join(&stack) })
-}
-
-pub fn resolve(cwd: &str, path: &str) -> Result<NodeRef, Errno> {
-    lookup(cwd, path, true).map(|r| r.node)
-}
-
-/// Resolve o diretório que contém `path` e devolve (diretório, último nome).
-pub fn lookup_parent(cwd: &str, path: &str) -> Result<(Resolved, String), Errno> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err(if path.is_empty() { ENOENT } else { EPERM }); // a raiz não tem pai
-    }
-    let (dir, name) = match trimmed.rsplit_once('/') {
-        Some(("", name)) => ("/", name),
-        Some((dir, name)) => (dir, name),
-        None => (".", trimmed),
+    let trio = if cred.uid == meta.uid {
+        meta.permissoes >> 6
+    } else if cred.gid == meta.gid {
+        meta.permissoes >> 3
+    } else {
+        meta.permissoes
     };
-    if name == "." || name == ".." {
-        return Err(EINVAL);
+    trio & acesso == acesso
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tipo {
+    Arquivo,
+    Diretorio,
+    Dispositivo(Dispositivo),
+}
+
+/// Qualquer arquivo ou diretório, esteja na memória ou no disco.
+#[derive(Clone)]
+pub enum Vnode {
+    Memoria(Arc<No>),
+    Disco(Arc<Ext2>, u32),
+}
+
+static PROXIMO_ID: AtomicU64 = AtomicU64::new(1);
+static RAIZ: Mutex<Option<Arc<No>>> = Mutex::new(None);
+static DISCO: Mutex<Option<Arc<Ext2>>> = Mutex::new(None);
+
+impl No {
+    fn novo(conteudo: Conteudo, meta: Meta) -> Arc<No> {
+        Arc::new(No {
+            id: PROXIMO_ID.fetch_add(1, Ordering::Relaxed),
+            conteudo: Mutex::new(conteudo),
+            meta: Mutex::new(meta),
+        })
     }
-    if name.len() > MAX_NAME {
+}
+
+fn meta_padrao(conteudo: &Conteudo) -> Meta {
+    Meta::de_root(match conteudo {
+        Conteudo::Arquivo(_) => 0o644,
+        Conteudo::Dispositivo(_) => 0o666,
+        _ => 0o755,
+    })
+}
+
+fn diretorio_vazio() -> Conteudo {
+    Conteudo::Diretorio(BTreeMap::new())
+}
+
+/// Um nó em memória, ou a raiz do disco se ele for um ponto de montagem.
+fn entrar(no: Arc<No>) -> Vnode {
+    if let Conteudo::Montagem(fs) = &*no.conteudo.lock() {
+        return Vnode::Disco(fs.clone(), ext2::RAIZ);
+    }
+    Vnode::Memoria(no)
+}
+
+impl Vnode {
+    pub fn tipo(&self) -> Result<Tipo, i64> {
+        match self {
+            Vnode::Memoria(no) => Ok(match &*no.conteudo.lock() {
+                Conteudo::Arquivo(_) => Tipo::Arquivo,
+                Conteudo::Diretorio(_) | Conteudo::Montagem(_) => Tipo::Diretorio,
+                Conteudo::Dispositivo(d) => Tipo::Dispositivo(*d),
+            }),
+            Vnode::Disco(fs, inode) => {
+                Ok(if fs.info(*inode)?.diretorio { Tipo::Diretorio } else { Tipo::Arquivo })
+            }
+        }
+    }
+
+    /// Número único do arquivo (o "inode" que o `stat` mostra).
+    pub fn id(&self) -> u64 {
+        match self {
+            Vnode::Memoria(no) => no.id,
+            Vnode::Disco(_, inode) => 0x1_0000_0000 + *inode as u64,
+        }
+    }
+
+    /// Bytes, num arquivo; quantidade de entradas, num diretório em memória.
+    pub fn tamanho(&self) -> Result<u64, i64> {
+        match self {
+            Vnode::Memoria(no) => Ok(match &*no.conteudo.lock() {
+                Conteudo::Arquivo(dados) => dados.len() as u64,
+                Conteudo::Diretorio(filhos) => filhos.len() as u64,
+                _ => 0,
+            }),
+            Vnode::Disco(fs, inode) => fs.info(*inode).map(|i| i.tamanho),
+        }
+    }
+
+    pub fn meta(&self) -> Result<Meta, i64> {
+        match self {
+            Vnode::Memoria(no) => Ok(*no.meta.lock()),
+            Vnode::Disco(fs, inode) => {
+                let i = fs.info(*inode)?;
+                Ok(Meta { permissoes: i.permissoes, uid: i.uid, gid: i.gid, modificado: i.modificado })
+            }
+        }
+    }
+
+    /// `chmod` e `chown`.
+    pub fn alterar(&self, permissoes: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
+        match self {
+            Vnode::Memoria(no) => {
+                let mut m = no.meta.lock();
+                if let Some(p) = permissoes {
+                    m.permissoes = p & 0o7777;
+                }
+                m.uid = uid.unwrap_or(m.uid);
+                m.gid = gid.unwrap_or(m.gid);
+                Ok(())
+            }
+            Vnode::Disco(fs, inode) => fs.alterar(*inode, permissoes, uid, gid),
+        }
+    }
+
+    /// O processo pode fazer `acesso` (LER/ESCREVER/EXECUTAR) neste arquivo?
+    pub fn permite(&self, cred: Cred, acesso: u32) -> Result<(), i64> {
+        let diretorio = self.tipo()? == Tipo::Diretorio;
+        if permitido(&self.meta()?, cred, acesso, diretorio) { Ok(()) } else { Err(EACCES) }
+    }
+
+    fn filho(&self, nome: &str) -> Result<Vnode, i64> {
+        match self {
+            Vnode::Memoria(no) => {
+                let filho = match &*no.conteudo.lock() {
+                    Conteudo::Diretorio(filhos) => filhos.get(nome).cloned().ok_or(ENOENT)?,
+                    _ => return Err(ENOTDIR),
+                };
+                Ok(entrar(filho))
+            }
+            Vnode::Disco(fs, inode) => Ok(Vnode::Disco(fs.clone(), fs.buscar(*inode, nome)?)),
+        }
+    }
+
+    pub fn ler(&self, posicao: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        match self {
+            Vnode::Memoria(no) => match &*no.conteudo.lock() {
+                Conteudo::Arquivo(dados) => {
+                    let inicio = (posicao as usize).min(dados.len());
+                    let n = buf.len().min(dados.len() - inicio);
+                    buf[..n].copy_from_slice(&dados[inicio..inicio + n]);
+                    Ok(n)
+                }
+                _ => Err(EISDIR),
+            },
+            Vnode::Disco(fs, inode) => fs.ler(*inode, posicao, buf),
+        }
+    }
+
+    pub fn escrever(&self, posicao: u64, dados: &[u8]) -> Result<usize, i64> {
+        match self {
+            Vnode::Memoria(no) => match &mut *no.conteudo.lock() {
+                Conteudo::Arquivo(conteudo) => {
+                    no.meta.lock().modificado = rtc::agora();
+                    let inicio = posicao as usize;
+                    let fim = inicio + dados.len();
+                    if fim > conteudo.len() {
+                        conteudo.resize(fim, 0);
+                    }
+                    conteudo[inicio..fim].copy_from_slice(dados);
+                    Ok(dados.len())
+                }
+                _ => Err(EISDIR),
+            },
+            Vnode::Disco(fs, inode) => fs.escrever(*inode, posicao, dados),
+        }
+    }
+
+    /// Esvazia o arquivo (`O_TRUNC`).
+    pub fn truncar(&self) -> Result<(), i64> {
+        match self {
+            Vnode::Memoria(no) => {
+                if let Conteudo::Arquivo(dados) = &mut *no.conteudo.lock() {
+                    dados.clear();
+                }
+                Ok(())
+            }
+            Vnode::Disco(fs, inode) => fs.truncar(*inode),
+        }
+    }
+
+    /// Lê o arquivo inteiro (para o `execve`).
+    pub fn ler_tudo(&self) -> Result<Vec<u8>, i64> {
+        let mut dados = alloc::vec![0u8; self.tamanho()? as usize];
+        let n = self.ler(0, &mut dados)?;
+        dados.truncate(n);
+        Ok(dados)
+    }
+
+    /// (nome, id, tipo) de cada entrada de um diretório.
+    pub fn listar(&self) -> Result<Vec<(String, u64, Tipo)>, i64> {
+        match self {
+            Vnode::Memoria(no) => {
+                let filhos: Vec<(String, Arc<No>)> = match &*no.conteudo.lock() {
+                    Conteudo::Diretorio(f) => f.iter().map(|(n, no)| (n.clone(), no.clone())).collect(),
+                    _ => return Err(ENOTDIR),
+                };
+                filhos
+                    .into_iter()
+                    .map(|(nome, no)| {
+                        let v = entrar(no);
+                        Ok((nome, v.id(), v.tipo()?))
+                    })
+                    .collect()
+            }
+            Vnode::Disco(fs, inode) => Ok(fs
+                .listar(*inode)?
+                .into_iter()
+                .map(|(nome, i, dir)| (nome, 0x1_0000_0000 + i as u64, if dir { Tipo::Diretorio } else { Tipo::Arquivo }))
+                .collect()),
+        }
+    }
+
+    fn mesmo_sistema(&self, outro: &Vnode) -> bool {
+        match (self, outro) {
+            (Vnode::Memoria(_), Vnode::Memoria(_)) => true,
+            (Vnode::Disco(a, _), Vnode::Disco(b, _)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Operações por caminho
+// -----------------------------------------------------------------------------
+
+pub fn init() {
+    *RAIZ.lock() = Some(No::novo(diretorio_vazio(), Meta::de_root(0o755)));
+    for caminho in ["/dev", "/home", "/etc", "/bin"] {
+        let _ = criar_na_memoria(caminho, diretorio_vazio(), None);
+    }
+    // Todo mundo escreve no /tmp, mas cada um só apaga o que é seu (sticky).
+    let _ = criar_na_memoria("/tmp", diretorio_vazio(), Some(Meta::de_root(0o1777)));
+    let _ = criar_na_memoria("/dev/tty", Conteudo::Dispositivo(Dispositivo::Terminal), None);
+    let _ = criar_na_memoria("/dev/null", Conteudo::Dispositivo(Dispositivo::Nulo), None);
+    let _ = criar_na_memoria("/dev/zero", Conteudo::Dispositivo(Dispositivo::Zero), None);
+}
+
+/// Pendura um disco ext2 num diretório novo (como o `mount` do Unix).
+pub fn montar(caminho: &str, fs: Arc<Ext2>) -> Result<(), i64> {
+    *DISCO.lock() = Some(fs.clone());
+    criar_na_memoria(caminho, Conteudo::Montagem(fs), None).map(|_| ())
+}
+
+/// O disco montado, se houver.
+pub fn disco() -> Option<Arc<Ext2>> {
+    DISCO.lock().clone()
+}
+
+/// Como `buscar`, mas exigindo permissão de atravessar (`x`) cada diretório do caminho.
+pub fn buscar_como(caminho: &str, cred: Cred) -> Result<Vnode, i64> {
+    let mut atual = raiz();
+    for parte in caminho.split('/').filter(|p| !p.is_empty()) {
+        atual.permite(cred, EXECUTAR)?;
+        atual = atual.filho(parte)?;
+    }
+    Ok(atual)
+}
+
+fn raiz() -> Vnode {
+    Vnode::Memoria(RAIZ.lock().clone().expect("o VFS ainda não foi iniciado"))
+}
+
+/// Junta `caminho` ao diretório `base` e resolve `.` e `..`, sem consultar o disco.
+pub fn normalizar(base: &str, caminho: &str) -> String {
+    let mut partes: Vec<&str> = Vec::new();
+    if !caminho.starts_with('/') {
+        partes.extend(base.split('/').filter(|p| !p.is_empty()));
+    }
+    for parte in caminho.split('/') {
+        match parte {
+            "" | "." => {}
+            ".." => {
+                partes.pop();
+            }
+            nome => partes.push(nome),
+        }
+    }
+    let mut resultado = String::new();
+    for parte in &partes {
+        resultado.push('/');
+        resultado.push_str(parte);
+    }
+    if resultado.is_empty() {
+        resultado.push('/');
+    }
+    resultado
+}
+
+pub fn buscar(caminho: &str) -> Result<Vnode, i64> {
+    let mut atual = raiz();
+    for parte in caminho.split('/').filter(|p| !p.is_empty()) {
+        atual = atual.filho(parte)?;
+    }
+    Ok(atual)
+}
+
+/// "/a/b/c" → ("/a/b", "c")
+pub fn separar(caminho: &str) -> Result<(&str, &str), i64> {
+    let (pai, nome) = caminho.rsplit_once('/').ok_or(EINVAL)?;
+    if nome.is_empty() {
+        return Err(EBUSY); // a raiz
+    }
+    if nome.len() > 255 {
         return Err(ENAMETOOLONG);
     }
-    let parent = lookup(cwd, dir, true)?;
-    if !parent.node.is_dir() {
-        return Err(ENOTDIR);
-    }
-    Ok((parent, name.to_string()))
+    Ok((if pai.is_empty() { "/" } else { pai }, nome))
 }
 
-fn child_path(parent: &Resolved, name: &str) -> String {
-    if parent.path == "/" { alloc::format!("/{name}") } else { alloc::format!("{}/{name}", parent.path) }
-}
-
-fn is_mount_point(path: &str) -> bool {
-    MOUNTS.lock().iter().any(|m| m.path == path)
-}
-
-// --- Operações sobre caminhos ----------------------------------------------------
-
-/// Abre ou cria (com `O_CREAT`) o arquivo regular `path`.
-pub fn create_file(cwd: &str, path: &str, exclusive: bool, permissions: u32) -> Result<Resolved, Errno> {
-    match lookup(cwd, path, true) {
-        Ok(_) if exclusive => Err(EEXIST),
-        Ok(existing) => Ok(existing),
-        Err(ENOENT) => {
-            let (parent, name) = lookup_parent(cwd, path)?;
-            let node = parent.node.create(&name, NewNode::File, permissions)?;
-            Ok(Resolved { node, path: child_path(&parent, &name) })
-        }
-        Err(errno) => Err(errno),
-    }
-}
-
-pub fn mkdir(cwd: &str, path: &str, permissions: u32) -> Result<(), Errno> {
-    if !path.is_empty() && path.trim_end_matches('/').is_empty() {
-        return Err(EEXIST); // a raiz sempre existe (o `mkdir -p` conta com isso)
-    }
-    let (parent, name) = lookup_parent(cwd, path)?;
-    if parent.node.lookup(&name).is_ok() || is_mount_point(&child_path(&parent, &name)) {
+/// Cria um nó diretamente na árvore em memória (usado na partida e pelo initrd).
+pub fn criar_na_memoria(caminho: &str, conteudo: Conteudo, meta: Option<Meta>) -> Result<(), i64> {
+    let (pai, nome) = separar(caminho)?;
+    let Vnode::Memoria(pai) = buscar(pai)? else { return Err(EXDEV) };
+    let mut c = pai.conteudo.lock();
+    let Conteudo::Diretorio(filhos) = &mut *c else { return Err(ENOTDIR) };
+    if filhos.contains_key(nome) {
         return Err(EEXIST);
     }
-    parent.node.create(&name, NewNode::Directory, permissions).map(|_| ())
+    let meta = meta.unwrap_or_else(|| meta_padrao(&conteudo));
+    filhos.insert(nome.to_string(), No::novo(conteudo, meta));
+    Ok(())
 }
 
-pub fn symlink(target: &str, cwd: &str, path: &str) -> Result<(), Errno> {
-    let (parent, name) = lookup_parent(cwd, path)?;
-    if parent.node.lookup(&name).is_ok() {
-        return Err(EEXIST);
+/// Como `mkdir -p`, só na memória.
+pub fn criar_diretorios(caminho: &str) {
+    let mut atual = String::new();
+    for parte in caminho.split('/').filter(|p| !p.is_empty()) {
+        atual.push('/');
+        atual.push_str(parte);
+        let _ = criar_na_memoria(&atual, diretorio_vazio(), None);
     }
-    parent.node.create(&name, NewNode::Symlink(target), 0o777).map(|_| ())
 }
 
-pub fn readlink(cwd: &str, path: &str) -> Result<String, Errno> {
-    lookup(cwd, path, false)?.node.readlink()
-}
-
-/// Remove um arquivo (`directory = false`) ou um diretório vazio.
-pub fn remove(cwd: &str, path: &str, directory: bool) -> Result<(), Errno> {
-    let (parent, name) = lookup_parent(cwd, path)?;
-    if is_mount_point(&child_path(&parent, &name)) {
-        return Err(EBUSY);
-    }
-    parent.node.unlink(&name, directory)
-}
-
-/// `link`: `new` passa a ser outro nome do arquivo `old`.
-pub fn link(cwd: &str, old: &str, new: &str) -> Result<(), Errno> {
-    let target = lookup(cwd, old, false)?.node;
-    if target.is_dir() {
-        return Err(EPERM);
-    }
-    let (parent, name) = lookup_parent(cwd, new)?;
-    if parent.node.lookup(&name).is_ok() {
-        return Err(EEXIST);
-    }
-    if parent.node.dev() != target.dev() {
-        return Err(EXDEV);
-    }
-    parent.node.link(&name, &target)
-}
-
-/// `rename`: move `old` para `new`, substituindo o que houver lá (um
-/// arquivo, ou um diretório vazio se `old` também for um diretório).
-pub fn rename(cwd: &str, old: &str, new: &str) -> Result<(), Errno> {
-    let (old_parent, old_name) = lookup_parent(cwd, old)?;
-    let (new_parent, new_name) = lookup_parent(cwd, new)?;
-    let source = old_parent.node.lookup(&old_name)?;
-    let old_path = child_path(&old_parent, &old_name);
-    let new_path = child_path(&new_parent, &new_name);
-    if is_mount_point(&old_path) || is_mount_point(&new_path) {
-        return Err(EBUSY);
-    }
-    if old_parent.node.dev() != new_parent.node.dev() {
-        return Err(EXDEV);
-    }
-    if source.is_dir() && new_path.starts_with(&(old_path.clone() + "/")) {
-        return Err(EINVAL); // um diretório não pode ir para dentro de si mesmo
-    }
-    if let Ok(existing) = new_parent.node.lookup(&new_name) {
-        if existing.same_as(&source) {
-            return Ok(());
+/// Cria um arquivo vazio ou um diretório, onde quer que o pai esteja.
+pub fn criar(caminho: &str, diretorio: bool, meta: Meta) -> Result<Vnode, i64> {
+    let (pai, nome) = separar(caminho)?;
+    match buscar(pai)? {
+        Vnode::Memoria(_) => {
+            let conteudo = if diretorio { diretorio_vazio() } else { Conteudo::Arquivo(Vec::new()) };
+            criar_na_memoria(caminho, conteudo, Some(meta))?;
+            buscar(caminho)
         }
-        match (source.is_dir(), existing.is_dir()) {
-            (true, false) => return Err(ENOTDIR),
-            (false, true) => return Err(EISDIR),
-            (directory, _) => new_parent.node.unlink(&new_name, directory)?,
+        Vnode::Disco(fs, dir) => {
+            let inode = fs.criar(dir, nome, diretorio, meta.permissoes, meta.uid, meta.gid)?;
+            Ok(Vnode::Disco(fs, inode))
         }
     }
-    old_parent.node.rename(&old_name, &new_parent.node, &new_name)
 }
 
-/// Lê um arquivo inteiro (usado pelo carregador de programas e pelo monitor).
-pub fn read_file(cwd: &str, path: &str) -> Result<Vec<u8>, Errno> {
-    let node = resolve(cwd, path)?;
-    match node.kind() {
-        Kind::Directory => return Err(EISDIR),
-        Kind::File => {}
-        _ => return Ok(Vec::new()),
-    }
-    let mut data = alloc::vec![0; node.size() as usize];
-    let mut done = 0;
-    while done < data.len() {
-        match node.read_at(done as u64, &mut data[done..])? {
-            0 => break,
-            n => done += n,
+/// Apaga um arquivo (`unlink`) ou um diretório vazio (`rmdir`).
+pub fn remover(caminho: &str, diretorio: bool) -> Result<(), i64> {
+    let (pai, nome) = separar(caminho)?;
+    match buscar(pai)? {
+        Vnode::Disco(fs, dir) => fs.remover(dir, nome, diretorio),
+        Vnode::Memoria(pai) => {
+            let mut c = pai.conteudo.lock();
+            let Conteudo::Diretorio(filhos) = &mut *c else { return Err(ENOTDIR) };
+            let problema = match (&*filhos.get(nome).ok_or(ENOENT)?.conteudo.lock(), diretorio) {
+                (Conteudo::Montagem(_), _) => Some(EBUSY),
+                (Conteudo::Diretorio(f), true) if !f.is_empty() => Some(ENOTEMPTY),
+                (Conteudo::Diretorio(_), true) => None,
+                (Conteudo::Diretorio(_), false) => Some(EISDIR),
+                (_, true) => Some(ENOTDIR),
+                (_, false) => None,
+            };
+            if let Some(erro) = problema {
+                return Err(erro);
+            }
+            filhos.remove(nome);
+            Ok(())
         }
     }
-    data.truncate(done);
-    Ok(data)
 }
 
-/// Cria ou substitui (ou acrescenta a) um arquivo (usado pelo monitor).
-pub fn write_file(cwd: &str, path: &str, data: &[u8], append: bool) -> Result<(), Errno> {
-    let node = create_file(cwd, path, false, 0o644)?.node;
-    if !append {
-        node.truncate(0)?;
+/// Move/renomeia dentro do mesmo sistema de arquivos. Um arquivo no destino é substituído.
+pub fn renomear(de: &str, para: &str) -> Result<(), i64> {
+    if para.starts_with(de) && para.as_bytes().get(de.len()) == Some(&b'/') {
+        return Err(EINVAL); // mover um diretório para dentro dele mesmo
     }
-    node.write_at(if append { node.size() } else { 0 }, data).map(|_| ())
+    let (pai_de, nome_de) = separar(de)?;
+    let (pai_para, nome_para) = separar(para)?;
+    let (pai_de, pai_para) = (buscar(pai_de)?, buscar(pai_para)?);
+    if !pai_de.mesmo_sistema(&pai_para) {
+        return Err(EXDEV); // entre memória e disco: o `mv` teria que copiar
+    }
+    match (pai_de, pai_para) {
+        (Vnode::Disco(fs, a), Vnode::Disco(_, b)) => fs.renomear(a, nome_de, b, nome_para),
+        (Vnode::Memoria(a), Vnode::Memoria(b)) => {
+            if let Ok(existente) = Vnode::Memoria(b.clone()).filho(nome_para) {
+                if existente.tipo()? == Tipo::Diretorio {
+                    return Err(EISDIR);
+                }
+            }
+            let no = {
+                let mut c = a.conteudo.lock();
+                let Conteudo::Diretorio(filhos) = &mut *c else { return Err(ENOTDIR) };
+                filhos.remove(nome_de).ok_or(ENOENT)?
+            };
+            match &mut *b.conteudo.lock() {
+                Conteudo::Diretorio(filhos) => {
+                    filhos.insert(nome_para.to_string(), no);
+                    Ok(())
+                }
+                _ => Err(ENOTDIR),
+            }
+        }
+        _ => Err(EXDEV),
+    }
 }

@@ -1,0 +1,14 @@
+FerrugemOS: um sistema operacional tipo Unix escrito em Rust.
+
+Tudo o que você vê aqui está num sistema de arquivos em memória,
+carregado do initrd. Você pode criar e apagar arquivos à vontade,
+mas tudo some quando a máquina desliga.
+
+Algumas ideias:
+  echo "olá, mundo" > /tmp/oi.txt
+  cat /tmp/oi.txt
+  ls -l /bin | grep sh
+  sleep 30 &
+  ps
+  kill <pid>
+  sh /home/exemplo.sh

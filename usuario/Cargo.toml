@@ -1,0 +1,19 @@
+# Programas de usuário do FerrugemOS.
+#
+# `ulib` (src/lib.rs) faz o papel da libc: chamadas de sistema, malloc,
+# print!, argumentos. Cada arquivo em src/bin/ vira um executável em /bin.
+[package]
+name = "usuario"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ulib"
+path = "src/lib.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

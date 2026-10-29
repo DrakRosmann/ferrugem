@@ -1,1098 +1,808 @@
-//! ext2: o sistema de arquivos clássico do Linux, lido e gravado no disco.
+//! ext2: o sistema de arquivos clássico do Linux, com leitura e escrita.
 //!
-//! O disco é dividido em blocos (1, 2 ou 4 KiB) e os blocos em grupos. O
-//! superbloco (no byte 1024) descreve o todo; cada grupo tem um bitmap de
-//! blocos, um bitmap de inodes e uma tabela de inodes. Um inode guarda os
-//! metadados de um arquivo e onde estão os dados: 12 ponteiros diretos para
-//! blocos, um indireto (um bloco cheio de ponteiros), um duplamente e um
-//! triplamente indireto. Um diretório é um arquivo com uma lista de
-//! entradas (inode, tamanho do registro, nome).
+//! O disco é dividido em blocos (aqui, de 1 KiB) e os blocos em *grupos*.
+//! Cada grupo tem um bitmap de blocos livres, um bitmap de inodes livres e
+//! uma tabela de inodes. Um **inode** descreve um arquivo: tipo, tamanho,
+//! número de links e onde estão os dados:
 //!
-//! Cada alteração vai para o disco na hora (write-through), na ordem que
-//! deixa o disco mais consistente se a energia cair no meio: o inode antes
-//! da entrada de diretório que aponta para ele. Imagens criadas com
-//! `mkfs.ext2` (veja scripts/disco.sh) podem ser montadas e verificadas
-//! com `e2fsck` no Linux.
+//! ```text
+//!   i_block[0..12]  12 blocos diretos
+//!   i_block[12]     um bloco cheio de números de blocos       (indireto)
+//!   i_block[13]     um bloco de blocos de números de blocos   (duplo indireto)
+//! ```
+//!
+//! Um **diretório** é um arquivo cujo conteúdo é uma lista de entradas
+//! `[inode | tamanho do registro | tamanho do nome | tipo | nome]`.
+//! O inode 2 é sempre a raiz.
+//!
+//! Como o formato é o mesmo do Linux, dá para criar o disco com `mkfs.ext2`,
+//! conferir com `e2fsck` e montar no Linux para ver o que o FerrugemOS gravou.
 
+use crate::ata;
+use crate::rtc;
+use crate::erro::*;
+use crate::spin::Mutex;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::any::Any;
 
-use crate::block::{BlockDevice, SECTOR_SIZE};
-use crate::rtc;
-use crate::sync::SpinLock;
-use crate::syscall::{EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EROFS, EXDEV, Errno};
-use crate::vfs::{DirEntry, Device, Inode, Kind, NewNode, NodeRef};
+pub const RAIZ: u32 = 2;
 
-const MAGIC: u16 = 0xEF53;
-const ROOT_INO: u32 = 2;
-const DIRECT_BLOCKS: u64 = 12;
-/// Blocos guardados no cache (o resto é relido do disco).
-const CACHE_BLOCKS: usize = 2048;
-/// Links simbólicos curtos ficam dentro do próprio inode ("fast symlinks").
-const FAST_SYMLINK_MAX: usize = 60;
+const MODO_DIRETORIO: u16 = 0x4000;
+const MODO_ARQUIVO: u16 = 0x8000;
+const TIPO_ENTRADA_ARQUIVO: u8 = 1;
+const TIPO_ENTRADA_DIRETORIO: u8 = 2;
+const MAX_CACHE: usize = 512;
 
-// Tipos no campo de modo do inode.
-const S_IFMT: u16 = 0xF000;
-const S_IFREG: u16 = 0x8000;
-const S_IFDIR: u16 = 0x4000;
-const S_IFLNK: u16 = 0xA000;
-const S_IFCHR: u16 = 0x2000;
-
-// Recursos (features). Sem os obrigatórios que não conhecemos, não dá para
-// montar; sem os de "só leitura", dá para ler mas não para gravar.
-const INCOMPAT_FILETYPE: u32 = 0x2;
-const RO_COMPAT_SUPPORTED: u32 = 0x1 | 0x2; // sparse_super, large_file
-/// Diretório com índice em árvore (dir_index). Não o mantemos: ao alterar
-/// um diretório indexado, a marca é tirada e o Linux volta à busca linear.
-const INDEX_FLAG: u32 = 0x1000;
-
-const STATE_CLEAN: u16 = 1;
-
-// --- Bytes em little-endian ------------------------------------------------------
-
-fn u16_at(data: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([data[offset], data[offset + 1]])
+fn rd16(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+fn rd32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+}
+fn wr16(b: &mut [u8], o: usize, v: u16) {
+    b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+}
+fn wr32(b: &mut [u8], o: usize, v: u32) {
+    b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-fn u32_at(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
-}
+/// Os 128 primeiros bytes de um inode (o resto, se houver, não usamos).
+#[derive(Clone)]
+struct Inode([u8; 128]);
 
-fn put_u16(data: &mut [u8], offset: usize, value: u16) {
-    data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(data: &mut [u8], offset: usize, value: u32) {
-    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-// --- Inode cru ---------------------------------------------------------------------
-
-/// Um inode como está no disco. Os campos que não usamos são preservados.
-struct RawInode(Vec<u8>);
-
-impl RawInode {
-    fn mode(&self) -> u16 {
-        u16_at(&self.0, 0)
+impl Inode {
+    fn modo(&self) -> u16 {
+        rd16(&self.0, 0)
     }
-    fn file_type(&self) -> u16 {
-        self.mode() & S_IFMT
+    fn eh_diretorio(&self) -> bool {
+        self.modo() & 0xF000 == MODO_DIRETORIO
     }
-    fn size(&self) -> u64 {
-        let high = if self.file_type() == S_IFREG { u32_at(&self.0, 108) as u64 } else { 0 };
-        u32_at(&self.0, 4) as u64 | high << 32
+    fn tamanho(&self) -> u64 {
+        rd32(&self.0, 4) as u64
     }
-    fn set_size(&mut self, size: u64) {
-        put_u32(&mut self.0, 4, size as u32);
-        if self.file_type() == S_IFREG {
-            put_u32(&mut self.0, 108, (size >> 32) as u32);
-        }
-    }
-    fn mtime(&self) -> u32 {
-        u32_at(&self.0, 16)
-    }
-    /// Dono: 16 bits baixos no começo do inode, altos na área "osd2".
-    fn uid(&self) -> u32 {
-        u16_at(&self.0, 2) as u32 | (u16_at(&self.0, 120) as u32) << 16
-    }
-    fn gid(&self) -> u32 {
-        u16_at(&self.0, 24) as u32 | (u16_at(&self.0, 122) as u32) << 16
-    }
-    fn set_owner(&mut self, uid: u32, gid: u32) {
-        put_u16(&mut self.0, 2, uid as u16);
-        put_u16(&mut self.0, 120, (uid >> 16) as u16);
-        put_u16(&mut self.0, 24, gid as u16);
-        put_u16(&mut self.0, 122, (gid >> 16) as u16);
-    }
-    /// Marca uma alteração: muda mtime e ctime.
-    fn touch(&mut self) {
-        let now = rtc::now() as u32;
-        put_u32(&mut self.0, 12, now);
-        put_u32(&mut self.0, 16, now);
+    fn definir_tamanho(&mut self, t: u64) {
+        wr32(&mut self.0, 4, t as u32);
     }
     fn links(&self) -> u16 {
-        u16_at(&self.0, 26)
+        rd16(&self.0, 26)
     }
-    fn set_links(&mut self, links: u16) {
-        put_u16(&mut self.0, 26, links);
+    fn definir_links(&mut self, n: u16) {
+        wr16(&mut self.0, 26, n);
     }
-    /// Espaço ocupado, em setores de 512 bytes (inclui os blocos indiretos).
-    fn sectors(&self) -> u32 {
-        u32_at(&self.0, 28)
+    /// Em setores de 512 bytes, contando também os blocos de índice.
+    fn somar_setores(&mut self, n: i64) {
+        let atual = rd32(&self.0, 28) as i64;
+        wr32(&mut self.0, 28, (atual + n) as u32);
     }
-    fn add_sectors(&mut self, delta: i64) {
-        let sectors = (self.sectors() as i64 + delta) as u32;
-        put_u32(&mut self.0, 28, sectors);
+    /// Marca a hora de acesso, de mudança e de modificação.
+    fn tocar(&mut self) {
+        let agora = rtc::agora() as u32;
+        for deslocamento in [8, 12, 16] {
+            wr32(&mut self.0, deslocamento, agora);
+        }
     }
-    fn flags(&self) -> u32 {
-        u32_at(&self.0, 32)
+    fn modificado_em(&self) -> u64 {
+        rd32(&self.0, 16) as u64
     }
-    fn block(&self, index: usize) -> u32 {
-        u32_at(&self.0, 40 + index * 4)
+    fn info(&self) -> InfoInode {
+        InfoInode {
+            diretorio: self.eh_diretorio(),
+            tamanho: self.tamanho(),
+            modificado: self.modificado_em(),
+            permissoes: (self.modo() & 0o7777) as u32,
+            uid: rd16(&self.0, 2) as u32,
+            gid: rd16(&self.0, 24) as u32,
+        }
     }
-    fn set_block(&mut self, index: usize, block: u32) {
-        put_u32(&mut self.0, 40 + index * 4, block);
+    fn bloco(&self, i: usize) -> u32 {
+        rd32(&self.0, 40 + i * 4)
     }
-    /// Link simbólico com o destino guardado nos ponteiros de bloco.
-    fn is_fast_symlink(&self) -> bool {
-        let acl_sectors = if u32_at(&self.0, 104) != 0 { 1 } else { 0 };
-        self.file_type() == S_IFLNK && self.sectors() <= acl_sectors && self.size() < FAST_SYMLINK_MAX as u64
+    fn definir_bloco(&mut self, i: usize, b: u32) {
+        wr32(&mut self.0, 40 + i * 4, b);
     }
 }
 
-// --- O sistema de arquivos -----------------------------------------------------------
+/// O que o VFS precisa saber de um inode.
+pub struct InfoInode {
+    pub diretorio: bool,
+    pub tamanho: u64,
+    pub modificado: u64,
+    pub permissoes: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
 
-struct Fs {
-    disk: Arc<dyn BlockDevice>,
-    block_size: usize,
-    /// Ponteiros de bloco que cabem num bloco indireto.
-    per_block: u64,
-    superblock: Vec<u8>,
-    /// Descritores de grupo crus (32 bytes cada).
-    groups: Vec<[u8; 32]>,
-    blocks_per_group: u32,
-    inodes_per_group: u32,
-    inode_size: usize,
-    first_data_block: u32,
-    blocks_count: u32,
-    filetype: bool,
+struct Grupo {
+    mapa_blocos: u32,
+    mapa_inodes: u32,
+    tabela_inodes: u32,
+    blocos_livres: u16,
+    inodes_livres: u16,
+    diretorios: u16,
+    sujo: bool,
+}
+
+struct Estado {
+    tamanho_bloco: usize,
+    primeiro_bloco: u32,
+    blocos_por_grupo: u32,
+    inodes_por_grupo: u32,
+    tamanho_inode: usize,
+    total_blocos: u32,
+    superbloco: Vec<u8>,
+    superbloco_sujo: bool,
+    grupos: Vec<Grupo>,
     cache: BTreeMap<u32, Vec<u8>>,
 }
 
 pub struct Ext2 {
-    fs: SpinLock<Fs>,
-    dev: u64,
-    read_only: bool,
+    estado: Mutex<Estado>,
 }
 
-pub struct Ext2Node {
-    fs: Arc<Ext2>,
-    ino: u32,
+/// Uma entrada de diretório, com onde ela está (para poder alterá-la).
+struct Entrada {
+    inode: u32,
+    nome: String,
+    tipo: u8,
 }
 
-/// Informações para o monitor do kernel.
-pub struct Info {
-    pub label: String,
-    pub block_size: usize,
-    pub blocks: u64,
-    pub free_blocks: u64,
-    pub inodes: u64,
-    pub free_inodes: u64,
-    pub read_only: bool,
-}
-
-impl Fs {
-    // --- Blocos -----------------------------------------------------------------
-
-    fn block(&mut self, block: u32) -> Result<&[u8], Errno> {
-        if block == 0 || block >= self.blocks_count {
-            return Err(EIO);
+impl Ext2 {
+    /// Lê o superbloco e a tabela de grupos do disco ATA.
+    pub fn montar() -> Result<Arc<Ext2>, &'static str> {
+        let mut superbloco = vec![0u8; 1024];
+        ata::ler(2, &mut superbloco).map_err(|_| "erro lendo o superbloco")?;
+        if rd16(&superbloco, 56) != 0xEF53 {
+            return Err("o disco não tem um sistema ext2");
         }
-        if !self.cache.contains_key(&block) {
-            let mut data = vec![0; self.block_size];
-            self.disk.read(block as u64 * (self.block_size / SECTOR_SIZE) as u64, &mut data)?;
-            if self.cache.len() >= CACHE_BLOCKS {
-                self.cache.pop_first();
-            }
-            self.cache.insert(block, data);
+        // Só aceitamos recursos que sabemos gravar sem estragar nada.
+        let incompativeis = rd32(&superbloco, 96);
+        let so_leitura = rd32(&superbloco, 100);
+        if incompativeis & !0x2 != 0 || so_leitura & !0x3 != 0 {
+            return Err("o ext2 usa recursos que não suportamos (crie com `make disco`)");
         }
-        Ok(&self.cache[&block])
+        let revisao = rd32(&superbloco, 76);
+        let mut e = Estado {
+            tamanho_bloco: 1024 << rd32(&superbloco, 24),
+            primeiro_bloco: rd32(&superbloco, 20),
+            blocos_por_grupo: rd32(&superbloco, 32),
+            inodes_por_grupo: rd32(&superbloco, 40),
+            tamanho_inode: if revisao >= 1 { rd16(&superbloco, 88) as usize } else { 128 },
+            total_blocos: rd32(&superbloco, 4),
+            superbloco,
+            superbloco_sujo: false,
+            grupos: Vec::new(),
+            cache: BTreeMap::new(),
+        };
+        let quantos = (e.total_blocos - e.primeiro_bloco).div_ceil(e.blocos_por_grupo);
+        for g in 0..quantos as usize {
+            let (bloco, deslocamento) = e.posicao_grupo(g);
+            let dados = e.ler_bloco(bloco).map_err(|_| "erro lendo a tabela de grupos")?;
+            let d = &dados[deslocamento..deslocamento + 32];
+            e.grupos.push(Grupo {
+                mapa_blocos: rd32(d, 0),
+                mapa_inodes: rd32(d, 4),
+                tabela_inodes: rd32(d, 8),
+                blocos_livres: rd16(d, 12),
+                inodes_livres: rd16(d, 14),
+                diretorios: rd16(d, 16),
+                sujo: false,
+            });
+        }
+        Ok(Arc::new(Ext2 { estado: Mutex::new(e) }))
     }
 
-    fn write_block(&mut self, block: u32, data: &[u8]) -> Result<(), Errno> {
-        if block == 0 || block >= self.blocks_count {
-            return Err(EIO);
+    /// Roda uma operação e grava no disco os metadados que ela mudou.
+    fn operar<T>(&self, f: impl FnOnce(&mut Estado) -> Result<T, i64>) -> Result<T, i64> {
+        let mut e = self.estado.lock();
+        let resultado = f(&mut e);
+        e.sincronizar()?;
+        resultado
+    }
+
+    pub fn buscar(&self, dir: u32, nome: &str) -> Result<u32, i64> {
+        self.operar(|e| e.buscar(dir, nome))
+    }
+
+    pub fn info(&self, inode: u32) -> Result<InfoInode, i64> {
+        self.operar(|e| e.ler_inode(inode).map(|i| i.info()))
+    }
+
+    /// `chmod`/`chown`: troca as permissões e/ou o dono.
+    pub fn alterar(&self, inode: u32, permissoes: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
+        self.operar(|e| {
+            let mut i = e.ler_inode(inode)?;
+            if let Some(p) = permissoes {
+                let modo = (i.modo() & 0xF000) | (p & 0o7777) as u16;
+                wr16(&mut i.0, 0, modo);
+            }
+            if let Some(u) = uid {
+                wr16(&mut i.0, 2, u as u16);
+            }
+            if let Some(g) = gid {
+                wr16(&mut i.0, 24, g as u16);
+            }
+            wr32(&mut i.0, 12, rtc::agora() as u32); // ctime: o inode mudou
+            e.escrever_inode(inode, &i)
+        })
+    }
+
+    pub fn ler(&self, inode: u32, posicao: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        self.operar(|e| e.ler_dados(inode, posicao, buf))
+    }
+
+    pub fn escrever(&self, inode: u32, posicao: u64, dados: &[u8]) -> Result<usize, i64> {
+        self.operar(|e| e.escrever_dados(inode, posicao, dados))
+    }
+
+    pub fn truncar(&self, inode: u32) -> Result<(), i64> {
+        self.operar(|e| {
+            let mut i = e.ler_inode(inode)?;
+            e.liberar_dados(&mut i)?;
+            i.tocar();
+            e.escrever_inode(inode, &i)
+        })
+    }
+
+    /// (nome, inode, é diretório?) de cada entrada, sem `.` e `..`.
+    pub fn listar(&self, dir: u32) -> Result<Vec<(String, u32, bool)>, i64> {
+        self.operar(|e| {
+            Ok(e.entradas(dir)?
+                .into_iter()
+                .filter(|x| x.nome != "." && x.nome != "..")
+                .map(|x| (x.nome, x.inode, x.tipo == TIPO_ENTRADA_DIRETORIO))
+                .collect())
+        })
+    }
+
+    pub fn criar(&self, dir: u32, nome: &str, diretorio: bool, permissoes: u32, uid: u32, gid: u32) -> Result<u32, i64> {
+        self.operar(|e| {
+            let numero = e.criar(dir, nome, diretorio)?;
+            let mut i = e.ler_inode(numero)?;
+            let modo = (i.modo() & 0xF000) | (permissoes & 0o7777) as u16;
+            wr16(&mut i.0, 0, modo);
+            wr16(&mut i.0, 2, uid as u16);
+            wr16(&mut i.0, 24, gid as u16);
+            e.escrever_inode(numero, &i)?;
+            Ok(numero)
+        })
+    }
+
+    pub fn remover(&self, dir: u32, nome: &str, diretorio: bool) -> Result<(), i64> {
+        self.operar(|e| e.remover(dir, nome, diretorio))
+    }
+
+    pub fn renomear(&self, dir_de: u32, nome_de: &str, dir_para: u32, nome_para: &str) -> Result<(), i64> {
+        self.operar(|e| e.renomear(dir_de, nome_de, dir_para, nome_para))
+    }
+
+    /// (blocos no total, blocos livres, tamanho do bloco)
+    pub fn estatisticas(&self) -> (u64, u64, u64) {
+        let e = self.estado.lock();
+        (e.total_blocos as u64, rd32(&e.superbloco, 12) as u64, e.tamanho_bloco as u64)
+    }
+}
+
+impl Estado {
+    // ------------------------------------------------------------------ blocos
+
+    fn setores_por_bloco(&self) -> u32 {
+        (self.tamanho_bloco / 512) as u32
+    }
+
+    fn ler_bloco(&mut self, bloco: u32) -> Result<Vec<u8>, i64> {
+        if let Some(dados) = self.cache.get(&bloco) {
+            return Ok(dados.clone());
         }
-        self.disk.write(block as u64 * (self.block_size / SECTOR_SIZE) as u64, data)?;
-        if let Some(cached) = self.cache.get_mut(&block) {
-            cached.copy_from_slice(data);
+        let mut dados = vec![0u8; self.tamanho_bloco];
+        ata::ler(bloco * self.setores_por_bloco(), &mut dados)?;
+        if self.cache.len() >= MAX_CACHE {
+            self.cache.pop_first();
         }
+        self.cache.insert(bloco, dados.clone());
+        Ok(dados)
+    }
+
+    /// Grava direto no disco ("write-through"): o cache nunca tem nada pendente.
+    fn escrever_bloco(&mut self, bloco: u32, dados: &[u8]) -> Result<(), i64> {
+        ata::gravar(bloco * self.setores_por_bloco(), dados)?;
+        if self.cache.len() >= MAX_CACHE {
+            self.cache.pop_first();
+        }
+        self.cache.insert(bloco, dados.to_vec());
         Ok(())
     }
 
-    /// Altera um trecho de um bloco (lê, muda, grava).
-    fn update_block(&mut self, block: u32, f: impl FnOnce(&mut [u8])) -> Result<(), Errno> {
-        let mut data = self.block(block)?.to_vec();
-        f(&mut data);
-        self.write_block(block, &data)
+    fn posicao_grupo(&self, g: usize) -> (u32, usize) {
+        let byte = g * 32;
+        (self.primeiro_bloco + 1 + (byte / self.tamanho_bloco) as u32, byte % self.tamanho_bloco)
     }
 
-    // --- Superbloco e grupos ----------------------------------------------------------
-
-    fn write_superblock(&mut self) -> Result<(), Errno> {
-        self.disk.write(2, &self.superblock)
-    }
-
-    fn write_group(&mut self, group: usize) -> Result<(), Errno> {
-        let offset = group * 32;
-        let block = self.first_data_block + 1 + (offset / self.block_size) as u32;
-        let descriptor = self.groups[group];
-        let within = offset % self.block_size;
-        self.update_block(block, |data| data[within..within + 32].copy_from_slice(&descriptor))
-    }
-
-    /// Ajusta os contadores de livres (e de diretórios) de um grupo e do
-    /// superbloco, e grava os dois.
-    fn adjust_counts(&mut self, group: usize, blocks: i32, inodes: i32, dirs: i32) -> Result<(), Errno> {
-        let descriptor = &mut self.groups[group];
-        for (offset, delta) in [(12, blocks), (14, inodes), (16, dirs)] {
-            let value = u16_at(descriptor, offset) as i32 + delta;
-            put_u16(descriptor, offset, value as u16);
-        }
-        self.write_group(group)?;
-        for (offset, delta) in [(12, blocks), (16, inodes)] {
-            let value = u32_at(&self.superblock, offset) as i64 + delta as i64;
-            put_u32(&mut self.superblock, offset, value as u32);
-        }
-        self.write_superblock()
-    }
-
-    fn group_count(&self) -> usize {
-        self.groups.len()
-    }
-
-    // --- Alocação ---------------------------------------------------------------------
-
-    /// Procura um bit livre no bitmap (em `bitmap_offset` do descritor) de
-    /// algum grupo, começando por `start`, e o marca. Devolve (grupo, bit).
-    fn allocate_bit(&mut self, start: usize, bitmap_offset: usize, free_offset: usize, limit: impl Fn(usize) -> u32) -> Result<(usize, u32), Errno> {
-        for i in 0..self.group_count() {
-            let group = (start + i) % self.group_count();
-            if u16_at(&self.groups[group], free_offset) == 0 {
+    fn sincronizar(&mut self) -> Result<(), i64> {
+        for g in 0..self.grupos.len() {
+            if !self.grupos[g].sujo {
                 continue;
             }
-            let bitmap = u32_at(&self.groups[group], bitmap_offset);
-            let bits = limit(group);
-            let data = self.block(bitmap)?;
-            let Some(bit) = (0..bits).find(|&bit| data[bit as usize / 8] & (1 << (bit % 8)) == 0) else {
-                continue; // contador e bitmap discordam: tenta outro grupo
-            };
-            self.update_block(bitmap, |data| data[bit as usize / 8] |= 1 << (bit % 8))?;
-            return Ok((group, bit));
+            let (bloco, o) = self.posicao_grupo(g);
+            let mut dados = self.ler_bloco(bloco)?;
+            let grupo = &self.grupos[g];
+            wr16(&mut dados, o + 12, grupo.blocos_livres);
+            wr16(&mut dados, o + 14, grupo.inodes_livres);
+            wr16(&mut dados, o + 16, grupo.diretorios);
+            self.escrever_bloco(bloco, &dados)?;
+            self.grupos[g].sujo = false;
         }
-        Err(ENOSPC)
-    }
-
-    fn release_bit(&mut self, group: usize, bitmap_offset: usize, bit: u32) -> Result<(), Errno> {
-        let bitmap = u32_at(&self.groups[group], bitmap_offset);
-        self.update_block(bitmap, |data| data[bit as usize / 8] &= !(1 << (bit % 8)))
-    }
-
-    /// Reserva um bloco, de preferência no grupo `near`, e o zera.
-    fn allocate_block(&mut self, near: usize) -> Result<u32, Errno> {
-        let (per_group, first, total) = (self.blocks_per_group, self.first_data_block, self.blocks_count);
-        let (group, bit) =
-            self.allocate_bit(near, 0, 12, |group| per_group.min(total - first - group as u32 * per_group))?;
-        self.adjust_counts(group, -1, 0, 0)?;
-        let block = first + group as u32 * per_group + bit;
-        let zeros = vec![0; self.block_size];
-        self.write_block(block, &zeros)?;
-        Ok(block)
-    }
-
-    fn free_block(&mut self, block: u32) -> Result<(), Errno> {
-        let index = block - self.first_data_block;
-        let group = (index / self.blocks_per_group) as usize;
-        self.release_bit(group, 0, index % self.blocks_per_group)?;
-        self.cache.remove(&block);
-        self.adjust_counts(group, 1, 0, 0)
-    }
-
-    fn allocate_inode(&mut self, near: usize, directory: bool) -> Result<u32, Errno> {
-        let per_group = self.inodes_per_group;
-        let (group, bit) = self.allocate_bit(near, 4, 14, |_| per_group)?;
-        self.adjust_counts(group, 0, -1, directory as i32)?;
-        Ok(group as u32 * per_group + bit + 1)
-    }
-
-    fn free_inode(&mut self, ino: u32, directory: bool) -> Result<(), Errno> {
-        let group = ((ino - 1) / self.inodes_per_group) as usize;
-        self.release_bit(group, 4, (ino - 1) % self.inodes_per_group)?;
-        self.adjust_counts(group, 0, 1, -(directory as i32))
-    }
-
-    fn group_of(&self, ino: u32) -> usize {
-        ((ino - 1) / self.inodes_per_group) as usize
-    }
-
-    // --- Inodes -------------------------------------------------------------------------
-
-    fn inode_location(&self, ino: u32) -> (u32, usize) {
-        let group = self.group_of(ino);
-        let index = ((ino - 1) % self.inodes_per_group) as usize;
-        let table = u32_at(&self.groups[group], 8);
-        let offset = index * self.inode_size;
-        (table + (offset / self.block_size) as u32, offset % self.block_size)
-    }
-
-    fn read_inode(&mut self, ino: u32) -> Result<RawInode, Errno> {
-        let (block, offset) = self.inode_location(ino);
-        let size = self.inode_size;
-        Ok(RawInode(self.block(block)?[offset..offset + size].to_vec()))
-    }
-
-    fn write_inode(&mut self, ino: u32, inode: &RawInode) -> Result<(), Errno> {
-        let (block, offset) = self.inode_location(ino);
-        self.update_block(block, |data| data[offset..offset + inode.0.len()].copy_from_slice(&inode.0))
-    }
-
-    // --- Blocos de um arquivo ----------------------------------------------------------
-
-    /// O bloco do disco com o `index`-ésimo bloco do arquivo. Com `allocate`,
-    /// cria o que faltar (o bloco e os indiretos); sem, 0 indica um buraco.
-    fn map_block(&mut self, ino: u32, inode: &mut RawInode, index: u64, allocate: bool) -> Result<u32, Errno> {
-        let near = self.group_of(ino);
-        if index < DIRECT_BLOCKS {
-            let mut block = inode.block(index as usize);
-            if block == 0 && allocate {
-                block = self.allocate_block(near)?;
-                inode.set_block(index as usize, block);
-                inode.add_sectors((self.block_size / SECTOR_SIZE) as i64);
-            }
-            return Ok(block);
+        if self.superbloco_sujo {
+            ata::gravar(2, &self.superbloco)?;
+            self.superbloco_sujo = false;
         }
-        // Qual árvore de indiretos (1, 2 ou 3 níveis) e a posição nela.
-        let mut index = index - DIRECT_BLOCKS;
-        let mut levels = 1;
-        let mut span = self.per_block;
-        while index >= span {
-            index -= span;
-            levels += 1;
-            span *= self.per_block;
-            if levels > 3 {
-                return Err(EFBIG);
-            }
-        }
-        let slot = 11 + levels;
-        let mut block = inode.block(slot);
-        if block == 0 {
-            if !allocate {
-                return Ok(0);
-            }
-            block = self.allocate_block(near)?;
-            inode.set_block(slot, block);
-            inode.add_sectors((self.block_size / SECTOR_SIZE) as i64);
-        }
-        for level in (0..levels).rev() {
-            let span = self.per_block.pow(level as u32);
-            let entry = (index / span) as usize;
-            index %= span;
-            let mut next = u32_at(self.block(block)?, entry * 4);
-            if next == 0 {
-                if !allocate {
-                    return Ok(0);
-                }
-                next = self.allocate_block(near)?;
-                inode.add_sectors((self.block_size / SECTOR_SIZE) as i64);
-                self.update_block(block, |data| put_u32(data, entry * 4, next))?;
-            }
-            block = next;
-        }
-        Ok(block)
+        ata::sincronizar()
     }
 
-    /// Libera os blocos de dados a partir do bloco `keep` do arquivo (e os
-    /// indiretos que ficarem vazios).
-    fn free_blocks_from(&mut self, inode: &mut RawInode, keep: u64) -> Result<(), Errno> {
-        let mut first = 0;
-        for slot in 0..15usize {
-            let level = slot.saturating_sub(11) as u32;
-            let span = self.per_block.pow(level);
-            let mut block = inode.block(slot);
-            let freed = self.free_tree(&mut block, level, first, keep)?;
-            inode.set_block(slot, block);
-            inode.add_sectors(-((freed * self.block_size / SECTOR_SIZE) as i64));
-            first += span;
-        }
-        Ok(())
+    fn somar_superbloco(&mut self, deslocamento: usize, n: i32) {
+        let atual = rd32(&self.superbloco, deslocamento) as i64;
+        wr32(&mut self.superbloco, deslocamento, (atual + n as i64) as u32);
+        self.superbloco_sujo = true;
     }
 
-    /// Libera a subárvore de `*block` (de `level` níveis de indireção, que
-    /// cobre os blocos do arquivo a partir de `first`) que estiver a partir
-    /// de `keep`. Devolve quantos blocos foram liberados.
-    fn free_tree(&mut self, block: &mut u32, level: u32, first: u64, keep: u64) -> Result<usize, Errno> {
-        if *block == 0 || first + self.per_block.pow(level) <= keep {
-            return Ok(0);
-        }
-        let mut freed = 0;
-        if level > 0 {
-            let child_span = self.per_block.pow(level - 1);
-            let mut table = self.block(*block)?.to_vec();
-            for entry in 0..self.per_block as usize {
-                let mut child = u32_at(&table, entry * 4);
-                freed += self.free_tree(&mut child, level - 1, first + entry as u64 * child_span, keep)?;
-                put_u32(&mut table, entry * 4, child);
-            }
-            if first < keep {
-                // Parte da subárvore continua: o indireto fica, atualizado.
-                self.write_block(*block, &table)?;
-                return Ok(freed);
-            }
-        }
-        self.free_block(*block)?;
-        *block = 0;
-        Ok(freed + 1)
-    }
-
-    // --- Conteúdo -----------------------------------------------------------------------
-
-    fn read(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
-        let mut inode = self.read_inode(ino)?;
-        let size = inode.size();
-        if offset >= size {
-            return Ok(0);
-        }
-        let len = buf.len().min((size - offset) as usize);
-        let bs = self.block_size as u64;
-        let mut done = 0;
-        while done < len {
-            let position = offset + done as u64;
-            let within = (position % bs) as usize;
-            let n = (self.block_size - within).min(len - done);
-            let block = self.map_block(ino, &mut inode, position / bs, false)?;
-            if block == 0 {
-                buf[done..done + n].fill(0); // buraco num arquivo esparso
-            } else {
-                buf[done..done + n].copy_from_slice(&self.block(block)?[within..within + n]);
-            }
-            done += n;
-        }
-        Ok(len)
-    }
-
-    fn write(&mut self, ino: u32, offset: u64, data: &[u8]) -> Result<usize, Errno> {
-        let mut inode = self.read_inode(ino)?;
-        let bs = self.block_size as u64;
-        let mut done = 0;
-        let mut result = Ok(());
-        while done < data.len() {
-            let position = offset + done as u64;
-            let within = (position % bs) as usize;
-            let n = (self.block_size - within).min(data.len() - done);
-            let block = match self.map_block(ino, &mut inode, position / bs, true) {
-                Ok(block) => block,
-                Err(errno) => {
-                    result = Err(errno); // disco cheio: grava o que deu
-                    break;
-                }
-            };
-            let chunk = &data[done..done + n];
-            if n == self.block_size {
-                self.write_block(block, chunk)?;
-            } else {
-                self.update_block(block, |bytes| bytes[within..within + n].copy_from_slice(chunk))?;
-            }
-            done += n;
-        }
-        if offset + done as u64 > inode.size() {
-            inode.set_size(offset + done as u64);
-        }
-        inode.touch();
-        self.write_inode(ino, &inode)?;
-        match result {
-            Err(errno) if done == 0 => Err(errno),
-            _ => Ok(done),
-        }
-    }
-
-    fn truncate(&mut self, ino: u32, size: u64) -> Result<(), Errno> {
-        let mut inode = self.read_inode(ino)?;
-        if size < inode.size() {
-            let bs = self.block_size as u64;
-            self.free_blocks_from(&mut inode, size.div_ceil(bs))?;
-            // O resto do último bloco precisa ler como zero se o arquivo crescer.
-            if size % bs != 0 {
-                let block = self.map_block(ino, &mut inode, size / bs, false)?;
-                if block != 0 {
-                    let within = (size % bs) as usize;
-                    self.update_block(block, |data| data[within..].fill(0))?;
-                }
-            }
-        }
-        inode.set_size(size);
-        inode.touch();
-        self.write_inode(ino, &inode)
-    }
-
-    // --- Diretórios ----------------------------------------------------------------------
-
-    /// Percorre as entradas de um diretório: `visit(bloco, posição, inode,
-    /// nome)` devolve `true` para parar. Devolve onde parou.
-    fn scan_dir(
-        &mut self,
-        ino: u32,
-        mut visit: impl FnMut(u32, usize, u32, &[u8]) -> bool,
-    ) -> Result<Option<(u32, usize)>, Errno> {
-        let mut inode = self.read_inode(ino)?;
-        if inode.file_type() != S_IFDIR {
-            return Err(ENOTDIR);
-        }
-        let blocks = inode.size() / self.block_size as u64;
-        for index in 0..blocks {
-            let block = self.map_block(ino, &mut inode, index, false)?;
-            if block == 0 {
-                continue;
-            }
-            let data = self.block(block)?.to_vec();
-            let mut position = 0;
-            while position + 8 <= self.block_size {
-                let entry_ino = u32_at(&data, position);
-                let record = u16_at(&data, position + 4) as usize;
-                let name_len = data[position + 6] as usize;
-                if record < 8 || position + record > self.block_size {
-                    return Err(EIO); // entrada corrompida
-                }
-                if entry_ino != 0 && visit(block, position, entry_ino, &data[position + 8..position + 8 + name_len]) {
-                    return Ok(Some((block, position)));
-                }
-                position += record;
+    /// Procura um bit zero num bitmap, liga e devolve o índice.
+    fn ocupar_bit(&mut self, bloco_mapa: u32, limite: u32) -> Result<Option<u32>, i64> {
+        let mut mapa = self.ler_bloco(bloco_mapa)?;
+        for i in 0..limite {
+            let (byte, bit) = ((i / 8) as usize, i % 8);
+            if mapa[byte] & (1 << bit) == 0 {
+                mapa[byte] |= 1 << bit;
+                self.escrever_bloco(bloco_mapa, &mapa)?;
+                return Ok(Some(i));
             }
         }
         Ok(None)
     }
 
-    fn find_entry(&mut self, dir: u32, name: &str) -> Result<u32, Errno> {
-        let mut found = 0;
-        self.scan_dir(dir, |_, _, ino, entry| {
-            found = ino;
-            entry == name.as_bytes()
-        })?
-        .map(|_| found)
-        .ok_or(ENOENT)
+    fn soltar_bit(&mut self, bloco_mapa: u32, i: u32) -> Result<(), i64> {
+        let mut mapa = self.ler_bloco(bloco_mapa)?;
+        mapa[(i / 8) as usize] &= !(1 << (i % 8));
+        self.escrever_bloco(bloco_mapa, &mapa)
     }
 
-    fn type_code(mode: u16) -> u8 {
-        match mode & S_IFMT {
-            S_IFREG => 1,
-            S_IFDIR => 2,
-            S_IFCHR => 3,
-            0x6000 => 4,
-            0x1000 => 5,
-            0xC000 => 6,
-            S_IFLNK => 7,
-            _ => 0,
+    fn alocar_bloco(&mut self) -> Result<u32, i64> {
+        for g in 0..self.grupos.len() {
+            if self.grupos[g].blocos_livres == 0 {
+                continue;
+            }
+            let inicio = self.primeiro_bloco + g as u32 * self.blocos_por_grupo;
+            let limite = self.blocos_por_grupo.min(self.total_blocos - inicio);
+            if let Some(i) = self.ocupar_bit(self.grupos[g].mapa_blocos, limite)? {
+                self.grupos[g].blocos_livres -= 1;
+                self.grupos[g].sujo = true;
+                self.somar_superbloco(12, -1);
+                let bloco = inicio + i;
+                let zeros = vec![0u8; self.tamanho_bloco];
+                self.escrever_bloco(bloco, &zeros)?;
+                return Ok(bloco);
+            }
+        }
+        Err(ENOSPC)
+    }
+
+    fn liberar_bloco(&mut self, bloco: u32) -> Result<(), i64> {
+        let relativo = bloco - self.primeiro_bloco;
+        let g = (relativo / self.blocos_por_grupo) as usize;
+        self.soltar_bit(self.grupos[g].mapa_blocos, relativo % self.blocos_por_grupo)?;
+        self.grupos[g].blocos_livres += 1;
+        self.grupos[g].sujo = true;
+        self.somar_superbloco(12, 1);
+        self.cache.remove(&bloco);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ inodes
+
+    fn posicao_inode(&self, inode: u32) -> (u32, usize) {
+        let g = ((inode - 1) / self.inodes_por_grupo) as usize;
+        let byte = ((inode - 1) % self.inodes_por_grupo) as usize * self.tamanho_inode;
+        (self.grupos[g].tabela_inodes + (byte / self.tamanho_bloco) as u32, byte % self.tamanho_bloco)
+    }
+
+    fn ler_inode(&mut self, inode: u32) -> Result<Inode, i64> {
+        if inode == 0 || ((inode - 1) / self.inodes_por_grupo) as usize >= self.grupos.len() {
+            return Err(EIO);
+        }
+        let (bloco, o) = self.posicao_inode(inode);
+        let dados = self.ler_bloco(bloco)?;
+        Ok(Inode(dados[o..o + 128].try_into().unwrap()))
+    }
+
+    fn escrever_inode(&mut self, inode: u32, valor: &Inode) -> Result<(), i64> {
+        let (bloco, o) = self.posicao_inode(inode);
+        let mut dados = self.ler_bloco(bloco)?;
+        dados[o..o + 128].copy_from_slice(&valor.0);
+        self.escrever_bloco(bloco, &dados)
+    }
+
+    fn alocar_inode(&mut self, diretorio: bool) -> Result<u32, i64> {
+        for g in 0..self.grupos.len() {
+            if self.grupos[g].inodes_livres == 0 {
+                continue;
+            }
+            if let Some(i) = self.ocupar_bit(self.grupos[g].mapa_inodes, self.inodes_por_grupo)? {
+                let grupo = &mut self.grupos[g];
+                grupo.inodes_livres -= 1;
+                grupo.diretorios += diretorio as u16;
+                grupo.sujo = true;
+                self.somar_superbloco(16, -1);
+                return Ok(g as u32 * self.inodes_por_grupo + i + 1);
+            }
+        }
+        Err(ENOSPC)
+    }
+
+    /// Apaga de vez: dados, inode e bit no bitmap.
+    fn liberar_inode(&mut self, numero: u32, inode: &mut Inode) -> Result<(), i64> {
+        let diretorio = inode.eh_diretorio();
+        self.liberar_dados(inode)?;
+        inode.definir_links(0);
+        // dtime: a hora em que foi apagado. Precisa ser uma data de verdade, porque
+        // valores pequenos o e2fsck interpreta como a lista de órfãos do ext3.
+        wr32(&mut inode.0, 20, rtc::agora().max(1_000_000_000) as u32);
+        self.escrever_inode(numero, inode)?;
+        let g = ((numero - 1) / self.inodes_por_grupo) as usize;
+        self.soltar_bit(self.grupos[g].mapa_inodes, (numero - 1) % self.inodes_por_grupo)?;
+        let grupo = &mut self.grupos[g];
+        grupo.inodes_livres += 1;
+        grupo.diretorios -= diretorio as u16;
+        grupo.sujo = true;
+        self.somar_superbloco(16, 1);
+        Ok(())
+    }
+
+    // ------------------------------------------------------- blocos de arquivo
+
+    /// Número do bloco de disco que guarda o bloco `indice` do arquivo.
+    /// 0 = buraco (nunca escrito). Com `alocar`, cria o que faltar.
+    fn bloco_de(&mut self, inode: &mut Inode, indice: u32, alocar: bool) -> Result<u32, i64> {
+        let por_bloco = (self.tamanho_bloco / 4) as u32;
+        if indice < 12 {
+            return self.ponteiro_no_inode(inode, indice as usize, alocar);
+        }
+        let i = indice - 12;
+        if i < por_bloco {
+            let tabela = self.ponteiro_no_inode(inode, 12, alocar)?;
+            return if tabela == 0 { Ok(0) } else { self.ponteiro_na_tabela(inode, tabela, i, alocar) };
+        }
+        let i = i - por_bloco;
+        if i < por_bloco * por_bloco {
+            let t1 = self.ponteiro_no_inode(inode, 13, alocar)?;
+            if t1 == 0 {
+                return Ok(0);
+            }
+            let t2 = self.ponteiro_na_tabela(inode, t1, i / por_bloco, alocar)?;
+            return if t2 == 0 { Ok(0) } else { self.ponteiro_na_tabela(inode, t2, i % por_bloco, alocar) };
+        }
+        Err(EFBIG)
+    }
+
+    fn ponteiro_no_inode(&mut self, inode: &mut Inode, i: usize, alocar: bool) -> Result<u32, i64> {
+        let bloco = inode.bloco(i);
+        if bloco != 0 || !alocar {
+            return Ok(bloco);
+        }
+        let novo = self.alocar_bloco()?;
+        inode.definir_bloco(i, novo);
+        inode.somar_setores(self.setores_por_bloco() as i64);
+        Ok(novo)
+    }
+
+    fn ponteiro_na_tabela(&mut self, inode: &mut Inode, tabela: u32, i: u32, alocar: bool) -> Result<u32, i64> {
+        let mut dados = self.ler_bloco(tabela)?;
+        let bloco = rd32(&dados, i as usize * 4);
+        if bloco != 0 || !alocar {
+            return Ok(bloco);
+        }
+        let novo = self.alocar_bloco()?;
+        wr32(&mut dados, i as usize * 4, novo);
+        self.escrever_bloco(tabela, &dados)?;
+        inode.somar_setores(self.setores_por_bloco() as i64);
+        Ok(novo)
+    }
+
+    /// Devolve todos os blocos do arquivo (inclusive os de índice).
+    fn liberar_dados(&mut self, inode: &mut Inode) -> Result<(), i64> {
+        for i in 0..15 {
+            let bloco = inode.bloco(i);
+            if bloco != 0 {
+                match i {
+                    0..=11 => self.liberar_bloco(bloco)?,
+                    _ => self.liberar_tabela(bloco, i - 11)?,
+                }
+            }
+            inode.definir_bloco(i, 0);
+        }
+        inode.definir_tamanho(0);
+        wr32(&mut inode.0, 28, 0);
+        Ok(())
+    }
+
+    fn liberar_tabela(&mut self, tabela: u32, nivel: usize) -> Result<(), i64> {
+        let dados = self.ler_bloco(tabela)?;
+        for i in 0..self.tamanho_bloco / 4 {
+            let bloco = rd32(&dados, i * 4);
+            if bloco != 0 {
+                if nivel > 1 { self.liberar_tabela(bloco, nivel - 1)? } else { self.liberar_bloco(bloco)? }
+            }
+        }
+        self.liberar_bloco(tabela)
+    }
+
+    fn ler_dados(&mut self, numero: u32, posicao: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        let mut inode = self.ler_inode(numero)?;
+        let tamanho = inode.tamanho();
+        if posicao >= tamanho {
+            return Ok(0);
+        }
+        let total = buf.len().min((tamanho - posicao) as usize);
+        let tb = self.tamanho_bloco as u64;
+        let mut feito = 0;
+        while feito < total {
+            let p = posicao + feito as u64;
+            let o = (p % tb) as usize;
+            let n = (self.tamanho_bloco - o).min(total - feito);
+            let bloco = self.bloco_de(&mut inode, (p / tb) as u32, false)?;
+            if bloco == 0 {
+                buf[feito..feito + n].fill(0);
+            } else {
+                let dados = self.ler_bloco(bloco)?;
+                buf[feito..feito + n].copy_from_slice(&dados[o..o + n]);
+            }
+            feito += n;
+        }
+        Ok(total)
+    }
+
+    fn escrever_dados(&mut self, numero: u32, posicao: u64, dados: &[u8]) -> Result<usize, i64> {
+        let mut inode = self.ler_inode(numero)?;
+        let tb = self.tamanho_bloco as u64;
+        let mut feito = 0;
+        let mut erro = None;
+        while feito < dados.len() {
+            let p = posicao + feito as u64;
+            let o = (p % tb) as usize;
+            let n = (self.tamanho_bloco - o).min(dados.len() - feito);
+            let bloco = match self.bloco_de(&mut inode, (p / tb) as u32, true) {
+                Ok(b) => b,
+                Err(e) => {
+                    erro = Some(e); // disco cheio: grava o que deu
+                    break;
+                }
+            };
+            let mut conteudo = if n == self.tamanho_bloco { vec![0u8; n] } else { self.ler_bloco(bloco)? };
+            conteudo[o..o + n].copy_from_slice(&dados[feito..feito + n]);
+            self.escrever_bloco(bloco, &conteudo)?;
+            feito += n;
+        }
+        if posicao + feito as u64 > inode.tamanho() {
+            inode.definir_tamanho(posicao + feito as u64);
+        }
+        inode.tocar();
+        self.escrever_inode(numero, &inode)?;
+        match erro {
+            Some(e) if feito == 0 => Err(e),
+            _ => Ok(feito),
         }
     }
 
-    fn put_entry(&self, data: &mut [u8], position: usize, ino: u32, record: usize, name: &str, mode: u16) {
-        put_u32(data, position, ino);
-        put_u16(data, position + 4, record as u16);
-        data[position + 6] = name.len() as u8;
-        data[position + 7] = if self.filetype { Self::type_code(mode) } else { 0 };
-        data[position + 8..position + 8 + name.len()].copy_from_slice(name.as_bytes());
-    }
+    // ------------------------------------------------------------- diretórios
 
-    /// Marca o diretório como alterado (e tira o índice dir_index, que não
-    /// mantemos).
-    fn touch_dir(&mut self, dir: u32, inode: &mut RawInode) -> Result<(), Errno> {
-        let flags = inode.flags() & !INDEX_FLAG;
-        put_u32(&mut inode.0, 32, flags);
-        inode.touch();
-        self.write_inode(dir, inode)
-    }
-
-    fn add_entry(&mut self, dir: u32, name: &str, ino: u32, mode: u16) -> Result<(), Errno> {
-        let needed = (8 + name.len()).next_multiple_of(4);
-        let mut inode = self.read_inode(dir)?;
-        let blocks = inode.size() / self.block_size as u64;
-        // Primeiro, sobra de espaço numa entrada existente.
-        for index in 0..blocks {
-            let block = self.map_block(dir, &mut inode, index, false)?;
-            if block == 0 {
+    fn entradas(&mut self, dir: u32) -> Result<Vec<Entrada>, i64> {
+        let mut inode = self.ler_inode(dir)?;
+        if !inode.eh_diretorio() {
+            return Err(ENOTDIR);
+        }
+        let mut lista = Vec::new();
+        for indice in 0..(inode.tamanho() / self.tamanho_bloco as u64) as u32 {
+            let bloco = self.bloco_de(&mut inode, indice, false)?;
+            if bloco == 0 {
                 continue;
             }
-            let mut data = self.block(block)?.to_vec();
-            let mut position = 0;
-            while position + 8 <= self.block_size {
-                let entry_ino = u32_at(&data, position);
-                let record = u16_at(&data, position + 4) as usize;
-                if record < 8 {
-                    return Err(EIO);
+            let dados = self.ler_bloco(bloco)?;
+            let mut o = 0;
+            while o + 8 <= self.tamanho_bloco {
+                let numero = rd32(&dados, o);
+                let registro = rd16(&dados, o + 4) as usize;
+                let tamanho_nome = dados[o + 6] as usize;
+                if registro < 8 || o + registro > self.tamanho_bloco {
+                    break; // diretório corrompido: para por aqui
                 }
-                let used = if entry_ino == 0 { 0 } else { (8 + data[position + 6] as usize).next_multiple_of(4) };
-                if record - used >= needed {
-                    if used == 0 {
-                        self.put_entry(&mut data, position, ino, record, name, mode);
+                if numero != 0 {
+                    lista.push(Entrada {
+                        inode: numero,
+                        nome: String::from_utf8_lossy(&dados[o + 8..o + 8 + tamanho_nome]).into_owned(),
+                        tipo: dados[o + 7],
+                    });
+                }
+                o += registro;
+            }
+        }
+        Ok(lista)
+    }
+
+    fn buscar(&mut self, dir: u32, nome: &str) -> Result<u32, i64> {
+        self.entradas(dir)?.into_iter().find(|e| e.nome == nome).map(|e| e.inode).ok_or(ENOENT)
+    }
+
+    /// Acha espaço num bloco do diretório (sobra no fim de uma entrada, ou
+    /// uma entrada vazia); se não houver, acrescenta um bloco novo.
+    fn adicionar_entrada(&mut self, dir: u32, nome: &str, numero: u32, tipo: u8) -> Result<(), i64> {
+        if nome.len() > 255 {
+            return Err(ENAMETOOLONG);
+        }
+        let necessario = (8 + nome.len()).next_multiple_of(4);
+        let escrever = |dados: &mut [u8], o: usize, registro: usize| {
+            wr32(dados, o, numero);
+            wr16(dados, o + 4, registro as u16);
+            dados[o + 6] = nome.len() as u8;
+            dados[o + 7] = tipo;
+            dados[o + 8..o + 8 + nome.len()].copy_from_slice(nome.as_bytes());
+        };
+
+        let mut inode = self.ler_inode(dir)?;
+        let blocos = (inode.tamanho() / self.tamanho_bloco as u64) as u32;
+        for indice in 0..blocos {
+            let bloco = self.bloco_de(&mut inode, indice, false)?;
+            if bloco == 0 {
+                continue;
+            }
+            let mut dados = self.ler_bloco(bloco)?;
+            let mut o = 0;
+            while o + 8 <= self.tamanho_bloco {
+                let registro = rd16(&dados, o + 4) as usize;
+                if registro < 8 {
+                    break;
+                }
+                let usado = if rd32(&dados, o) == 0 { 0 } else { (8 + dados[o + 6] as usize).next_multiple_of(4) };
+                if registro - usado >= necessario {
+                    if usado == 0 {
+                        escrever(&mut dados, o, registro);
                     } else {
-                        put_u16(&mut data, position + 4, used as u16);
-                        self.put_entry(&mut data, position + used, ino, record - used, name, mode);
+                        wr16(&mut dados, o + 4, usado as u16);
+                        escrever(&mut dados, o + usado, registro - usado);
                     }
-                    self.write_block(block, &data)?;
-                    return self.touch_dir(dir, &mut inode);
+                    return self.escrever_bloco(bloco, &dados);
                 }
-                position += record;
+                o += registro;
             }
         }
-        // Senão, um bloco novo no fim do diretório.
-        let block = self.map_block(dir, &mut inode, blocks, true)?;
-        let mut data = vec![0; self.block_size];
-        self.put_entry(&mut data, 0, ino, self.block_size, name, mode);
-        self.write_block(block, &data)?;
-        inode.set_size(inode.size() + self.block_size as u64);
-        self.touch_dir(dir, &mut inode)
+        let bloco = self.bloco_de(&mut inode, blocos, true)?;
+        let mut dados = vec![0u8; self.tamanho_bloco];
+        escrever(&mut dados, 0, self.tamanho_bloco);
+        self.escrever_bloco(bloco, &dados)?;
+        inode.definir_tamanho(inode.tamanho() + self.tamanho_bloco as u64);
+        self.escrever_inode(dir, &inode)
     }
 
-    /// Tira a entrada `name` do diretório e devolve o inode dela.
-    fn remove_entry(&mut self, dir: u32, name: &str) -> Result<u32, Errno> {
-        let mut inode = self.read_inode(dir)?;
-        let blocks = inode.size() / self.block_size as u64;
-        for index in 0..blocks {
-            let block = self.map_block(dir, &mut inode, index, false)?;
-            if block == 0 {
+    /// Tira a entrada: o registro anterior "engole" o espaço dela.
+    fn remover_entrada(&mut self, dir: u32, nome: &str) -> Result<u32, i64> {
+        let mut inode = self.ler_inode(dir)?;
+        for indice in 0..(inode.tamanho() / self.tamanho_bloco as u64) as u32 {
+            let bloco = self.bloco_de(&mut inode, indice, false)?;
+            if bloco == 0 {
                 continue;
             }
-            let mut data = self.block(block)?.to_vec();
-            // A entrada fisicamente anterior no bloco (mesmo se apagada).
-            let mut previous: Option<usize> = None;
-            let mut position = 0;
-            while position + 8 <= self.block_size {
-                let entry_ino = u32_at(&data, position);
-                let record = u16_at(&data, position + 4) as usize;
-                let name_len = data[position + 6] as usize;
-                if record < 8 || position + record > self.block_size {
-                    return Err(EIO);
+            let mut dados = self.ler_bloco(bloco)?;
+            let mut o = 0;
+            let mut anterior: Option<usize> = None;
+            while o + 8 <= self.tamanho_bloco {
+                let numero = rd32(&dados, o);
+                let registro = rd16(&dados, o + 4) as usize;
+                if registro < 8 {
+                    break;
                 }
-                if entry_ino != 0 && &data[position + 8..position + 8 + name_len] == name.as_bytes() {
-                    match previous {
-                        // A anterior absorve o espaço desta.
-                        Some(previous) => {
-                            let merged = u16_at(&data, previous + 4) + record as u16;
-                            put_u16(&mut data, previous + 4, merged);
+                let tamanho_nome = dados[o + 6] as usize;
+                if numero != 0 && &dados[o + 8..o + 8 + tamanho_nome] == nome.as_bytes() {
+                    match anterior {
+                        Some(a) => {
+                            let novo = rd16(&dados, a + 4) + registro as u16;
+                            wr16(&mut dados, a + 4, novo);
                         }
-                        None => put_u32(&mut data, position, 0),
+                        None => wr32(&mut dados, o, 0),
                     }
-                    self.write_block(block, &data)?;
-                    self.touch_dir(dir, &mut inode)?;
-                    return Ok(entry_ino);
+                    self.escrever_bloco(bloco, &dados)?;
+                    return Ok(numero);
                 }
-                previous = Some(position);
-                position += record;
+                anterior = Some(o);
+                o += registro;
             }
         }
         Err(ENOENT)
     }
 
-    fn is_empty_dir(&mut self, ino: u32) -> Result<bool, Errno> {
-        let mut empty = true;
-        self.scan_dir(ino, |_, _, _, name| {
-            empty = name == b"." || name == b"..";
-            !empty
-        })?;
-        Ok(empty)
+    fn mudar_links(&mut self, numero: u32, delta: i32) -> Result<(), i64> {
+        let mut inode = self.ler_inode(numero)?;
+        inode.definir_links((inode.links() as i32 + delta) as u16);
+        self.escrever_inode(numero, &inode)
     }
 
-    /// Solta um link do inode; no último, libera os blocos e o inode.
-    fn drop_link(&mut self, ino: u32) -> Result<(), Errno> {
-        let mut inode = self.read_inode(ino)?;
-        let directory = inode.file_type() == S_IFDIR;
-        let links = if directory { 0 } else { inode.links().saturating_sub(1) };
-        inode.set_links(links);
-        if links > 0 {
-            inode.touch();
-            return self.write_inode(ino, &inode);
-        }
-        // Em dispositivos e links curtos, os "ponteiros" não são blocos.
-        let has_blocks = matches!(inode.file_type(), S_IFREG | S_IFDIR) || inode.file_type() == S_IFLNK && !inode.is_fast_symlink();
-        if has_blocks {
-            self.free_blocks_from(&mut inode, 0)?;
-        }
-        put_u32(&mut inode.0, 20, rtc::now() as u32); // dtime: inode apagado
-        self.write_inode(ino, &inode)?;
-        self.free_inode(ino, directory)
-    }
-
-    fn adjust_links(&mut self, ino: u32, delta: i32) -> Result<(), Errno> {
-        let mut inode = self.read_inode(ino)?;
-        inode.set_links((inode.links() as i32 + delta) as u16);
-        inode.touch();
-        self.write_inode(ino, &inode)
-    }
-
-    fn create(&mut self, dir: u32, name: &str, node: &NewNode, permissions: u32) -> Result<u32, Errno> {
-        if name.len() > 255 {
-            return Err(EINVAL);
-        }
-        if self.find_entry(dir, name).is_ok() {
+    fn criar(&mut self, dir: u32, nome: &str, diretorio: bool) -> Result<u32, i64> {
+        if self.buscar(dir, nome).is_ok() {
             return Err(EEXIST);
         }
-        let directory = matches!(node, NewNode::Directory);
-        let file_type = match node {
-            NewNode::File => S_IFREG,
-            NewNode::Directory => S_IFDIR,
-            NewNode::Symlink(_) => S_IFLNK,
-        };
-        let mode = file_type | (permissions & 0o7777) as u16;
-        let ino = self.allocate_inode(self.group_of(dir), directory)?;
-        let mut inode = RawInode(vec![0; self.inode_size]);
-        put_u16(&mut inode.0, 0, mode);
-        put_u32(&mut inode.0, 8, rtc::now() as u32); // atime
-        inode.touch();
-        inode.set_links(if directory { 2 } else { 1 });
-        if self.inode_size > 128 {
-            put_u16(&mut inode.0, 128, 32); // i_extra_isize, como o Linux grava
+        let numero = self.alocar_inode(diretorio)?;
+        let mut inode = Inode([0; 128]);
+        inode.tocar();
+        if diretorio {
+            wr16(&mut inode.0, 0, MODO_DIRETORIO | 0o755);
+            inode.definir_links(2); // a entrada no pai + o "." dele mesmo
+            let bloco = self.bloco_de(&mut inode, 0, true)?;
+            let mut dados = vec![0u8; self.tamanho_bloco];
+            wr32(&mut dados, 0, numero);
+            wr16(&mut dados, 4, 12);
+            dados[6] = 1;
+            dados[7] = TIPO_ENTRADA_DIRETORIO;
+            dados[8] = b'.';
+            wr32(&mut dados, 12, dir);
+            wr16(&mut dados, 16, (self.tamanho_bloco - 12) as u16);
+            dados[18] = 2;
+            dados[19] = TIPO_ENTRADA_DIRETORIO;
+            dados[20..22].copy_from_slice(b"..");
+            self.escrever_bloco(bloco, &dados)?;
+            inode.definir_tamanho(self.tamanho_bloco as u64);
+        } else {
+            wr16(&mut inode.0, 0, MODO_ARQUIVO | 0o644);
+            inode.definir_links(1);
         }
-        match node {
-            NewNode::Directory => {
-                let block = self.map_block(ino, &mut inode, 0, true)?;
-                let mut data = vec![0; self.block_size];
-                self.put_entry(&mut data, 0, ino, 12, ".", S_IFDIR);
-                self.put_entry(&mut data, 12, dir, self.block_size - 12, "..", S_IFDIR);
-                self.write_block(block, &data)?;
-                inode.set_size(self.block_size as u64);
-            }
-            NewNode::Symlink(target) if target.len() < FAST_SYMLINK_MAX => {
-                inode.0[40..40 + target.len()].copy_from_slice(target.as_bytes());
-                inode.set_size(target.len() as u64);
-            }
-            _ => {}
+        self.escrever_inode(numero, &inode)?;
+        let tipo = if diretorio { TIPO_ENTRADA_DIRETORIO } else { TIPO_ENTRADA_ARQUIVO };
+        self.adicionar_entrada(dir, nome, numero, tipo)?;
+        if diretorio {
+            self.mudar_links(dir, 1)?; // o ".." do filho aponta para o pai
         }
-        self.write_inode(ino, &inode)?;
-        if let NewNode::Symlink(target) = node
-            && target.len() >= FAST_SYMLINK_MAX
-        {
-            self.write(ino, 0, target.as_bytes())?;
-        }
-        if directory {
-            self.adjust_links(dir, 1)?; // o ".." do novo diretório
-        }
-        self.add_entry(dir, name, ino, mode)?;
-        Ok(ino)
+        Ok(numero)
     }
 
-    fn unlink(&mut self, dir: u32, name: &str, directory: bool) -> Result<(), Errno> {
-        let ino = self.find_entry(dir, name)?;
-        let is_dir = self.read_inode(ino)?.file_type() == S_IFDIR;
-        match (directory, is_dir) {
-            (false, true) => return Err(EISDIR),
-            (true, false) => return Err(ENOTDIR),
-            (true, true) if !self.is_empty_dir(ino)? => return Err(ENOTEMPTY),
+    fn remover(&mut self, dir: u32, nome: &str, diretorio: bool) -> Result<(), i64> {
+        let numero = self.buscar(dir, nome)?;
+        let mut inode = self.ler_inode(numero)?;
+        match (inode.eh_diretorio(), diretorio) {
+            (true, false) => return Err(EISDIR),
+            (false, true) => return Err(ENOTDIR),
+            (true, true) if self.entradas(numero)?.len() > 2 => return Err(ENOTEMPTY),
             _ => {}
         }
-        self.remove_entry(dir, name)?;
-        if is_dir {
-            self.adjust_links(dir, -1)?;
+        self.remover_entrada(dir, nome)?;
+        if inode.eh_diretorio() {
+            self.mudar_links(dir, -1)?;
+            return self.liberar_inode(numero, &mut inode);
         }
-        self.drop_link(ino)
+        // Um arquivo só some de verdade quando o último nome (link) for apagado.
+        inode.definir_links(inode.links().saturating_sub(1));
+        if inode.links() == 0 {
+            self.liberar_inode(numero, &mut inode)
+        } else {
+            self.escrever_inode(numero, &inode)
+        }
     }
 
-    fn rename(&mut self, dir: u32, name: &str, new_dir: u32, new_name: &str) -> Result<(), Errno> {
-        let ino = self.find_entry(dir, name)?;
-        let mode = self.read_inode(ino)?.mode();
-        self.add_entry(new_dir, new_name, ino, mode)?;
-        self.remove_entry(dir, name)?;
-        if mode & S_IFMT == S_IFDIR && dir != new_dir {
+    fn renomear(&mut self, dir_de: u32, nome_de: &str, dir_para: u32, nome_para: &str) -> Result<(), i64> {
+        let numero = self.buscar(dir_de, nome_de)?;
+        if let Ok(existente) = self.buscar(dir_para, nome_para) {
+            if existente == numero {
+                return Ok(());
+            }
+            self.remover(dir_para, nome_para, false)?; // substitui um arquivo
+        }
+        let diretorio = self.ler_inode(numero)?.eh_diretorio();
+        let tipo = if diretorio { TIPO_ENTRADA_DIRETORIO } else { TIPO_ENTRADA_ARQUIVO };
+        self.adicionar_entrada(dir_para, nome_para, numero, tipo)?;
+        self.remover_entrada(dir_de, nome_de)?;
+        if diretorio && dir_de != dir_para {
             // O ".." do diretório movido passa a apontar para o novo pai.
-            if let Some((block, position)) = self.scan_dir(ino, |_, _, _, entry| entry == b"..")? {
-                self.update_block(block, |data| put_u32(data, position, new_dir))?;
-            }
-            self.adjust_links(dir, -1)?;
-            self.adjust_links(new_dir, 1)?;
+            self.remover_entrada(numero, "..")?;
+            self.adicionar_entrada(numero, "..", dir_para, TIPO_ENTRADA_DIRETORIO)?;
+            self.mudar_links(dir_de, -1)?;
+            self.mudar_links(dir_para, 1)?;
         }
         Ok(())
-    }
-}
-
-impl Ext2 {
-    /// Monta o ext2 de `disk`. Devolve a raiz, ou por que não deu.
-    pub fn mount(disk: Arc<dyn BlockDevice>, dev: u64) -> Result<NodeRef, &'static str> {
-        let mut superblock = vec![0; 1024];
-        disk.read(2, &mut superblock).map_err(|_| "erro de leitura no disco")?;
-        if u16_at(&superblock, 56) != MAGIC {
-            return Err("não é um ext2");
-        }
-        let block_size = 1024usize << u32_at(&superblock, 24);
-        let rev = u32_at(&superblock, 76);
-        let inode_size = if rev >= 1 { u16_at(&superblock, 88) as usize } else { 128 };
-        let incompat = if rev >= 1 { u32_at(&superblock, 96) } else { 0 };
-        let ro_compat = if rev >= 1 { u32_at(&superblock, 100) } else { 0 };
-        if incompat & !INCOMPAT_FILETYPE != 0 {
-            return Err("recursos não suportados (ext3/ext4?)");
-        }
-        let read_only = ro_compat & !RO_COMPAT_SUPPORTED != 0;
-        let blocks_count = u32_at(&superblock, 4);
-        let first_data_block = u32_at(&superblock, 20);
-        let blocks_per_group = u32_at(&superblock, 32);
-        let inodes_per_group = u32_at(&superblock, 40);
-        if block_size > 4096 || blocks_per_group == 0 || inodes_per_group == 0 || inode_size < 128 {
-            return Err("superbloco inválido");
-        }
-        let group_count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
-
-        let mut fs = Fs {
-            disk,
-            block_size,
-            per_block: block_size as u64 / 4,
-            superblock,
-            groups: Vec::new(),
-            blocks_per_group,
-            inodes_per_group,
-            inode_size,
-            first_data_block,
-            blocks_count,
-            filetype: incompat & INCOMPAT_FILETYPE != 0,
-            cache: BTreeMap::new(),
-        };
-        let table_blocks = (group_count * 32).div_ceil(block_size);
-        let mut table = Vec::new();
-        for i in 0..table_blocks {
-            let data = fs.block(first_data_block + 1 + i as u32).map_err(|_| "erro ao ler os grupos")?;
-            table.extend_from_slice(data);
-        }
-        fs.groups = (0..group_count).map(|g| table[g * 32..g * 32 + 32].try_into().unwrap()).collect();
-
-        if !read_only {
-            // Enquanto montado, o sistema não está "limpo": se a energia cair,
-            // o e2fsck saberá que precisa verificar.
-            let state = u16_at(&fs.superblock, 58) & !STATE_CLEAN;
-            put_u16(&mut fs.superblock, 58, state);
-            let mounts = u16_at(&fs.superblock, 52);
-            put_u16(&mut fs.superblock, 52, mounts.wrapping_add(1));
-            put_u32(&mut fs.superblock, 44, rtc::now() as u32); // s_mtime
-            fs.write_superblock().map_err(|_| "erro ao gravar o superbloco")?;
-        }
-        let ext2 = Arc::new(Ext2 { fs: SpinLock::new(fs), dev, read_only });
-        Ok(Arc::new(Ext2Node { fs: ext2, ino: ROOT_INO }))
-    }
-
-    fn writable(&self) -> Result<(), Errno> {
-        if self.read_only { Err(EROFS) } else { Ok(()) }
-    }
-
-    pub fn info(root: &NodeRef) -> Option<Info> {
-        let node = root.as_any().downcast_ref::<Ext2Node>()?;
-        let fs = node.fs.fs.lock();
-        let sb = &fs.superblock;
-        let label = &sb[120..136];
-        let label_len = label.iter().position(|&b| b == 0).unwrap_or(16);
-        Some(Info {
-            label: String::from_utf8_lossy(&label[..label_len]).into_owned(),
-            block_size: fs.block_size,
-            blocks: u32_at(sb, 4) as u64,
-            free_blocks: u32_at(sb, 12) as u64,
-            inodes: u32_at(sb, 0) as u64,
-            free_inodes: u32_at(sb, 16) as u64,
-            read_only: node.fs.read_only,
-        })
-    }
-}
-
-impl Ext2Node {
-    fn node(&self, ino: u32) -> NodeRef {
-        Arc::new(Ext2Node { fs: self.fs.clone(), ino })
-    }
-
-    fn inode(&self) -> Result<RawInode, Errno> {
-        self.fs.fs.lock().read_inode(self.ino)
-    }
-
-    /// O inode de outro nó deste mesmo sistema de arquivos.
-    fn same_fs(&self, other: &NodeRef) -> Result<u32, Errno> {
-        let other = other.as_any().downcast_ref::<Ext2Node>().ok_or(EXDEV)?;
-        if Arc::ptr_eq(&self.fs, &other.fs) { Ok(other.ino) } else { Err(EXDEV) }
-    }
-}
-
-impl Inode for Ext2Node {
-    fn ino(&self) -> u64 {
-        self.ino as u64
-    }
-
-    fn dev(&self) -> u64 {
-        self.fs.dev
-    }
-
-    fn kind(&self) -> Kind {
-        let Ok(inode) = self.inode() else { return Kind::Special };
-        match inode.file_type() {
-            S_IFREG => Kind::File,
-            S_IFDIR => Kind::Directory,
-            S_IFLNK => Kind::Symlink,
-            S_IFCHR => match Device::from_rdev(self.rdev()) {
-                Some(device) => Kind::Device(device),
-                None => Kind::Special,
-            },
-            _ => Kind::Special,
-        }
-    }
-
-    fn mode(&self) -> u32 {
-        self.inode().map_or(0, |inode| inode.mode() as u32)
-    }
-
-    fn size(&self) -> u64 {
-        self.inode().map_or(0, |inode| inode.size())
-    }
-
-    fn nlink(&self) -> u64 {
-        self.inode().map_or(0, |inode| inode.links() as u64)
-    }
-
-    fn mtime(&self) -> u64 {
-        self.inode().map_or(0, |inode| inode.mtime() as u64)
-    }
-
-    fn set_mtime(&self, seconds: u64) -> Result<(), Errno> {
-        self.fs.writable()?;
-        let mut fs = self.fs.fs.lock();
-        let mut inode = fs.read_inode(self.ino)?;
-        put_u32(&mut inode.0, 16, seconds as u32);
-        fs.write_inode(self.ino, &inode)
-    }
-
-    fn uid(&self) -> u32 {
-        self.inode().map_or(0, |inode| inode.uid())
-    }
-
-    fn gid(&self) -> u32 {
-        self.inode().map_or(0, |inode| inode.gid())
-    }
-
-    fn set_permissions(&self, permissions: u32) -> Result<(), Errno> {
-        self.fs.writable()?;
-        let mut fs = self.fs.fs.lock();
-        let mut inode = fs.read_inode(self.ino)?;
-        let mode = inode.file_type() | (permissions & 0o7777) as u16;
-        put_u16(&mut inode.0, 0, mode);
-        put_u32(&mut inode.0, 12, rtc::now() as u32); // ctime
-        fs.write_inode(self.ino, &inode)
-    }
-
-    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
-        self.fs.writable()?;
-        let mut fs = self.fs.fs.lock();
-        let mut inode = fs.read_inode(self.ino)?;
-        let (uid, gid) = (uid.unwrap_or(inode.uid()), gid.unwrap_or(inode.gid()));
-        inode.set_owner(uid, gid);
-        put_u32(&mut inode.0, 12, rtc::now() as u32); // ctime
-        fs.write_inode(self.ino, &inode)
-    }
-
-    fn rdev(&self) -> u64 {
-        let Ok(inode) = self.inode() else { return 0 };
-        if inode.file_type() != S_IFCHR {
-            return 0;
-        }
-        // Formato antigo (major:minor de 8 bits) no 1º ponteiro, ou o novo no 2º.
-        match (inode.block(0), inode.block(1)) {
-            (0, new) => ((new & 0xFFF00) >> 8 << 8 | (new & 0xFF)) as u64,
-            (old, _) => old as u64 & 0xFFFF,
-        }
-    }
-
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Errno> {
-        if self.kind() == Kind::Directory {
-            return Err(EISDIR);
-        }
-        self.fs.fs.lock().read(self.ino, offset, buf)
-    }
-
-    fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize, Errno> {
-        self.fs.writable()?;
-        if self.kind() == Kind::Directory {
-            return Err(EISDIR);
-        }
-        self.fs.fs.lock().write(self.ino, offset, data)
-    }
-
-    fn truncate(&self, size: u64) -> Result<(), Errno> {
-        self.fs.writable()?;
-        if self.kind() == Kind::Directory {
-            return Err(EISDIR);
-        }
-        self.fs.fs.lock().truncate(self.ino, size)
-    }
-
-    fn lookup(&self, name: &str) -> Result<NodeRef, Errno> {
-        let ino = self.fs.fs.lock().find_entry(self.ino, name)?;
-        Ok(self.node(ino))
-    }
-
-    fn entries(&self) -> Result<Vec<DirEntry>, Errno> {
-        let mut entries = Vec::new();
-        let filetype = self.fs.fs.lock().filetype;
-        let mut raw = Vec::new();
-        self.fs.fs.lock().scan_dir(self.ino, |block, position, ino, name| {
-            if name != b"." && name != b".." {
-                raw.push((block, position, ino, String::from_utf8_lossy(name).into_owned()));
-            }
-            false
-        })?;
-        let mut fs = self.fs.fs.lock();
-        for (block, position, ino, name) in raw {
-            // Com o recurso filetype, o tipo está na própria entrada.
-            let code = if filetype { fs.block(block)?[position + 7] } else { Fs::type_code(fs.read_inode(ino)?.mode()) };
-            let dtype = match code {
-                1 => crate::vfs::DT_REG,
-                2 => crate::vfs::DT_DIR,
-                3 => crate::vfs::DT_CHR,
-                5 => crate::vfs::DT_FIFO,
-                7 => crate::vfs::DT_LNK,
-                _ => 0,
-            };
-            entries.push(DirEntry { name, ino: ino as u64, dtype });
-        }
-        Ok(entries)
-    }
-
-    fn create(&self, name: &str, node: NewNode, permissions: u32) -> Result<NodeRef, Errno> {
-        self.fs.writable()?;
-        let ino = self.fs.fs.lock().create(self.ino, name, &node, permissions)?;
-        Ok(self.node(ino))
-    }
-
-    fn link(&self, name: &str, target: &NodeRef) -> Result<(), Errno> {
-        self.fs.writable()?;
-        let target = self.same_fs(target)?;
-        let mut fs = self.fs.fs.lock();
-        let mode = fs.read_inode(target)?.mode();
-        fs.adjust_links(target, 1)?;
-        fs.add_entry(self.ino, name, target, mode)
-    }
-
-    fn unlink(&self, name: &str, directory: bool) -> Result<(), Errno> {
-        self.fs.writable()?;
-        self.fs.fs.lock().unlink(self.ino, name, directory)
-    }
-
-    fn rename(&self, name: &str, new_dir: &NodeRef, new_name: &str) -> Result<(), Errno> {
-        self.fs.writable()?;
-        let new_dir = self.same_fs(new_dir)?;
-        self.fs.fs.lock().rename(self.ino, name, new_dir, new_name)
-    }
-
-    fn readlink(&self) -> Result<String, Errno> {
-        let inode = self.inode()?;
-        if inode.file_type() != S_IFLNK {
-            return Err(EINVAL);
-        }
-        let size = inode.size() as usize;
-        let bytes = if inode.is_fast_symlink() {
-            inode.0[40..40 + size].to_vec()
-        } else {
-            let mut data = vec![0; size];
-            let n = self.fs.fs.lock().read(self.ino, 0, &mut data)?;
-            data.truncate(n);
-            data
-        };
-        String::from_utf8(bytes).map_err(|_| EINVAL)
-    }
-
-    fn unmount(&self) {
-        if self.fs.read_only {
-            return;
-        }
-        let mut fs = self.fs.fs.lock();
-        let state = u16_at(&fs.superblock, 58) | STATE_CLEAN;
-        put_u16(&mut fs.superblock, 58, state);
-        put_u32(&mut fs.superblock, 48, rtc::now() as u32); // s_wtime
-        let _ = fs.write_superblock();
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }

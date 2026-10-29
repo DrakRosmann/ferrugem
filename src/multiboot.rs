@@ -1,101 +1,130 @@
-//! Leitura da estrutura de informação Multiboot (v1) entregue pelo carregador.
-//! Tudo é copiado para cá, porque a memória original será reaproveitada.
+//! Leitura da estrutura de informações que o bootloader Multiboot nos entrega.
+//!
+//! O ponteiro chega em EBX no boot (e vira o 2º argumento de `kmain`).
+//! O campo `flags` diz quais campos são válidos. Referência:
+//! https://www.gnu.org/software/grub/manual/multiboot/multiboot.html
 
-use crate::paging::phys_to_virt;
+use core::ptr::read_unaligned;
 
-const MAX_REGIONS: usize = 32;
+pub const MAGICO: u32 = 0x2BADB002;
 
-#[derive(Clone, Copy, Default)]
-pub struct MemoryRegion {
-    pub base: u64,
-    pub length: u64,
-    /// 1 = utilizável; os demais valores são reservados.
-    pub kind: u32,
+#[derive(Clone, Copy)]
+pub struct Info {
+    base: usize,
 }
 
-pub struct BootInfo {
-    regions: [MemoryRegion; MAX_REGIONS],
-    region_count: usize,
-    loader_name: [u8; 64],
-    loader_name_len: usize,
-    cmdline: [u8; 128],
-    cmdline_len: usize,
+/// Uma região de memória física, como informada pelo firmware (BIOS e820).
+pub struct RegiaoMemoria {
+    pub inicio: u64,
+    pub tamanho: u64,
+    pub tipo: u32,
 }
 
-/// Lê da memória física, pelo mapa direto.
-unsafe fn read<T: Copy>(addr: u64) -> T {
-    unsafe { phys_to_virt::<T>(addr).read_unaligned() }
-}
-
-unsafe fn copy_cstr(addr: u64, out: &mut [u8]) -> usize {
-    let mut len = 0;
-    while len < out.len() {
-        let byte = unsafe { read::<u8>(addr + len as u64) };
-        if byte == 0 {
-            break;
-        }
-        out[len] = byte;
-        len += 1;
-    }
-    len
-}
-
-impl BootInfo {
+impl Info {
     /// # Safety
-    /// `addr` precisa apontar para uma estrutura Multiboot válida.
-    pub unsafe fn parse(addr: u32) -> Self {
-        let addr = addr as u64;
-        let mut info = Self {
-            regions: [MemoryRegion::default(); MAX_REGIONS],
-            region_count: 0,
-            loader_name: [0; 64],
-            loader_name_len: 0,
-            cmdline: [0; 128],
-            cmdline_len: 0,
-        };
+    /// `endereco` precisa ser o ponteiro válido recebido do bootloader,
+    /// e a memória precisa estar mapeada (estamos com identidade em 1 GiB).
+    pub unsafe fn de_endereco(endereco: u32) -> Self {
+        Self { base: endereco as usize }
+    }
+
+    fn u32_em(&self, deslocamento: usize) -> u32 {
+        unsafe { read_unaligned((self.base + deslocamento) as *const u32) }
+    }
+
+    fn flags(&self) -> u32 {
+        self.u32_em(0)
+    }
+
+    pub fn nome_bootloader(&self) -> Option<&'static str> {
+        if self.flags() & (1 << 9) == 0 {
+            return None;
+        }
+        let ptr = self.u32_em(64) as usize as *const u8;
+        // String no estilo C: vai até o primeiro byte zero.
+        let mut tamanho = 0;
         unsafe {
-            let flags: u32 = read(addr);
-            if flags & (1 << 2) != 0 {
-                let ptr: u32 = read(addr + 16);
-                info.cmdline_len = copy_cstr(ptr as u64, &mut info.cmdline);
+            while *ptr.add(tamanho) != 0 && tamanho < 256 {
+                tamanho += 1;
             }
-            if flags & (1 << 6) != 0 {
-                let length: u32 = read(addr + 44);
-                let mut entry = read::<u32>(addr + 48) as u64;
-                let end = entry + length as u64;
-                while entry < end && info.region_count < MAX_REGIONS {
-                    let size: u32 = read(entry);
-                    info.regions[info.region_count] = MemoryRegion {
-                        base: read(entry + 4),
-                        length: read(entry + 12),
-                        kind: read(entry + 20),
-                    };
-                    info.region_count += 1;
-                    entry += size as u64 + 4;
-                }
-            } else if flags & 1 != 0 {
-                // Sem mapa de memória: usa só a memória "alta" a partir de 1 MiB.
-                let upper_kib: u32 = read(addr + 8);
-                info.regions[0] = MemoryRegion { base: 0x100000, length: upper_kib as u64 * 1024, kind: 1 };
-                info.region_count = 1;
+            core::str::from_utf8(core::slice::from_raw_parts(ptr, tamanho)).ok()
+        }
+    }
+
+    /// Itera sobre o mapa de memória. Esse mapa é a base para, no próximo passo,
+    /// escrever um alocador de páginas físicas.
+    pub fn mapa_memoria(&self) -> Option<IterMapa> {
+        if self.flags() & (1 << 6) == 0 {
+            return None;
+        }
+        let tamanho = self.u32_em(44) as usize;
+        let inicio = self.u32_em(48) as usize;
+        Some(IterMapa { atual: inicio, fim: inicio + tamanho })
+    }
+}
+
+/// Um arquivo que o bootloader carregou junto com o kernel (o nosso initrd).
+pub struct Modulo {
+    pub inicio: u64,
+    pub fim: u64,
+}
+
+impl Info {
+    pub fn modulos(&self) -> impl Iterator<Item = Modulo> + '_ {
+        let quantidade = if self.flags() & (1 << 3) != 0 { self.u32_em(20) as usize } else { 0 };
+        let tabela = self.u32_em(24) as usize;
+        (0..quantidade).map(move |i| unsafe {
+            Modulo {
+                inicio: read_unaligned((tabela + i * 16) as *const u32) as u64,
+                fim: read_unaligned((tabela + i * 16 + 4) as *const u32) as u64,
             }
-            if flags & (1 << 9) != 0 {
-                let ptr: u32 = read(addr + 64);
-                info.loader_name_len = copy_cstr(ptr as u64, &mut info.loader_name);
+        })
+    }
+
+    /// Chama `f(início, fim)` para cada área de memória que o bootloader usou
+    /// e que o alocador de quadros não pode entregar para ninguém.
+    pub fn reservas(&self, mut f: impl FnMut(u64, u64)) {
+        let base = self.base as u64;
+        f(base, base + 120);
+        if self.flags() & (1 << 6) != 0 {
+            let mapa = self.u32_em(48) as u64;
+            f(mapa, mapa + self.u32_em(44) as u64);
+        }
+        if self.flags() & (1 << 3) != 0 {
+            let tabela = self.u32_em(24) as u64;
+            f(tabela, tabela + self.u32_em(20) as u64 * 16);
+            for m in self.modulos() {
+                f(m.inicio, m.fim);
             }
         }
-        info
     }
+}
 
-    pub fn regions(&self) -> &[MemoryRegion] {
-        &self.regions[..self.region_count]
-    }
+pub struct IterMapa {
+    atual: usize,
+    fim: usize,
+}
 
-    pub fn loader_name(&self) -> &str {
-        core::str::from_utf8(&self.loader_name[..self.loader_name_len]).unwrap_or("?")
-    }
+impl Iterator for IterMapa {
+    type Item = RegiaoMemoria;
 
-    pub fn cmdline(&self) -> &str {
-        core::str::from_utf8(&self.cmdline[..self.cmdline_len]).unwrap_or("")
+    fn next(&mut self) -> Option<RegiaoMemoria> {
+        if self.atual >= self.fim {
+            return None;
+        }
+        // Formato de cada entrada: size(u32) base(u64) len(u64) type(u32)
+        // `size` não conta a si mesmo, por isso o "+ 4" no avanço.
+        let p = self.atual;
+        let entrada = unsafe {
+            let size = read_unaligned(p as *const u32) as usize;
+            let regiao = RegiaoMemoria {
+                inicio: read_unaligned((p + 4) as *const u64),
+                tamanho: read_unaligned((p + 12) as *const u64),
+                tipo: read_unaligned((p + 20) as *const u32),
+            };
+            self.atual += size + 4;
+            regiao
+        };
+        Some(entrada)
     }
 }

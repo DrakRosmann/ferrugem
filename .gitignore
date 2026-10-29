@@ -1,2 +1,8 @@
 /target
-/user/target
+/usuario/target
+/build
+Cargo.lock
+/disco.img
+/ferramentas/musl
+/ferramentas/fontes
+/ferramentas/lua

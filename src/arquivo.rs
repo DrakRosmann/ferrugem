@@ -1,0 +1,256 @@
+//! Arquivos abertos e pipes.
+//!
+//! No Unix, `open` devolve um número (o descritor, `fd`) que indexa a tabela
+//! de arquivos do processo. Cada entrada aponta para um `Arquivo` aberto,
+//! que guarda a posição de leitura/escrita. Depois de um `fork`, pai e filho
+//! *compartilham* o mesmo `Arquivo` (por isso é um `Arc`): é assim que o
+//! shell passa o terminal e os pipes para os programas que executa.
+
+use crate::erro::*;
+use crate::processo;
+use crate::spin::Mutex;
+use crate::tty;
+use crate::vfs::{self, Cred, Dispositivo, Meta, Vnode};
+use crate::rtc;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+pub const O_ACESSO: u64 = 3;
+pub const O_RDONLY: u64 = 0;
+pub const O_WRONLY: u64 = 1;
+pub const O_CREAT: u64 = 0o100;
+pub const O_EXCL: u64 = 0o200;
+pub const O_TRUNC: u64 = 0o1000;
+pub const O_APPEND: u64 = 0o2000;
+pub const O_DIRECTORY: u64 = 0o200000;
+
+pub enum Tipo {
+    No(Vnode),
+    LeituraPipe(Arc<Pipe>),
+    EscritaPipe(Arc<Pipe>),
+}
+
+pub struct Arquivo {
+    pub tipo: Tipo,
+    pub posicao: Mutex<u64>,
+    flags: u64,
+}
+
+impl Arquivo {
+    /// `permissoes`: as de um arquivo novo, se `O_CREAT` precisar criá-lo.
+    pub fn abrir(caminho: &str, flags: u64, cred: Cred, permissoes: u32) -> Result<Arc<Arquivo>, i64> {
+        let escrita = flags & O_ACESSO != O_RDONLY;
+        let no = match vfs::buscar_como(caminho, cred) {
+            Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
+            Ok(no) => {
+                let acesso = match flags & O_ACESSO {
+                    O_RDONLY => vfs::LER,
+                    O_WRONLY => vfs::ESCREVER,
+                    _ => vfs::LER | vfs::ESCREVER,
+                };
+                no.permite(cred, acesso)?;
+                no
+            }
+            Err(ENOENT) if flags & O_CREAT != 0 => {
+                // Criar um arquivo é escrever no diretório.
+                let (pai, _) = vfs::separar(caminho)?;
+                vfs::buscar_como(pai, cred)?.permite(cred, vfs::ESCREVER | vfs::EXECUTAR)?;
+                let meta = Meta { permissoes, uid: cred.uid, gid: cred.gid, modificado: rtc::agora() };
+                vfs::criar(caminho, false, meta)?
+            }
+            Err(e) => return Err(e),
+        };
+        match no.tipo()? {
+            vfs::Tipo::Diretorio if escrita => return Err(EISDIR),
+            vfs::Tipo::Diretorio => {}
+            _ if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+            vfs::Tipo::Arquivo if escrita && flags & O_TRUNC != 0 => no.truncar()?,
+            _ => {}
+        }
+        Ok(Arc::new(Arquivo { tipo: Tipo::No(no), posicao: Mutex::new(0), flags }))
+    }
+
+    pub fn ler(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        if self.flags & O_ACESSO == O_WRONLY {
+            return Err(EBADF);
+        }
+        let no = match &self.tipo {
+            Tipo::LeituraPipe(pipe) => return pipe.ler(buf),
+            Tipo::EscritaPipe(_) => return Err(EBADF),
+            Tipo::No(no) => no,
+        };
+        match no.tipo()? {
+            vfs::Tipo::Arquivo => {
+                let mut posicao = self.posicao.lock();
+                let n = no.ler(*posicao, buf)?;
+                *posicao += n as u64;
+                Ok(n)
+            }
+            vfs::Tipo::Diretorio => Err(EISDIR),
+            // Ler o terminal pode dormir até alguém digitar.
+            vfs::Tipo::Dispositivo(Dispositivo::Terminal) => tty::ler(buf),
+            vfs::Tipo::Dispositivo(Dispositivo::Nulo) => Ok(0),
+            vfs::Tipo::Dispositivo(Dispositivo::Zero) => {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    pub fn escrever(&self, dados: &[u8]) -> Result<usize, i64> {
+        if self.flags & O_ACESSO == O_RDONLY {
+            return Err(EBADF);
+        }
+        let no = match &self.tipo {
+            Tipo::EscritaPipe(pipe) => return pipe.escrever(dados),
+            Tipo::LeituraPipe(_) => return Err(EBADF),
+            Tipo::No(no) => no,
+        };
+        match no.tipo()? {
+            vfs::Tipo::Arquivo => {
+                let mut posicao = self.posicao.lock();
+                if self.flags & O_APPEND != 0 {
+                    *posicao = no.tamanho()?;
+                }
+                let n = no.escrever(*posicao, dados)?;
+                *posicao += n as u64;
+                Ok(n)
+            }
+            vfs::Tipo::Diretorio => Err(EISDIR),
+            vfs::Tipo::Dispositivo(Dispositivo::Terminal) => {
+                tty::escrever(dados);
+                Ok(dados.len())
+            }
+            vfs::Tipo::Dispositivo(_) => Ok(dados.len()),
+        }
+    }
+
+    pub fn flags(&self) -> u64 {
+        self.flags
+    }
+
+    /// `lseek`: 0 = a partir do início, 1 = da posição atual, 2 = do fim.
+    pub fn posicionar(&self, deslocamento: i64, referencia: u64) -> Result<u64, i64> {
+        let Tipo::No(no) = &self.tipo else { return Err(ESPIPE) };
+        let tamanho = match no.tipo()? {
+            vfs::Tipo::Arquivo => no.tamanho()? as i64,
+            vfs::Tipo::Diretorio => 0,
+            vfs::Tipo::Dispositivo(_) => return Err(ESPIPE),
+        };
+        let mut posicao = self.posicao.lock();
+        let base = match referencia {
+            0 => 0,
+            1 => *posicao as i64,
+            2 => tamanho,
+            _ => return Err(EINVAL),
+        };
+        let nova = base.checked_add(deslocamento).filter(|&p| p >= 0).ok_or(EINVAL)?;
+        *posicao = nova as u64;
+        Ok(nova as u64)
+    }
+}
+
+impl Drop for Arquivo {
+    /// Quando a última referência a uma ponta de pipe some, a outra ponta
+    /// precisa saber (leitura recebe fim de arquivo; escrita recebe EPIPE).
+    fn drop(&mut self) {
+        match &self.tipo {
+            Tipo::LeituraPipe(pipe) => {
+                pipe.leitores.fetch_sub(1, Ordering::Relaxed);
+                processo::acordar(pipe.canal());
+            }
+            Tipo::EscritaPipe(pipe) => {
+                pipe.escritores.fetch_sub(1, Ordering::Relaxed);
+                processo::acordar(pipe.canal());
+            }
+            Tipo::No(_) => {}
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Pipes
+// -----------------------------------------------------------------------------
+
+const CAPACIDADE_PIPE: usize = 4096;
+
+/// Um buffer circular entre dois processos. Quem lê de um pipe vazio dorme
+/// até alguém escrever; quem escreve num pipe cheio dorme até alguém ler.
+pub struct Pipe {
+    dados: Mutex<VecDeque<u8>>,
+    leitores: AtomicUsize,
+    escritores: AtomicUsize,
+}
+
+impl Pipe {
+    /// (ponta de leitura, ponta de escrita)
+    pub fn novo() -> (Arc<Arquivo>, Arc<Arquivo>) {
+        let pipe = Arc::new(Pipe {
+            dados: Mutex::new(VecDeque::new()),
+            leitores: AtomicUsize::new(1),
+            escritores: AtomicUsize::new(1),
+        });
+        let ponta = |tipo, flags| Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags });
+        (
+            ponta(Tipo::LeituraPipe(pipe.clone()), O_RDONLY),
+            ponta(Tipo::EscritaPipe(pipe), O_WRONLY),
+        )
+    }
+
+    /// O "canal" onde leitores e escritores dormem: o endereço do próprio pipe.
+    fn canal(&self) -> usize {
+        self as *const Pipe as usize
+    }
+
+    fn ler(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        loop {
+            {
+                let mut dados = self.dados.lock();
+                if !dados.is_empty() {
+                    let n = buf.len().min(dados.len());
+                    for (destino, byte) in buf.iter_mut().zip(dados.drain(..n)) {
+                        *destino = byte;
+                    }
+                    processo::acordar(self.canal());
+                    return Ok(n);
+                }
+            }
+            if self.escritores.load(Ordering::Relaxed) == 0 {
+                return Ok(0); // ninguém mais vai escrever: fim de arquivo
+            }
+            if processo::tem_sinal_pendente() {
+                return Err(EINTR);
+            }
+            processo::dormir(self.canal());
+        }
+    }
+
+    fn escrever(&self, dados: &[u8]) -> Result<usize, i64> {
+        let mut escritos = 0;
+        while escritos < dados.len() {
+            if self.leitores.load(Ordering::Relaxed) == 0 {
+                // Escrever num pipe sem leitor mata o processo com SIGPIPE,
+                // como no Unix (é o que encerra `programa | head`).
+                processo::enviar_sinal(processo::atual().pid, processo::SIGPIPE).ok();
+                return if escritos > 0 { Ok(escritos) } else { Err(EPIPE) };
+            }
+            {
+                let mut fila = self.dados.lock();
+                let espaco = CAPACIDADE_PIPE - fila.len();
+                if espaco > 0 {
+                    let n = espaco.min(dados.len() - escritos);
+                    fila.extend(&dados[escritos..escritos + n]);
+                    escritos += n;
+                    processo::acordar(self.canal());
+                    continue;
+                }
+            }
+            if processo::tem_sinal_pendente() {
+                return if escritos > 0 { Ok(escritos) } else { Err(EINTR) };
+            }
+            processo::dormir(self.canal());
+        }
+        Ok(escritos)
+    }
+}

@@ -1,1 +1,0 @@
-Feito em Rust, sem std, sem crates externos.

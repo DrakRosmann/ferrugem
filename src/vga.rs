@@ -1,440 +1,253 @@
-//! Modo texto VGA 80x25. A linha 0 é a barra de status; o terminal usa o resto.
+//! Driver de tela em modo texto VGA (80 x 25).
+//!
+//! Em modo texto, a placa de vídeo lê a tela direto da memória a partir do
+//! endereço físico 0xB8000. Cada célula ocupa 2 bytes:
+//!
+//!   byte 0: o caractere (no conjunto de caracteres "code page 437", não UTF-8!)
+//!   byte 1: a cor  -> 4 bits de fundo | 4 bits de frente
+//!
+//! Escrever na tela é literalmente escrever nesse array.
+//!
+//! Também entendemos um pedaço das sequências de escape ANSI (as mesmas que
+//! um terminal Linux entende), para que os programas usem cores e limpem a
+//! tela do mesmo jeito na VGA e na serial:
+//!
+//! ```text
+//!   ESC [ 2 J        limpa a tela
+//!   ESC [ 0 m        cor padrão
+//!   ESC [ 1 m        cores claras
+//!   ESC [ 3x m       cor do texto (30 preto ... 37 branco; 90..97 claras)
+//! ```
 
+use crate::interrupcoes;
+use crate::porta::outb;
+use crate::spin::Mutex;
 use core::fmt;
+use core::ptr::{read_volatile, write_volatile};
 
-use crate::cpu::outb;
-use crate::paging::PHYS_OFFSET;
-use crate::sync::SpinLock;
-
-pub const WIDTH: usize = 80;
-pub const HEIGHT: usize = 25;
-const TOP: usize = 1;
-const BUFFER: *mut u16 = (PHYS_OFFSET + 0xB8000) as *mut u16;
+const LARGURA: usize = 80;
+const ALTURA: usize = 25;
+const BUFFER: *mut u16 = 0xB8000 as *mut u16;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Color {
-    Black = 0,
-    Blue = 1,
-    Green = 2,
-    Cyan = 3,
-    Red = 4,
+pub enum Cor {
+    Preto = 0,
+    Azul = 1,
+    Verde = 2,
+    Ciano = 3,
+    Vermelho = 4,
     Magenta = 5,
-    Brown = 6,
-    LightGray = 7,
-    DarkGray = 8,
-    LightBlue = 9,
-    LightGreen = 10,
-    LightCyan = 11,
-    LightRed = 12,
-    Pink = 13,
-    Yellow = 14,
-    White = 15,
+    Marrom = 6,
+    CinzaClaro = 7,
+    CinzaEscuro = 8,
+    AzulClaro = 9,
+    VerdeClaro = 10,
+    CianoClaro = 11,
+    VermelhoClaro = 12,
+    Rosa = 13,
+    Amarelo = 14,
+    Branco = 15,
 }
 
-impl Color {
-    pub const ALL: [Color; 16] = [
-        Color::Black,
-        Color::Blue,
-        Color::Green,
-        Color::Cyan,
-        Color::Red,
-        Color::Magenta,
-        Color::Brown,
-        Color::LightGray,
-        Color::DarkGray,
-        Color::LightBlue,
-        Color::LightGreen,
-        Color::LightCyan,
-        Color::LightRed,
-        Color::Pink,
-        Color::Yellow,
-        Color::White,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Color::Black => "preto",
-            Color::Blue => "azul",
-            Color::Green => "verde",
-            Color::Cyan => "ciano",
-            Color::Red => "vermelho",
-            Color::Magenta => "magenta",
-            Color::Brown => "marrom",
-            Color::LightGray => "cinza",
-            Color::DarkGray => "cinza-escuro",
-            Color::LightBlue => "azul-claro",
-            Color::LightGreen => "verde-claro",
-            Color::LightCyan => "ciano-claro",
-            Color::LightRed => "vermelho-claro",
-            Color::Pink => "rosa",
-            Color::Yellow => "amarelo",
-            Color::White => "branco",
-        }
-    }
-
-    /// Código ANSI equivalente, para espelhar a cor no terminal serial.
-    pub fn ansi(self) -> u8 {
-        const MAP: [u8; 16] = [30, 34, 32, 36, 31, 35, 33, 37, 90, 94, 92, 96, 91, 95, 93, 97];
-        MAP[self as usize]
-    }
+const fn atributo(frente: Cor, fundo: Cor) -> u8 {
+    ((fundo as u8) << 4) | (frente as u8)
 }
 
-pub const fn attr(fg: Color, bg: Color) -> u8 {
-    (bg as u8) << 4 | fg as u8
-}
+const COR_PADRAO: u8 = atributo(Cor::CinzaClaro, Cor::Preto);
 
-pub const DEFAULT_ATTR: u8 = attr(Color::LightGray, Color::Black);
-pub const STATUS_ATTR: u8 = attr(Color::White, Color::Blue);
-
-/// Estado do interpretador de sequências ANSI: `ESC [ parâmetros letra`
-/// (CSI, com `?` nas sequências privadas) ou `ESC letra`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Escape {
-    None,
-    Started,
-    Params { values: [u16; 8], count: usize, private: bool },
+    Nenhum,
+    Esc,      // veio ESC
+    Csi,      // veio ESC [
 }
 
-pub struct Writer {
-    row: usize,
-    col: usize,
-    attr: u8,
+pub struct Tela {
+    coluna: usize,
+    cor: u8,
     escape: Escape,
-    /// Posição guardada por `ESC 7` / `ESC[s`.
-    saved: (usize, usize),
+    parametros: [u16; 4],
+    quantos: usize,
 }
 
-pub static WRITER: SpinLock<Writer> = SpinLock::new(Writer {
-    row: TOP,
-    col: 0,
-    attr: DEFAULT_ATTR,
-    escape: Escape::None,
-    saved: (TOP, 0),
-});
-
-pub fn put(row: usize, col: usize, byte: u8, attr: u8) {
-    if row < HEIGHT && col < WIDTH {
-        unsafe { BUFFER.add(row * WIDTH + col).write_volatile((attr as u16) << 8 | byte as u16) }
-    }
-}
-
-fn get(row: usize, col: usize) -> u16 {
-    unsafe { BUFFER.add(row * WIDTH + col).read_volatile() }
-}
-
-/// Escreve um texto na barra de status, a partir da coluna `col`.
-pub fn status_text(col: usize, text: &str, attr: u8) {
-    for (i, ch) in text.chars().enumerate() {
-        put(0, col + i, to_cp437(ch), attr);
-    }
-}
-
-pub fn init() {
-    for col in 0..WIDTH {
-        put(0, col, b' ', STATUS_ATTR);
-    }
-    WRITER.lock().clear();
-}
-
-impl Writer {
-    pub fn set_attr(&mut self, attr: u8) {
-        self.attr = attr;
+impl Tela {
+    const fn new() -> Self {
+        Self { coluna: 0, cor: COR_PADRAO, escape: Escape::Nenhum, parametros: [0; 4], quantos: 0 }
     }
 
-    pub fn clear(&mut self) {
-        for row in TOP..HEIGHT {
-            self.clear_row(row);
-        }
-        self.row = TOP;
-        self.col = 0;
-        self.update_cursor();
-    }
-
-    fn clear_row(&self, row: usize) {
-        for col in 0..WIDTH {
-            put(row, col, b' ', self.attr);
-        }
-    }
-
-    fn newline(&mut self) {
-        self.col = 0;
-        if self.row + 1 < HEIGHT {
-            self.row += 1;
-        } else {
-            for row in TOP + 1..HEIGHT {
-                for col in 0..WIDTH {
-                    unsafe { BUFFER.add((row - 1) * WIDTH + col).write_volatile(get(row, col)) }
-                }
+    /// Consome um caractere de uma sequência de escape. Devolve `false` se
+    /// o caractere não faz parte de nenhuma (e deve ser escrito).
+    fn escape(&mut self, c: char) -> bool {
+        match self.escape {
+            Escape::Nenhum if c == '\x1b' => self.escape = Escape::Esc,
+            Escape::Nenhum => return false,
+            Escape::Esc if c == '[' => {
+                self.escape = Escape::Csi;
+                self.parametros = [0; 4];
+                self.quantos = 0;
             }
-            self.clear_row(HEIGHT - 1);
+            Escape::Esc => self.escape = Escape::Nenhum,
+            Escape::Csi => match c {
+                '0'..='9' => {
+                    let i = self.quantos.min(3);
+                    self.parametros[i] = self.parametros[i].saturating_mul(10) + c as u16 - '0' as u16;
+                }
+                ';' => self.quantos += 1,
+                _ => {
+                    self.escape = Escape::Nenhum;
+                    let n = (self.quantos + 1).min(4);
+                    let parametros = self.parametros;
+                    match c {
+                        'm' => parametros[..n].iter().for_each(|&p| self.sgr(p)),
+                        'J' if parametros[0] == 2 => self.limpar(),
+                        _ => {} // movimentos de cursor etc.: ignorados
+                    }
+                }
+            },
+        }
+        true
+    }
+
+    /// "Select Graphic Rendition": muda a cor.
+    fn sgr(&mut self, parametro: u16) {
+        // ANSI numera preto, vermelho, verde, amarelo, azul, magenta, ciano, branco;
+        // a VGA usa outra ordem.
+        const ANSI_PARA_VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
+        let fundo = self.cor & 0xF0;
+        match parametro {
+            0 => self.cor = COR_PADRAO,
+            1 => self.cor |= 0x08,
+            30..=37 => self.cor = fundo | ANSI_PARA_VGA[(parametro - 30) as usize] | (self.cor & 0x08),
+            39 => self.cor = fundo | (COR_PADRAO & 0x0F),
+            90..=97 => self.cor = fundo | ANSI_PARA_VGA[(parametro - 90) as usize] | 0x08,
+            _ => {}
         }
     }
 
-    pub fn write_byte(&mut self, byte: u8) {
+    fn celula(&self, byte: u8) -> u16 {
+        ((self.cor as u16) << 8) | byte as u16
+    }
+
+    fn por(&self, linha: usize, coluna: usize, valor: u16) {
+        // `write_volatile` impede o compilador de "otimizar fora" a escrita:
+        // para ele, ninguém lê essa memória — mas a placa de vídeo lê!
+        unsafe { write_volatile(BUFFER.add(linha * LARGURA + coluna), valor) }
+    }
+
+    fn ler(&self, linha: usize, coluna: usize) -> u16 {
+        unsafe { read_volatile(BUFFER.add(linha * LARGURA + coluna)) }
+    }
+
+    pub fn definir_cor(&mut self, frente: Cor, fundo: Cor) {
+        self.cor = atributo(frente, fundo);
+    }
+
+    pub fn limpar(&mut self) {
+        let vazio = self.celula(b' ');
+        for linha in 0..ALTURA {
+            for coluna in 0..LARGURA {
+                self.por(linha, coluna, vazio);
+            }
+        }
+        self.coluna = 0;
+    }
+
+    /// Sempre escrevemos na última linha; ao quebrar a linha, rolamos tudo para cima.
+    fn nova_linha(&mut self) {
+        for linha in 1..ALTURA {
+            for coluna in 0..LARGURA {
+                let c = self.ler(linha, coluna);
+                self.por(linha - 1, coluna, c);
+            }
+        }
+        let vazio = self.celula(b' ');
+        for coluna in 0..LARGURA {
+            self.por(ALTURA - 1, coluna, vazio);
+        }
+        self.coluna = 0;
+    }
+
+    pub fn escrever_byte(&mut self, byte: u8) {
         match byte {
-            b'\n' => self.newline(),
-            b'\r' => self.col = 0,
-            0x08 => self.col = self.col.saturating_sub(1),
-            b'\t' => {
-                for _ in 0..4 - self.col % 4 {
-                    self.write_byte(b' ');
-                }
-            }
+            b'\n' => self.nova_linha(),
+            // Backspace só recua o cursor; quem quiser apagar escreve "\x08 \x08".
+            0x08 => self.coluna = self.coluna.saturating_sub(1),
             byte => {
-                if self.col >= WIDTH {
-                    self.newline();
+                if self.coluna >= LARGURA {
+                    self.nova_linha();
                 }
-                put(self.row, self.col, byte, self.attr);
-                self.col += 1;
+                let c = self.celula(byte);
+                self.por(ALTURA - 1, self.coluna, c);
+                self.coluna += 1;
             }
         }
     }
 
-    /// Processa um caractere, interpretando as sequências ANSI de um
-    /// terminal "linux"/"vt100": cores, posição do cursor, apagar e inserir
-    /// linhas e caracteres. É o bastante para editores como o `vi`.
-    fn write_char(&mut self, ch: char) {
-        match (self.escape, ch) {
-            (Escape::None, '\x1b') => self.escape = Escape::Started,
-            (Escape::None, ch) => self.write_byte(to_cp437(ch)),
-            (Escape::Started, '[') => self.escape = Escape::Params { values: [0; 8], count: 0, private: false },
-            (Escape::Started, ch) => {
-                self.escape = Escape::None;
-                match ch {
-                    '7' => self.saved = (self.row, self.col),
-                    '8' => (self.row, self.col) = self.saved,
-                    'M' => self.reverse_index(),
-                    'D' => self.newline_keep_column(),
-                    'c' => {
-                        self.attr = DEFAULT_ATTR;
-                        self.clear();
-                    }
-                    _ => {}
-                }
-            }
-            (Escape::Params { values, count, .. }, '?') if count == 0 && values[0] == 0 => {
-                self.escape = Escape::Params { values, count, private: true };
-            }
-            (Escape::Params { mut values, count, private }, '0'..='9') => {
-                if count < values.len() {
-                    values[count] = values[count].saturating_mul(10).saturating_add(ch as u16 - '0' as u16);
-                }
-                self.escape = Escape::Params { values, count, private };
-            }
-            (Escape::Params { values, count, private }, ';') => {
-                self.escape = Escape::Params { values, count: (count + 1).min(values.len()), private }
-            }
-            (Escape::Params { values, count, private }, command) => {
-                self.escape = Escape::None;
-                if !private {
-                    // Sequências privadas (`ESC[?25l`, mostrar/esconder o
-                    // cursor...) são ignoradas.
-                    self.apply_escape(command, &values[..(count + 1).min(values.len())]);
-                }
-            }
-        }
-    }
-
-    /// Linhas e colunas na tela: as linhas do terminal vão de TOP a HEIGHT-1.
-    fn move_to(&mut self, row: usize, col: usize) {
-        self.row = row.clamp(TOP, HEIGHT - 1);
-        self.col = col.min(WIDTH - 1);
-    }
-
-    fn copy_row(&self, from: usize, to: usize) {
-        for col in 0..WIDTH {
-            unsafe { BUFFER.add(to * WIDTH + col).write_volatile(get(from, col)) }
-        }
-    }
-
-    /// Insere `count` linhas em branco na linha do cursor (as de baixo descem).
-    fn insert_lines(&mut self, count: usize) {
-        let count = count.min(HEIGHT - self.row);
-        for row in (self.row + count..HEIGHT).rev() {
-            self.copy_row(row - count, row);
-        }
-        for row in self.row..self.row + count {
-            self.clear_row(row);
-        }
-    }
-
-    /// Apaga `count` linhas a partir do cursor (as de baixo sobem).
-    fn delete_lines(&mut self, count: usize) {
-        let count = count.min(HEIGHT - self.row);
-        for row in self.row..HEIGHT - count {
-            self.copy_row(row + count, row);
-        }
-        for row in HEIGHT - count..HEIGHT {
-            self.clear_row(row);
-        }
-    }
-
-    /// `ESC M`: sobe uma linha; no topo, a tela rola para baixo.
-    fn reverse_index(&mut self) {
-        if self.row > TOP {
-            self.row -= 1;
-        } else {
-            self.insert_lines(1);
-        }
-    }
-
-    fn newline_keep_column(&mut self) {
-        let col = self.col;
-        self.newline();
-        self.col = col;
-    }
-
-    fn erase(&self, row: usize, cols: core::ops::Range<usize>) {
-        for col in cols {
-            put(row, col, b' ', self.attr);
-        }
-    }
-
-    fn apply_escape(&mut self, command: char, params: &[u16]) {
-        // Ordem ANSI (preto, vermelho, verde, amarelo, azul, magenta, ciano,
-        // branco) nos índices de cor da VGA.
-        const ANSI_TO_VGA: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
-        let first = params[0] as usize;
-        let n = first.max(1); // contagem, com 1 como padrão
-        match command {
-            'm' => {
-                for &p in params {
-                    let p = p as u8;
-                    self.attr = match p {
-                        0 => DEFAULT_ATTR,
-                        1 => self.attr | 0x08,
-                        22 => self.attr & !0x08,
-                        7 => self.attr.rotate_left(4), // vídeo reverso: troca frente e fundo
-                        27 => DEFAULT_ATTR,
-                        30..=37 => (self.attr & 0xF8) | ANSI_TO_VGA[(p - 30) as usize],
-                        90..=97 => (self.attr & 0xF0) | ANSI_TO_VGA[(p - 90) as usize] | 0x08,
-                        39 => (self.attr & 0xF0) | (DEFAULT_ATTR & 0x0F),
-                        40..=47 => (self.attr & 0x0F) | ANSI_TO_VGA[(p - 40) as usize] << 4,
-                        49 => (self.attr & 0x0F) | (DEFAULT_ATTR & 0xF0),
-                        _ => self.attr,
-                    };
-                }
-            }
-            'H' | 'f' => {
-                let col = params.get(1).copied().unwrap_or(0).max(1) as usize;
-                self.move_to(TOP + n - 1, col - 1);
-            }
-            'A' => self.move_to(self.row.saturating_sub(n).max(TOP), self.col),
-            'B' => self.move_to(self.row + n, self.col),
-            'C' => self.move_to(self.row, self.col + n),
-            'D' => self.move_to(self.row, self.col.saturating_sub(n)),
-            'G' => self.move_to(self.row, n - 1),
-            'd' => self.move_to(TOP + n - 1, self.col),
-            'J' => {
-                let (row, col) = (self.row, self.col.min(WIDTH));
-                match first {
-                    0 => {
-                        self.erase(row, col..WIDTH);
-                        (row + 1..HEIGHT).for_each(|r| self.clear_row(r));
-                    }
-                    1 => {
-                        (TOP..row).for_each(|r| self.clear_row(r));
-                        self.erase(row, 0..(col + 1).min(WIDTH));
-                    }
-                    _ => (TOP..HEIGHT).for_each(|r| self.clear_row(r)),
-                }
-            }
-            'K' => {
-                let col = self.col.min(WIDTH);
-                match first {
-                    0 => self.erase(self.row, col..WIDTH),
-                    1 => self.erase(self.row, 0..(col + 1).min(WIDTH)),
-                    _ => self.clear_row(self.row),
-                }
-            }
-            'L' => self.insert_lines(n),
-            'M' => self.delete_lines(n),
-            'P' | '@' | 'X' => {
-                let (row, col) = (self.row, self.col.min(WIDTH - 1));
-                let n = n.min(WIDTH - col);
-                match command {
-                    'P' => {
-                        // Apaga n caracteres; o resto da linha anda para a esquerda.
-                        for c in col..WIDTH - n {
-                            unsafe { BUFFER.add(row * WIDTH + c).write_volatile(get(row, c + n)) }
-                        }
-                        self.erase(row, WIDTH - n..WIDTH);
-                    }
-                    '@' => {
-                        for c in (col + n..WIDTH).rev() {
-                            unsafe { BUFFER.add(row * WIDTH + c).write_volatile(get(row, c - n)) }
-                        }
-                        self.erase(row, col..col + n);
-                    }
-                    _ => self.erase(row, col..col + n),
-                }
-            }
-            's' => self.saved = (self.row, self.col),
-            'u' => (self.row, self.col) = self.saved,
-            _ => {} // 'r' (região de rolagem), 'n' (consultas) e outras: ignoradas
-        }
-    }
-
-    fn update_cursor(&self) {
-        let pos = (self.row * WIDTH + self.col.min(WIDTH - 1)) as u16;
+    /// Move o cursor piscante (desenhado pela própria placa) para onde vai o próximo caractere.
+    fn atualizar_cursor(&self) {
+        let posicao = ((ALTURA - 1) * LARGURA + self.coluna.min(LARGURA - 1)) as u16;
         unsafe {
+            // Registradores do controlador CRT: índice em 0x3D4, valor em 0x3D5.
             outb(0x3D4, 0x0F);
-            outb(0x3D5, pos as u8);
+            outb(0x3D5, posicao as u8);
             outb(0x3D4, 0x0E);
-            outb(0x3D5, (pos >> 8) as u8);
+            outb(0x3D5, (posicao >> 8) as u8);
         }
     }
 }
 
-impl fmt::Write for Writer {
+/// Converte um caractere Unicode para o code page 437 da VGA.
+/// O CP437 tem vários acentos (á, é, ó, ç...), mas não tem "ã" nem "õ":
+/// esses viram a letra sem acento.
+fn para_cp437(c: char) -> u8 {
+    match c {
+        ' '..='~' => c as u8,
+        '\n' => b'\n',
+        '\u{8}' => 0x08,
+        'Ç' => 0x80, 'ü' => 0x81, 'é' => 0x82, 'â' => 0x83, 'ä' => 0x84,
+        'à' => 0x85, 'ç' => 0x87, 'ê' => 0x88, 'è' => 0x8A, 'É' => 0x90,
+        'ô' => 0x93, 'á' => 0xA0, 'í' => 0xA1, 'ó' => 0xA2, 'ú' => 0xA3,
+        'ã' | 'Ã' => b'a', 'õ' | 'Õ' => b'o', 'Á' | 'À' | 'Â' => b'A',
+        'Í' => b'I', 'Ó' | 'Ô' => b'O', 'Ú' => b'U', 'Ê' => b'E',
+        'ñ' => 0xA4, 'Ñ' => 0xA5, 'Ü' => 0x9A, '´' => b'\'', '¨' => b'"',
+        '░' => 0xB0, '▒' => 0xB1, '▓' => 0xB2, '│' => 0xB3, '║' => 0xBA,
+        '╗' => 0xBB, '╝' => 0xBC, '╚' => 0xC8, '╔' => 0xC9, '═' => 0xCD,
+        '█' => 0xDB, '·' => 0xFA, '■' => 0xFE, '→' => 0x1A, '•' => 0x07,
+        _ => 0xFE, // caractere desconhecido: um quadradinho
+    }
+}
+
+impl fmt::Write for Tela {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for ch in s.chars() {
-            self.write_char(ch);
+        for c in s.chars() {
+            if !self.escape(c) {
+                self.escrever_byte(para_cp437(c));
+            }
         }
-        self.update_cursor();
+        self.atualizar_cursor();
         Ok(())
     }
 }
 
-/// Converte um caractere Unicode para a página de código 437 da VGA.
-/// Letras sem equivalente (ã, õ...) perdem o acento.
-pub fn to_cp437(ch: char) -> u8 {
-    match ch {
-        ' '..='~' | '\n' | '\r' | '\t' | '\x08' => ch as u8,
-        'Ç' => 0x80,
-        'ü' => 0x81,
-        'é' => 0x82,
-        'â' => 0x83,
-        'à' => 0x85,
-        'ç' => 0x87,
-        'ê' => 0x88,
-        'É' => 0x90,
-        'ô' => 0x93,
-        'á' => 0xA0,
-        'í' => 0xA1,
-        'ó' => 0xA2,
-        'ú' => 0xA3,
-        'ã' => b'a',
-        'õ' => b'o',
-        'Á' | 'Ã' | 'Â' | 'À' => b'A',
-        'Ê' => b'E',
-        'Í' => b'I',
-        'Ó' | 'Õ' | 'Ô' => b'O',
-        'Ú' => b'U',
-        '░' => 0xB0,
-        '▒' => 0xB1,
-        '▓' => 0xB2,
-        '│' => 0xB3,
-        '┐' => 0xBF,
-        '└' => 0xC0,
-        '─' => 0xC4,
-        '┘' => 0xD9,
-        '┌' => 0xDA,
-        '█' => 0xDB,
-        '°' => 0xF8,
-        '·' => 0xFA,
-        _ => b'?',
-    }
+pub static TELA: Mutex<Tela> = Mutex::new(Tela::new());
+
+/// Limpa a tela e deixa o cursor como uma linha fina (linhas 13 a 15 da célula).
+pub fn limpar() {
+    interrupcoes::sem_interrupcoes(|| {
+        let mut tela = TELA.lock();
+        tela.limpar();
+        tela.atualizar_cursor();
+        unsafe {
+            outb(0x3D4, 0x0A); // início do cursor (bit 5 = 0: visível)
+            outb(0x3D5, 13);
+            outb(0x3D4, 0x0B); // fim do cursor
+            outb(0x3D5, 15);
+        }
+    });
+}
+
+pub fn definir_cor(frente: Cor, fundo: Cor) {
+    interrupcoes::sem_interrupcoes(|| TELA.lock().definir_cor(frente, fundo));
 }
