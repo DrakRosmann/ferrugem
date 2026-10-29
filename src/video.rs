@@ -12,10 +12,9 @@
 //! memória com `mmap` e desenha lá. Quando ele fecha o `/dev/fb0` (ou morre),
 //! voltamos ao modo texto.
 //!
-//! Para escrever texto no modo gráfico, o servidor precisa de uma fonte. Ela
-//! vem da própria VGA: a fonte 8×16 do modo texto fica no plano 2 da memória
-//! de vídeo, e a lemos no boot (`/dev/fonte`). Ela também serve para repor a
-//! fonte ao voltar ao modo texto, já que o modo gráfico escreve por cima.
+//! Para escrever texto no modo gráfico, o servidor precisa de uma fonte: a
+//! mesma do console (vga.rs), em `/dev/fonte`. Ao voltar ao modo texto, ela
+//! é gravada de novo na placa, já que o modo gráfico escreve por cima.
 //! Do mesmo jeito, guardamos os registradores da VGA do modo texto (a placa
 //! os reprograma para o modo gráfico) e os repomos na volta.
 
@@ -45,8 +44,6 @@ const BPP: u32 = 32;
 
 /// Onde está o framebuffer na memória física, e quanto a placa tem de memória.
 static PLACA: Mutex<Option<(u64, u64)>> = Mutex::new(None);
-/// A fonte 8×16 do modo texto: 256 caracteres de 16 linhas de 8 pixels.
-static FONTE: Mutex<[u8; 4096]> = Mutex::new([0; 4096]);
 /// Quem está com a tela no modo gráfico (0 = modo texto).
 static DONO: AtomicU32 = AtomicU32::new(0);
 
@@ -159,24 +156,7 @@ fn achar_placa() -> Option<u64> {
     None
 }
 
-/// Mapeia o plano 2 da VGA (onde fica a fonte) em 0xA0000, chama `f` e desfaz.
-fn com_plano_da_fonte(f: impl FnOnce(*mut u8)) {
-    unsafe {
-        outw(0x3C4, 0x0402); // sequenciador: escrever só no plano 2
-        outw(0x3C4, 0x0704); // ...com endereçamento sequencial
-        outw(0x3CE, 0x0204); // controlador gráfico: ler do plano 2
-        outw(0x3CE, 0x0005); // sem par/ímpar
-        outw(0x3CE, 0x0406); // memória em 0xA0000
-        f(0xA0000 as *mut u8);
-        outw(0x3C4, 0x0302); // de volta ao normal do modo texto
-        outw(0x3C4, 0x0304);
-        outw(0x3CE, 0x0004);
-        outw(0x3CE, 0x1005);
-        outw(0x3CE, 0x0E06); // memória em 0xB8000
-    }
-}
-
-/// No boot (ainda no modo texto): acha a placa e guarda a fonte.
+/// No boot (ainda no modo texto): acha a placa e guarda os registradores da VGA.
 pub fn init() -> Option<String> {
     if ler(REG_ID) < 0xB0C0 {
         return None; // não é uma placa Bochs VBE
@@ -186,14 +166,6 @@ pub fn init() -> Option<String> {
     let memoria = ler(0xA) as u64 * 64 * 1024;
     *PLACA.lock() = Some((fisico, memoria.max((LARGURA * ALTURA * 4) as u64)));
     *MODO_TEXTO.lock() = Some(guardar_modo_texto());
-    let mut fonte = FONTE.lock();
-    com_plano_da_fonte(|plano| {
-        for c in 0..256 {
-            for linha in 0..16 {
-                fonte[c * 16 + linha] = unsafe { plano.add(c * 32 + linha).read_volatile() };
-            }
-        }
-    });
     Some(format!("vídeo: placa Bochs VBE, framebuffer em {:#x} ({} MiB)", fisico, memoria >> 20))
 }
 
@@ -229,16 +201,7 @@ pub fn fechar() {
     if let Some(r) = &*MODO_TEXTO.lock() {
         repor_modo_texto(r);
     }
-    let fonte = FONTE.lock();
-    com_plano_da_fonte(|plano| {
-        for c in 0..256 {
-            for linha in 0..32 {
-                let byte = if linha < 16 { fonte[c * 16 + linha] } else { 0 };
-                unsafe { plano.add(c * 32 + linha).write_volatile(byte) };
-            }
-        }
-    });
-    drop(fonte);
+    vga::repor_fonte();
     vga::modo_grafico(false);
 }
 
@@ -256,7 +219,7 @@ pub fn memoria() -> Option<(u64, u64)> {
 }
 
 pub fn fonte() -> Vec<u8> {
-    FONTE.lock().to_vec()
+    vga::fonte()
 }
 
 const FBIOGET_VSCREENINFO: u64 = 0x4600;

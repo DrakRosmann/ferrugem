@@ -123,21 +123,8 @@ impl Quadro<'_> {
     }
 }
 
-/// Converte um caractere Unicode para o code page 437 da fonte da VGA (a
-/// mesma tabela do console do kernel; "ã" e "õ" viram a letra sem acento).
+/// O número do caractere na fonte da VGA (a mesma tabela do console do
+/// kernel, com as letras acentuadas geradas: veja comum/cp437.rs).
 pub fn cp437(c: char) -> u8 {
-    match c {
-        ' '..='~' => c as u8,
-        'Ç' => 0x80, 'ü' => 0x81, 'é' => 0x82, 'â' => 0x83, 'ä' => 0x84,
-        'à' => 0x85, 'ç' => 0x87, 'ê' => 0x88, 'è' => 0x8A, 'É' => 0x90,
-        'ô' => 0x93, 'á' => 0xA0, 'í' => 0xA1, 'ó' => 0xA2, 'ú' => 0xA3,
-        'ã' | 'Ã' => b'a', 'õ' | 'Õ' => b'o', 'Á' | 'À' | 'Â' => b'A',
-        'Í' => b'I', 'Ó' | 'Ô' => b'O', 'Ú' => b'U', 'Ê' => b'E',
-        'ñ' => 0xA4, 'Ñ' => 0xA5, 'Ü' => 0x9A, '´' => b'\'', '¨' => b'"',
-        '░' => 0xB0, '▒' => 0xB1, '▓' => 0xB2, '│' => 0xB3, '║' => 0xBA,
-        '╗' => 0xBB, '╝' => 0xBC, '╚' => 0xC8, '╔' => 0xC9, '═' => 0xCD,
-        '█' => 0xDB, '·' => 0xFA, '■' => 0xFE, '→' => 0x1A, '•' => 0x07,
-        '—' | '–' => b'-',
-        _ => 0xFE,
-    }
+    crate::cp437::codigo(c)
 }

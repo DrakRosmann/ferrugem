@@ -26,7 +26,7 @@
 //! ```
 
 use crate::interrupcoes;
-use crate::porta::outb;
+use crate::porta::{outb, outw};
 use crate::spin::Mutex;
 use core::fmt;
 use core::ptr::write_volatile;
@@ -252,25 +252,70 @@ impl Tela {
     }
 }
 
-/// Converte um caractere Unicode para o code page 437 da VGA.
-/// O CP437 tem vários acentos (á, é, ó, ç...), mas não tem "ã" nem "õ":
-/// esses viram a letra sem acento.
+/// Converte um caractere Unicode para a fonte da VGA (CP437 + as letras
+/// acentuadas que geramos no boot: veja comum/cp437.rs).
 fn para_cp437(c: char) -> u8 {
-    match c {
-        ' '..='~' => c as u8,
-        '\n' => b'\n',
-        '\u{8}' => 0x08,
-        'Ç' => 0x80, 'ü' => 0x81, 'é' => 0x82, 'â' => 0x83, 'ä' => 0x84,
-        'à' => 0x85, 'ç' => 0x87, 'ê' => 0x88, 'è' => 0x8A, 'É' => 0x90,
-        'ô' => 0x93, 'á' => 0xA0, 'í' => 0xA1, 'ó' => 0xA2, 'ú' => 0xA3,
-        'ã' | 'Ã' => b'a', 'õ' | 'Õ' => b'o', 'Á' | 'À' | 'Â' => b'A',
-        'Í' => b'I', 'Ó' | 'Ô' => b'O', 'Ú' => b'U', 'Ê' => b'E',
-        'ñ' => 0xA4, 'Ñ' => 0xA5, 'Ü' => 0x9A, '´' => b'\'', '¨' => b'"',
-        '░' => 0xB0, '▒' => 0xB1, '▓' => 0xB2, '│' => 0xB3, '║' => 0xBA,
-        '╗' => 0xBB, '╝' => 0xBC, '╚' => 0xC8, '╔' => 0xC9, '═' => 0xCD,
-        '█' => 0xDB, '·' => 0xFA, '—' | '–' => b'-', '■' => 0xFE, '→' => 0x1A, '•' => 0x07,
-        _ => 0xFE, // caractere desconhecido: um quadradinho
+    crate::cp437::codigo(c)
+}
+
+// -----------------------------------------------------------------------------
+// A fonte
+// -----------------------------------------------------------------------------
+
+/// A fonte 8×16 da VGA, já com as letras geradas: 256 caracteres de 16 linhas.
+static FONTE: Mutex<[u8; 4096]> = Mutex::new([0; 4096]);
+
+/// Mapeia o plano 2 da memória da VGA (onde fica a fonte do modo texto) em
+/// 0xA0000, chama `f` e desfaz. Cada caractere ocupa 32 bytes lá (só os 16
+/// primeiros são usados na fonte 8×16).
+pub fn com_plano_da_fonte(f: impl FnOnce(*mut u8)) {
+    unsafe {
+        outw(0x3C4, 0x0402); // sequenciador: escrever só no plano 2
+        outw(0x3C4, 0x0704); // ...com endereçamento sequencial
+        outw(0x3CE, 0x0204); // controlador gráfico: ler do plano 2
+        outw(0x3CE, 0x0005); // sem par/ímpar
+        outw(0x3CE, 0x0406); // memória em 0xA0000
+        f(0xA0000 as *mut u8);
+        outw(0x3C4, 0x0302); // de volta ao normal do modo texto
+        outw(0x3C4, 0x0304);
+        outw(0x3CE, 0x0004);
+        outw(0x3CE, 0x1005);
+        outw(0x3CE, 0x0E06); // memória em 0xB8000
     }
+}
+
+/// No boot: lê a fonte da placa, gera as letras acentuadas que faltam e a
+/// devolve à placa. Daí em diante, o console mostra "ã", "Õ", "Ê"...
+pub fn preparar_fonte() {
+    let mut fonte = FONTE.lock();
+    com_plano_da_fonte(|plano| {
+        for c in 0..256 {
+            for linha in 0..16 {
+                fonte[c * 16 + linha] = unsafe { plano.add(c * 32 + linha).read_volatile() };
+            }
+        }
+    });
+    crate::cp437::completar(&mut *fonte);
+    drop(fonte);
+    repor_fonte();
+}
+
+/// Grava a nossa fonte na placa (no boot e ao voltar do modo gráfico).
+pub fn repor_fonte() {
+    let fonte = FONTE.lock();
+    com_plano_da_fonte(|plano| {
+        for c in 0..256 {
+            for linha in 0..32 {
+                let byte = if linha < 16 { fonte[c * 16 + linha] } else { 0 };
+                unsafe { plano.add(c * 32 + linha).write_volatile(byte) };
+            }
+        }
+    });
+}
+
+/// Uma cópia da fonte (para o /dev/fonte).
+pub fn fonte() -> alloc::vec::Vec<u8> {
+    FONTE.lock().to_vec()
 }
 
 impl fmt::Write for Tela {

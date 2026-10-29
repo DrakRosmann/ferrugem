@@ -19,6 +19,8 @@ mod gdt;
 mod heap;
 mod initrd;
 mod interrupcoes;
+#[path = "../comum/cp437.rs"]
+mod cp437;
 #[path = "../comum/lista_livre.rs"]
 mod lista_livre;
 mod multiboot;
@@ -114,6 +116,7 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
 
     let livres = quadros::init(&info);
     heap::init();
+    vga::preparar_fonte(); // as letras acentuadas que faltam na fonte da VGA
     let protecoes = paginacao::init();
     ok(format_args!(
         "memória: {} MiB livres, heap do kernel de {} MiB; proteções: {}",
