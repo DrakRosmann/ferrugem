@@ -13,6 +13,7 @@
 #include <sys/syscall.h>
 #include <sys/select.h>
 #include <sys/un.h>
+#include <syslog.h>
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
@@ -386,6 +387,19 @@ static void testar_ipc(void) {
     ok = ok && strcmp(mem + 5000, "escrito pelo filho") == 0; /* ainda anexado: continua lá */
     ok = ok && shmdt(mem) == 0;
     CONFERIR(ok, "IPC_RMID: some da tabela, mas vale até o último shmdt");
+
+    /* syslog() da libc: datagrama para /dev/log; o syslogd grava no registro */
+    openlog("testec", LOG_PID, LOG_USER);
+    syslog(LOG_INFO, "mensagem pela libc %d", 42);
+    closelog();
+    usleep(200000);
+    char esperado[64], linha[256];
+    snprintf(esperado, sizeof esperado, "testec[%d]: mensagem pela libc 42", getpid());
+    FILE *reg = fopen("/var/log/mensagens", "r");
+    ok = 0;
+    while (reg && fgets(linha, sizeof linha, reg)) ok |= strstr(linha, esperado) != NULL;
+    if (reg) fclose(reg);
+    CONFERIR(ok, "syslog() chega ao /var/log/mensagens");
 }
 
 int main(void) {

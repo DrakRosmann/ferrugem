@@ -1,0 +1,4 @@
+# /etc/rc — o init roda este script uma vez, no boot, antes dos logins.
+# Cada serviço vira um daemon: continua rodando em segundo plano.
+syslogd
+crond

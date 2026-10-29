@@ -38,6 +38,8 @@ fn principal(_args: &[&str]) -> i32 {
         match usuarios::por_nome(&nome) {
             Some(u) if usuarios::conferir_senha(&nome, &senha) => iniciar_sessao(u),
             _ => {
+                let onde = sys::nome_do_terminal(io::ENTRADA).unwrap_or_default();
+                sys::registrar(sys::LOG_AUTH | sys::LOG_NOTICE, "login", &format!("senha errada para {} em {}", nome, onde));
                 let _ = sys::dormir_ms(1000); // atrasa quem tenta adivinhar
                 println!("Login incorreto");
             }
@@ -46,6 +48,8 @@ fn principal(_args: &[&str]) -> i32 {
 }
 
 fn iniciar_sessao(u: Usuario) -> ! {
+    let onde = sys::nome_do_terminal(io::ENTRADA).unwrap_or_default();
+    sys::registrar(sys::LOG_AUTH | sys::LOG_INFO, "login", &format!("{} entrou em {}", u.nome, onde));
     // Primeiro o grupo: depois do setuid não teríamos mais permissão para isso.
     if sys::mudar_gid(u.gid).is_err() || sys::mudar_uid(u.uid).is_err() {
         eprintln!("login: não consegui trocar de usuário");

@@ -104,6 +104,7 @@ pub fn tratar(ctx: &mut Contexto) {
         233 => epoll::controlar(a1, a2, a3, a4),
         232 => epoll::esperar(a1, a2, a3, if a4 as i32 >= 0 { Some(a4 as i32 as u64) } else { None }),
         281 => epoll::esperar(a1, a2, a3, if a4 as i32 >= 0 { Some(a4 as i32 as u64) } else { None }), // epoll_pwait (sem máscara)
+        103 => crate::registro::syscall(a1, a2, a3), // syslog: o registro do kernel (dmesg)
         29 => crate::shm::shmget(a1 as i32, a2, a3),
         30 => crate::shm::shmat(a1 as i32, a2, a3),
         31 => crate::shm::shmctl(a1 as i32, a2, a3),

@@ -36,6 +36,7 @@ mod spin;
 mod syscall;
 mod teclado;
 mod epoll;
+mod registro;
 mod shm;
 mod socket;
 mod tty;
@@ -53,6 +54,13 @@ use vga::Cor;
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
+    escrever_no_console(args);
+    interrupcoes::sem_interrupcoes(|| registro::guardar(args));
+}
+
+/// Escreve no tty1 (tela e serial) sem guardar no registro do kernel: é por
+/// aqui que passa o que os programas escrevem no console.
+pub fn escrever_no_console(args: fmt::Arguments) {
     // Sem interrupções enquanto seguramos os locks: se uma interrupção chegasse
     // agora e também quisesse imprimir, ela esperaria por nós para sempre.
     interrupcoes::sem_interrupcoes(|| {
@@ -228,6 +236,7 @@ pub fn erro_fatal(mensagem: fmt::Arguments) -> ! {
     unsafe {
         vga::TELA.forcar_destravar();
         serial::SERIAL.forcar_destravar();
+        registro::destravar();
     }
     vga::definir_cor(Cor::Branco, Cor::Vermelho);
     println!();

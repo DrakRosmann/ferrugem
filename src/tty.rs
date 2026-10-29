@@ -175,7 +175,7 @@ impl Terminal {
     fn emitir(&self, texto: &str) {
         match self.saida {
             // O tty1 vai para a tela e para a serial (o terminal do QEMU).
-            Saida::Console(0) => crate::_print(format_args!("{}", texto)),
+            Saida::Console(0) => crate::escrever_no_console(format_args!("{}", texto)),
             Saida::Console(n) => vga::escrever(n, texto),
             Saida::Pty => {
                 let oflag = self.estado.lock().flag(1);

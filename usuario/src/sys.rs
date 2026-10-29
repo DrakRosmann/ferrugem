@@ -703,8 +703,21 @@ pub fn disco() -> InfoDisco {
     InfoDisco { total_blocos: b[0], blocos_livres: b[1], tamanho_bloco: b[2] }
 }
 
-/// Converte tempo Unix em "AAAA-MM-DD HH:MM:SS" (UTC).
-pub fn formatar_data(segundos: u64) -> String {
+/// Uma data separada em campos (UTC).
+#[derive(Clone, Copy)]
+pub struct Data {
+    pub ano: i64,
+    pub mes: u32, // 1 a 12
+    pub dia: u32, // 1 a 31
+    pub hora: u32,
+    pub minuto: u32,
+    pub segundo: u32,
+    /// 0 = domingo ... 6 = sábado
+    pub dia_da_semana: u32,
+}
+
+/// Converte tempo Unix em campos de data.
+pub fn data(segundos: u64) -> Data {
     // Algoritmo "civil_from_days" de Howard Hinnant.
     let dias = (segundos / 86400) as i64 + 719468;
     let era = dias.div_euclid(146097);
@@ -715,8 +728,131 @@ pub fn formatar_data(segundos: u64) -> String {
     let dia = dia_do_ano - (153 * mp + 2) / 5 + 1;
     let mes = if mp < 10 { mp + 3 } else { mp - 9 };
     let ano = ano_da_era + era * 400 + (mes <= 2) as i64;
-    let s = segundos % 86400;
-    alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", ano, mes, dia, s / 3600, s / 60 % 60, s % 60)
+    let s = (segundos % 86400) as u32;
+    Data {
+        ano,
+        mes: mes as u32,
+        dia: dia as u32,
+        hora: s / 3600,
+        minuto: s / 60 % 60,
+        segundo: s % 60,
+        dia_da_semana: ((segundos / 86400 + 4) % 7) as u32, // 1970-01-01 foi uma quinta
+    }
+}
+
+/// Converte tempo Unix em "AAAA-MM-DD HH:MM:SS" (UTC).
+pub fn formatar_data(segundos: u64) -> String {
+    let d = data(segundos);
+    alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", d.ano, d.mes, d.dia, d.hora, d.minuto, d.segundo)
+}
+
+/// O formato do syslog: "Oct 29 17:05:09".
+pub fn formatar_data_syslog(segundos: u64) -> String {
+    const MESES: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let d = data(segundos);
+    alloc::format!("{} {:2} {:02}:{:02}:{:02}", MESES[d.mes as usize - 1], d.dia, d.hora, d.minuto, d.segundo)
+}
+
+// -----------------------------------------------------------------------------
+// Sockets Unix
+// -----------------------------------------------------------------------------
+
+pub const SOCK_STREAM: u64 = 1;
+pub const SOCK_DGRAM: u64 = 2;
+
+/// struct sockaddr_un com o caminho (sem o zero do fim no tamanho).
+fn endereco_unix(caminho: &str) -> ([u8; 110], u64) {
+    let mut e = [0u8; 110];
+    e[0] = 1; // AF_UNIX
+    let n = caminho.len().min(107);
+    e[2..2 + n].copy_from_slice(&caminho.as_bytes()[..n]);
+    (e, 2 + n as u64 + 1)
+}
+
+pub fn socket(tipo: u64) -> Resultado<i32> {
+    conferir(unsafe { syscall(41, 1, tipo, 0, 0) }).map(|fd| fd as i32)
+}
+
+pub fn ligar(fd: i32, caminho: &str) -> Resultado<()> {
+    let (e, n) = endereco_unix(caminho);
+    conferir(unsafe { syscall(49, fd as u64, e.as_ptr() as u64, n, 0) }).map(|_| ())
+}
+
+pub fn ouvir(fd: i32, fila: u64) -> Resultado<()> {
+    conferir(unsafe { syscall(50, fd as u64, fila, 0, 0) }).map(|_| ())
+}
+
+pub fn conectar(fd: i32, caminho: &str) -> Resultado<()> {
+    let (e, n) = endereco_unix(caminho);
+    conferir(unsafe { syscall(42, fd as u64, e.as_ptr() as u64, n, 0) }).map(|_| ())
+}
+
+pub fn aceitar(fd: i32) -> Resultado<i32> {
+    conferir(unsafe { syscall(43, fd as u64, 0, 0, 0) }).map(|fd| fd as i32)
+}
+
+/// Manda um datagrama para o socket ligado a `caminho`.
+pub fn enviar_para(fd: i32, dados: &[u8], caminho: &str) -> Resultado<usize> {
+    let (e, n) = endereco_unix(caminho);
+    let r = unsafe {
+        let resposta: i64;
+        asm!("syscall", inlateout("rax") 44i64 => resposta, in("rdi") fd as u64, in("rsi") dados.as_ptr() as u64,
+             in("rdx") dados.len() as u64, in("r10") 0u64, in("r8") e.as_ptr() as u64, in("r9") n,
+             lateout("rcx") _, lateout("r11") _, options(nostack));
+        resposta
+    };
+    conferir(r).map(|n| n as usize)
+}
+
+/// As mensagens do kernel (o `dmesg`): a chamada `syslog` do Linux.
+pub fn registro_do_kernel() -> Resultado<Vec<u8>> {
+    let tamanho = conferir(unsafe { syscall(103, 10, 0, 0, 0) })? as usize;
+    let mut buf = alloc::vec![0u8; tamanho];
+    let n = conferir(unsafe { syscall(103, 3, buf.as_mut_ptr() as u64, tamanho as u64, 0) })? as usize;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Vira um "daemon": um processo de fundo, sem terminal, que não morre com o
+/// login. O pai sai na hora (quem chamou volta para o shell) e o filho vira
+/// líder de uma sessão nova, sem terminal de controle.
+pub fn daemonizar() {
+    match fork() {
+        Ok(0) => {}
+        Ok(_) => sair(0),
+        Err(_) => return,
+    }
+    let _ = nova_sessao();
+    let _ = mudar_diretorio("/");
+    for fd in 0..3 {
+        let _ = fechar(fd);
+    }
+    for _ in 0..3 {
+        let _ = abrir("/dev/null", O_RDWR);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// syslog: mensagens para o registro do sistema (/var/log/mensagens)
+// -----------------------------------------------------------------------------
+
+pub const LOG_ERR: u8 = 3;
+pub const LOG_WARNING: u8 = 4;
+pub const LOG_NOTICE: u8 = 5;
+pub const LOG_INFO: u8 = 6;
+pub const LOG_USER: u8 = 1 << 3;
+pub const LOG_DAEMON: u8 = 3 << 3;
+pub const LOG_AUTH: u8 = 4 << 3;
+pub const LOG_CRON: u8 = 9 << 3;
+
+/// Manda uma mensagem ao `syslogd` pelo socket /dev/log, no formato do
+/// syslog: "<prioridade>Oct 29 17:05:09 nome[pid]: texto". Se o syslogd não
+/// estiver rodando, a mensagem se perde (como no Unix).
+pub fn registrar(prioridade: u8, nome: &str, texto: &str) {
+    let Ok(fd) = socket(SOCK_DGRAM) else { return };
+    let linha = alloc::format!("<{}>{} {}[{}]: {}", prioridade, formatar_data_syslog(hora_atual()), nome, pid(), texto);
+    let _ = enviar_para(fd, linha.as_bytes(), "/dev/log");
+    let _ = fechar(fd);
 }
 
 // -----------------------------------------------------------------------------

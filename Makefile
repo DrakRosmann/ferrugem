@@ -106,7 +106,9 @@ $(INITRD): $(USUARIO_OK) $(ARQUIVOS_RAIZ) $(BINARIOS_C) $(LUA)
 	for p in $(PROGRAMAS); do strip -o $(RAIZ)/bin/$$p $(USUARIO_BIN)/$$p; done
 	for p in $(PROGRAMAS_C); do strip -o $(RAIZ)/bin/$$p $(BUILD)/c/$$p; done
 	$(if $(LUA),strip -o $(RAIZ)/bin/lua $(LUA))
-	chmod 4755 $(RAIZ)/bin/su $(RAIZ)/bin/passwd    # setuid root
+	mkdir -p $(RAIZ)/var/log $(RAIZ)/var/spool/cron
+	chmod 4755 $(RAIZ)/bin/su $(RAIZ)/bin/passwd $(RAIZ)/bin/crontab    # setuid root
+	chmod 700 $(RAIZ)/var/spool/cron
 	chmod 600 $(RAIZ)/etc/shadow
 	chmod 700 $(RAIZ)/root
 	# Tudo é do root, menos o /home/usuario, que é do usuário 1000.

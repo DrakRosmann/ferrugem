@@ -5,6 +5,9 @@
 //! com o seu console como terminal de controle. O init também é o "pai
 //! adotivo" dos órfãos: recolhe todo processo cujo pai morreu antes dele,
 //! para que não fiquem zumbis para sempre.
+//!
+//! Antes dos logins, ele roda o script `/etc/rc`, que inicia os serviços
+//! (o `syslogd` e o `crond`).
 
 #![no_std]
 #![no_main]
@@ -50,6 +53,19 @@ fn principal(_args: &[&str]) -> i32 {
         let _ = sys::abrir("/dev/tty1", sys::O_RDWR | sys::O_NOCTTY);
     }
     sys::ignorar_sinal(sys::SIGINT, true);
+
+    // Os serviços do boot. Cada um vira daemon e o script termina logo.
+    if sys::stat("/etc/rc").is_ok() {
+        match sys::fork() {
+            Ok(0) => {
+                let erro = sys::executar("/bin/sh", &["sh", "/etc/rc"]);
+                eprintln!("init: não consegui executar /etc/rc: {}", erro);
+                sys::sair(1);
+            }
+            Ok(rc) => while sys::esperar(-1).is_ok_and(|(pid, _)| pid != rc) {},
+            Err(_) => {}
+        }
+    }
 
     let mut sessoes = [0i32; CONSOLES];
     for (console, sessao) in sessoes.iter_mut().enumerate() {

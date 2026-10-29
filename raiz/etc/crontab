@@ -1,0 +1,7 @@
+# /etc/crontab — tarefas agendadas do sistema (o crond confere a cada minuto).
+# As de cada usuário ficam em /var/spool/cron e são editadas com o `crontab`.
+#
+# minuto hora dia mês dia-da-semana usuário comando      (horas em UTC)
+#   */5  *    *   *   *             root    sync
+#   0    3    *   *   1-5           root    logger backup das 3h
+@reboot  root  logger -t cron o sistema ligou

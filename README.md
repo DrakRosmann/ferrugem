@@ -122,10 +122,17 @@ interrompe o programa que está rodando.
 **Modo usuário** (`usuario/`)
 - `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com
   `brk`, `print!`, sinais, ambiente, usuários, SHA-256.
-- `init` (processo 1) → `login` → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
+- `init` (processo 1) roda o `/etc/rc` (que inicia os serviços) e abre um
+  `login` em cada console → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
   `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`,
   e controle de jobs: Ctrl+Z, `jobs`, `fg`, `bg`.
-- `rastro` (um strace: `rastro ls`, `rastro -c lua script.lua`), `mount umount sync df mkfifo truncate`, `login su passwd id whoami chmod chown env ln readlink ls cat echo cp mv rm mkdir rmdir
+- **Serviços:** `syslogd` (recebe pelo socket `/dev/log` e grava em
+  `/var/log/mensagens`; o `syslog()` da musl funciona), `logger`, `dmesg`
+  (as mensagens do kernel, guardadas num buffer circular), e o **cron**:
+  `crond` com `/etc/crontab` e as tabelas de cada usuário, editadas com o
+  `crontab` (setuid root); `*/5`, `1-5`, listas, `@reboot`, `@daily`...
+  A saída das tarefas vai para o registro. Os logins também são registrados.
+- `rastro` (um strace: `rastro ls`, `rastro -c lua script.lua`), `mount umount sync df mkfifo truncate tty`, `login su passwd id whoami chmod chown env ln readlink ls cat echo cp mv rm mkdir rmdir
   touch grep wc head ps kill sleep date uptime free df uname clear desligar
   reiniciar teste`.
 - **Em C, com a musl** (`c/`): `ola` e `testec`, a bateria de testes da libc
