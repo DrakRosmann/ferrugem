@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* struct ucred (SO_PEERCRED) */
 /* testec.c — testa a libc (musl) rodando no FerrugemOS: stdio, malloc
  * grande (mmap), arquivos, processos, pipes, sinais, tempo e números
  * de ponto flutuante. Tudo com as funções padrão do C/POSIX. */
@@ -5,8 +6,13 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stddef.h>
+#include <sys/epoll.h>
+#include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/select.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
@@ -223,6 +229,165 @@ static void testar_proc_e_aleatorio(void) {
     CONFERIR(processos >= 3, "readdir do /proc lista os processos");
 }
 
+/* Sockets Unix, epoll e memória compartilhada: a comunicação entre processos. */
+static void testar_ipc(void) {
+    /* socketpair: um fluxo nos dois sentidos; shutdown dá fim de arquivo ao outro lado */
+    int par[2];
+    char buf[64] = {0};
+    CONFERIR(socketpair(AF_UNIX, SOCK_STREAM, 0, par) == 0, "socketpair");
+    write(par[0], "ida", 3);
+    write(par[1], "volta", 5);
+    int ok = read(par[1], buf, sizeof buf) == 3 && memcmp(buf, "ida", 3) == 0;
+    ok = ok && read(par[0], buf, sizeof buf) == 5 && memcmp(buf, "volta", 5) == 0;
+    shutdown(par[0], SHUT_WR);
+    ok = ok && read(par[1], buf, sizeof buf) == 0;
+    CONFERIR(ok, "socketpair: dados nos dois sentidos e shutdown");
+    close(par[0]);
+    close(par[1]);
+
+    /* servidor num caminho: bind, listen, accept; o cliente é outro processo */
+    const char *caminho = "/tmp/testec.sock";
+    unlink(caminho);
+    struct sockaddr_un end = {.sun_family = AF_UNIX};
+    strcpy(end.sun_path, caminho);
+    int servidor = socket(AF_UNIX, SOCK_STREAM, 0);
+    ok = servidor >= 0 && bind(servidor, (struct sockaddr *)&end, sizeof end) == 0 && listen(servidor, 4) == 0;
+    struct stat st;
+    CONFERIR(ok && stat(caminho, &st) == 0 && S_ISSOCK(st.st_mode), "bind cria o socket no sistema de arquivos");
+    int outro = socket(AF_UNIX, SOCK_STREAM, 0);
+    CONFERIR(bind(outro, (struct sockaddr *)&end, sizeof end) == -1 && errno == EADDRINUSE, "bind no mesmo caminho: EADDRINUSE");
+    close(outro);
+    pid_t cliente = fork();
+    if (cliente == 0) {
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        char r[16] = {0};
+        if (connect(c, (struct sockaddr *)&end, sizeof end) != 0) _exit(1);
+        send(c, "ping", 4, 0);
+        if (recv(c, r, sizeof r, 0) != 4 || memcmp(r, "pong", 4) != 0) _exit(2);
+        _exit(0);
+    }
+    int conexao = accept(servidor, NULL, NULL);
+    struct ucred cred;
+    socklen_t tamanho = sizeof cred;
+    ok = conexao >= 0 && getsockopt(conexao, SOL_SOCKET, SO_PEERCRED, &cred, &tamanho) == 0 && cred.pid == cliente;
+    memset(buf, 0, sizeof buf);
+    ok = ok && recv(conexao, buf, sizeof buf, 0) == 4 && strcmp(buf, "ping") == 0;
+    ok = ok && send(conexao, "pong", 4, 0) == 4;
+    int status;
+    waitpid(cliente, &status, 0);
+    CONFERIR(ok && WIFEXITED(status) && WEXITSTATUS(status) == 0, "connect/accept entre dois processos (e SO_PEERCRED)");
+    ok = read(conexao, buf, sizeof buf) == 0; /* o cliente saiu: fim de arquivo */
+    signal(SIGPIPE, SIG_IGN);
+    ok = ok && send(conexao, "x", 1, 0) == -1 && errno == EPIPE;
+    signal(SIGPIPE, SIG_DFL);
+    CONFERIR(ok, "o outro lado fechou: read dá 0, send dá EPIPE");
+    close(conexao);
+    close(servidor);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    CONFERIR(connect(c, (struct sockaddr *)&end, sizeof end) == -1 && errno == ECONNREFUSED,
+             "ninguém ouvindo: ECONNREFUSED");
+    close(c);
+    unlink(caminho);
+    if (access("/disco", W_OK) == 0) {
+        /* no ext2 também (fica lá: o e2fsck do `make teste` confere o inode) */
+        struct sockaddr_un no_disco = {.sun_family = AF_UNIX};
+        strcpy(no_disco.sun_path, "/disco/testec.sock");
+        unlink(no_disco.sun_path);
+        int s = socket(AF_UNIX, SOCK_STREAM, 0);
+        ok = bind(s, (struct sockaddr *)&no_disco, sizeof no_disco) == 0;
+        CONFERIR(ok && stat(no_disco.sun_path, &st) == 0 && S_ISSOCK(st.st_mode), "socket com nome no ext2");
+        close(s);
+    }
+
+    /* datagramas num endereço abstrato: cada mensagem chega inteira e separada */
+    struct sockaddr_un abstrato = {.sun_family = AF_UNIX};
+    memcpy(abstrato.sun_path, "\0testec", 7);
+    socklen_t tam_abstrato = offsetof(struct sockaddr_un, sun_path) + 7;
+    int caixa = socket(AF_UNIX, SOCK_DGRAM, 0);
+    ok = bind(caixa, (struct sockaddr *)&abstrato, tam_abstrato) == 0;
+    pid_t remetente = fork();
+    if (remetente == 0) {
+        int d = socket(AF_UNIX, SOCK_DGRAM, 0);
+        sendto(d, "um", 2, 0, (struct sockaddr *)&abstrato, tam_abstrato);
+        sendto(d, "dois", 4, 0, (struct sockaddr *)&abstrato, tam_abstrato);
+        sendto(d, "tres", 4, 0, (struct sockaddr *)&abstrato, tam_abstrato);
+        _exit(0);
+    }
+    waitpid(remetente, &status, 0);
+    char m[3][8] = {{0}};
+    ok = ok && recv(caixa, m[0], 8, 0) == 2 && recv(caixa, m[1], 8, 0) == 4 && recv(caixa, m[2], 8, 0) == 4;
+    CONFERIR(ok && !strcmp(m[0], "um") && !strcmp(m[1], "dois") && !strcmp(m[2], "tres"),
+             "datagramas num endereço abstrato");
+
+    /* O_NONBLOCK: sem nada para ler, EAGAIN na hora */
+    fcntl(caixa, F_SETFL, fcntl(caixa, F_GETFL) | O_NONBLOCK);
+    CONFERIR(recv(caixa, buf, sizeof buf, 0) == -1 && errno == EAGAIN && (fcntl(caixa, F_GETFL) & O_NONBLOCK),
+             "fcntl(O_NONBLOCK): EAGAIN em vez de esperar");
+    close(caixa);
+
+    /* epoll: um pipe e um socket no mesmo conjunto */
+    int p[2];
+    pipe(p);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, par);
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 111};
+    ok = ep >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev) == 0;
+    ev.data.u64 = 222;
+    ok = ok && epoll_ctl(ep, EPOLL_CTL_ADD, par[1], &ev) == 0;
+    ok = ok && epoll_ctl(ep, EPOLL_CTL_ADD, par[1], &ev) == -1 && errno == EEXIST;
+    struct epoll_event prontos[4];
+    ok = ok && epoll_wait(ep, prontos, 4, 0) == 0;
+    long t0 = agora_ms();
+    ok = ok && epoll_wait(ep, prontos, 4, 50) == 0 && agora_ms() - t0 >= 50;
+    CONFERIR(ok, "epoll: nada pronto, o prazo de 50 ms é respeitado");
+    write(par[0], "oi", 2);
+    int n = epoll_wait(ep, prontos, 4, 1000);
+    ok = n == 1 && prontos[0].data.u64 == 222 && (prontos[0].events & EPOLLIN);
+    write(p[1], "x", 1);
+    read(par[1], buf, sizeof buf);
+    n = epoll_wait(ep, prontos, 4, 1000);
+    ok = ok && n == 1 && prontos[0].data.u64 == 111;
+    CONFERIR(ok, "epoll_wait diz quem ficou pronto (pelo data)");
+    pid_t escritor = fork();
+    if (escritor == 0) {
+        usleep(50000);
+        write(par[0], "depois", 6);
+        _exit(0);
+    }
+    read(p[0], buf, 1);
+    n = epoll_wait(ep, prontos, 4, 2000); /* dorme até o filho escrever */
+    waitpid(escritor, &status, 0);
+    CONFERIR(n == 1 && prontos[0].data.u64 == 222, "epoll_wait acorda quando outro processo escreve");
+    close(ep);
+    close(p[0]);
+    close(p[1]);
+    close(par[0]);
+    close(par[1]);
+
+    /* memória compartilhada do System V: dois processos, as mesmas páginas */
+    key_t chave = 0x7e57;
+    int id = shmget(chave, 8192, IPC_CREAT | 0600);
+    pid_t filho = fork();
+    if (filho == 0) {
+        int meu = shmget(chave, 0, 0); /* acha pelo número, sem herdar nada */
+        char *q = shmat(meu, NULL, 0);
+        if (q == (void *)-1) _exit(1);
+        strcpy(q + 5000, "escrito pelo filho");
+        shmdt(q);
+        _exit(0);
+    }
+    waitpid(filho, &status, 0);
+    char *mem = shmat(id, NULL, 0);
+    struct shmid_ds info;
+    ok = mem != (void *)-1 && strcmp(mem + 5000, "escrito pelo filho") == 0;
+    ok = ok && shmctl(id, IPC_STAT, &info) == 0 && info.shm_nattch == 1 && info.shm_segsz == 8192;
+    CONFERIR(ok, "shmget/shmat: o pai lê o que o filho escreveu");
+    ok = shmctl(id, IPC_RMID, NULL) == 0 && shmget(chave, 0, 0) == -1 && errno == ENOENT;
+    ok = ok && strcmp(mem + 5000, "escrito pelo filho") == 0; /* ainda anexado: continua lá */
+    ok = ok && shmdt(mem) == 0;
+    CONFERIR(ok, "IPC_RMID: some da tabela, mas vale até o último shmdt");
+}
+
 int main(void) {
     printf("Testando a libc em C...\n");
 
@@ -313,6 +478,7 @@ int main(void) {
     testar_poll_e_select();
     testar_proc_e_aleatorio();
     testar_threads();
+    testar_ipc();
 
     char data[32];
     strftime(data, sizeof data, "%Y-%m-%d %H:%M", tm);

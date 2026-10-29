@@ -104,6 +104,8 @@ fn mostrar(itens: &[(String, sys::Stat)], longo: bool) {
                 'c'
             } else if info.eh_fifo() {
                 'p'
+            } else if info.eh_socket() {
+                's'
             } else {
                 '-'
             };

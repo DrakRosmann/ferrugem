@@ -101,6 +101,11 @@ interrompe o programa que está rodando.
   qualquer diretório; cache de disco com escrita adiada (vai para o disco no
   `sync`, ao desmontar, ao desligar ou a cada 3 s); `statfs` e `df`;
   `truncate` para qualquer tamanho; FIFOs (`mkfifo`) na memória e no ext2.
+- **Comunicação entre processos:** pipes, FIFOs, **sockets Unix** (stream e
+  datagrama; endereço no sistema de arquivos, inclusive no ext2, ou
+  abstrato; `socketpair`, `SO_PEERCRED`, `shutdown`), **memória
+  compartilhada** do System V (`shmget`/`shmat`, páginas sob demanda) e
+  **epoll**; `O_NONBLOCK` pelo `fcntl` em pipes, terminais e sockets.
 - **Raiz no disco** (`raiz=/dev/hda` na linha de comando do kernel): o `/` vem
   de um ext2, com `/dev`, `/proc` e um `/tmp` em memória montados por cima,
   como numa distribuição Linux. Sem a opção, o `/` é o initrd na memória.
@@ -141,7 +146,8 @@ interrompe o programa que está rodando.
 | `src/elf.rs`, `initrd.rs` | Carregador de executáveis, leitor de tar |
 | `src/vfs.rs`, `arquivo.rs` | Sistema de arquivos virtual, arquivos abertos, pipes |
 | `src/ata.rs`, `ext2.rs` | Driver de disco e sistema de arquivos ext2 |
-| `src/tty.rs`, `teclado.rs`, `serial.rs`, `vga.rs` | Terminal e dispositivos de entrada e saída |
+| `src/tty.rs`, `teclado.rs`, `serial.rs`, `vga.rs` | Consoles, pseudo-terminais e dispositivos de entrada e saída |
+| `src/socket.rs`, `epoll.rs`, `shm.rs` | Sockets Unix, epoll, memória compartilhada |
 | `comum/lista_livre.rs` | Alocador usado pelo kernel e pelos programas |
 | `usuario/src/lib.rs` + `sys.rs`, `io.rs` | `ulib`, a biblioteca dos programas |
 | `usuario/src/bin/*.rs` | Um programa por arquivo, todos vão para `/bin` |

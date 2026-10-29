@@ -31,8 +31,11 @@
 //! programa tentar ler o kernel, a CPU gera page fault.
 
 use crate::quadros::{self, TAMANHO_PAGINA};
+use crate::spin::Mutex;
 use crate::vfs::Vnode;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
 
@@ -137,6 +140,46 @@ pub enum Fonte {
     Anonima,
     /// Um arquivo, a partir de `deslocamento` (só até `tamanho` bytes; o resto é zero).
     Arquivo { no: Vnode, deslocamento: u64, tamanho: u64 },
+    /// Memória compartilhada (MAP_SHARED anônimo, shmget): as páginas são as
+    /// do segmento, as mesmas para todos que o mapeiam. `pagina`: a primeira.
+    Segmento { segmento: Arc<Segmento>, pagina: usize },
+}
+
+/// Páginas que vários espaços de endereçamento enxergam ao mesmo tempo.
+/// Cada quadro é alocado no primeiro acesso (de qualquer um) e fica aqui até
+/// o segmento morrer; cada mapeamento conta como mais um dono do quadro.
+pub struct Segmento {
+    quadros: Mutex<Vec<u64>>, // 0 = ainda não foi tocada
+}
+
+impl Segmento {
+    pub fn novo(tamanho: u64) -> Arc<Segmento> {
+        let paginas = tamanho.div_ceil(TAMANHO_PAGINA) as usize;
+        Arc::new(Segmento { quadros: Mutex::new(vec![0; paginas]) })
+    }
+
+    pub fn tamanho(&self) -> u64 {
+        self.quadros.lock().len() as u64 * TAMANHO_PAGINA
+    }
+
+    /// O quadro da página `i` (alocado agora, se preciso), já com mais um dono.
+    fn quadro(&self, i: usize) -> Option<u64> {
+        let mut q = self.quadros.lock();
+        let lugar = q.get_mut(i)?;
+        if *lugar == 0 {
+            *lugar = quadros::alocar_zerado()?;
+        }
+        quadros::compartilhar(*lugar);
+        Some(*lugar)
+    }
+}
+
+impl Drop for Segmento {
+    fn drop(&mut self) {
+        for &q in self.quadros.lock().iter().filter(|&&q| q != 0) {
+            quadros::liberar(q);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -180,9 +223,13 @@ impl Regiao {
     }
 
     fn avancar_fonte(&mut self, bytes: u64) {
-        if let Fonte::Arquivo { deslocamento, tamanho, .. } = &mut self.fonte {
-            *deslocamento += bytes;
-            *tamanho = tamanho.saturating_sub(bytes);
+        match &mut self.fonte {
+            Fonte::Arquivo { deslocamento, tamanho, .. } => {
+                *deslocamento += bytes;
+                *tamanho = tamanho.saturating_sub(bytes);
+            }
+            Fonte::Segmento { pagina, .. } => *pagina += (bytes / TAMANHO_PAGINA) as usize,
+            Fonte::Anonima => {}
         }
     }
 }
@@ -433,7 +480,14 @@ impl EspacoEnderecos {
     fn materializar(&self, virt: u64) -> Falha {
         let pagina = virt & !(TAMANHO_PAGINA - 1);
         let Some(regiao) = self.regiao_de(pagina) else { return Falha::Invalida };
-        let Some(quadro) = quadros::alocar_zerado() else { return Falha::SemMemoria };
+        let quadro = match &regiao.fonte {
+            Fonte::Segmento { segmento, pagina: primeira } => {
+                let i = primeira + ((pagina - regiao.inicio) / TAMANHO_PAGINA) as usize;
+                segmento.quadro(i)
+            }
+            _ => quadros::alocar_zerado(),
+        };
+        let Some(quadro) = quadro else { return Falha::SemMemoria };
         if let Fonte::Arquivo { no, deslocamento, tamanho } = &regiao.fonte {
             let dentro = pagina - regiao.inicio;
             if dentro < *tamanho {

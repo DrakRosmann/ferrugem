@@ -48,10 +48,12 @@ const MODO_DIRETORIO: u16 = 0x4000;
 const MODO_ARQUIVO: u16 = 0x8000;
 const MODO_LINK: u16 = 0xA000;
 const MODO_FIFO: u16 = 0x1000;
+const MODO_SOCKET: u16 = 0xC000;
 pub const TIPO_ENTRADA_ARQUIVO: u8 = 1;
 pub const TIPO_ENTRADA_DIRETORIO: u8 = 2;
 pub const TIPO_ENTRADA_LINK: u8 = 7;
 pub const TIPO_ENTRADA_FIFO: u8 = 5;
+pub const TIPO_ENTRADA_SOCKET: u8 = 6;
 const MAX_CACHE: usize = 2048;
 
 /// Cada sistema de arquivos montado recebe um número (para os ids dos inodes
@@ -92,6 +94,9 @@ impl Inode {
     fn eh_fifo(&self) -> bool {
         self.modo() & 0xF000 == MODO_FIFO
     }
+    fn eh_socket(&self) -> bool {
+        self.modo() & 0xF000 == MODO_SOCKET
+    }
     fn tipo_entrada(&self) -> u8 {
         if self.eh_diretorio() {
             TIPO_ENTRADA_DIRETORIO
@@ -99,6 +104,8 @@ impl Inode {
             TIPO_ENTRADA_LINK
         } else if self.eh_fifo() {
             TIPO_ENTRADA_FIFO
+        } else if self.eh_socket() {
+            TIPO_ENTRADA_SOCKET
         } else {
             TIPO_ENTRADA_ARQUIVO
         }
@@ -135,6 +142,7 @@ impl Inode {
             diretorio: self.eh_diretorio(),
             link: self.eh_link(),
             fifo: self.eh_fifo(),
+            socket: self.eh_socket(),
             tamanho: self.tamanho(),
             modificado: self.modificado_em(),
             permissoes: (self.modo() & 0o7777) as u32,
@@ -155,6 +163,7 @@ pub struct InfoInode {
     pub diretorio: bool,
     pub link: bool,
     pub fifo: bool,
+    pub socket: bool,
     pub tamanho: u64,
     pub modificado: u64,
     pub permissoes: u32,
@@ -387,6 +396,11 @@ impl Ext2 {
     /// Um FIFO (pipe com nome): só um inode, sem dados (o pipe vive no kernel).
     pub fn criar_fifo(&self, dir: u32, nome: &str, permissoes: u32, uid: u32, gid: u32) -> Result<u32, i64> {
         self.criar_do_tipo(dir, nome, MODO_FIFO, permissoes, uid, gid)
+    }
+
+    /// O endereço de um socket Unix: também só um inode.
+    pub fn criar_socket(&self, dir: u32, nome: &str, permissoes: u32, uid: u32, gid: u32) -> Result<u32, i64> {
+        self.criar_do_tipo(dir, nome, MODO_SOCKET, permissoes, uid, gid)
     }
 
     /// Muda o tamanho: encolher devolve os blocos que sobram; crescer só

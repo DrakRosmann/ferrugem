@@ -14,7 +14,7 @@ use crate::vfs::{self, Cred, Dispositivo, Meta, Vnode};
 use crate::rtc;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const POLLIN: u16 = 0x1;
 pub const POLLOUT: u16 = 0x4;
@@ -25,6 +25,7 @@ pub const POLLNVAL: u16 = 0x20;
 pub const O_ACESSO: u64 = 3;
 pub const O_RDONLY: u64 = 0;
 pub const O_WRONLY: u64 = 1;
+pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0o100;
 pub const O_EXCL: u64 = 0o200;
 pub const O_TRUNC: u64 = 0o1000;
@@ -41,15 +42,27 @@ pub enum Tipo {
     Terminal(Vnode, tty::IdTerminal),
     /// O lado mestre de um pseudo-terminal (o que /dev/ptmx devolve).
     PtyMestre(Vnode, tty::IdTerminal),
+    Socket(Arc<crate::socket::Socket>),
+    Epoll(Arc<crate::epoll::Epoll>),
 }
 
 pub struct Arquivo {
     pub tipo: Tipo,
     pub posicao: Mutex<u64>,
-    flags: u64,
+    /// O modo de acesso e as flags que o `fcntl(F_SETFL)` muda (O_APPEND, O_NONBLOCK).
+    flags: AtomicU64,
 }
 
 impl Arquivo {
+    pub fn novo(tipo: Tipo, flags: u64) -> Arc<Arquivo> {
+        Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags: AtomicU64::new(flags) })
+    }
+
+    /// Com O_NONBLOCK, quem teria que esperar recebe EAGAIN na hora.
+    pub fn bloqueia(&self) -> bool {
+        self.flags() & O_NONBLOCK == 0
+    }
+
     /// `permissoes`: as de um arquivo novo, se `O_CREAT` precisar criá-lo.
     pub fn abrir(caminho: &str, flags: u64, cred: Cred, permissoes: u32) -> Result<Arc<Arquivo>, i64> {
         let escrita = flags & O_ACESSO != O_RDONLY;
@@ -86,12 +99,12 @@ impl Arquivo {
                 Dispositivo::Ptmx => {
                     let id = tty::abrir_mestre(cred.uid, cred.gid)?;
                     let tipo = Tipo::PtyMestre(no, id);
-                    return Ok(Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags }));
+                    return Ok(Arquivo::novo(tipo, flags));
                 }
-                _ => return Ok(Arc::new(Arquivo { tipo: Tipo::No(no), posicao: Mutex::new(0), flags })),
+                _ => return Ok(Arquivo::novo(Tipo::No(no), flags)),
             };
             tty::abrir(terminal, flags & O_NOCTTY != 0)?;
-            return Ok(Arc::new(Arquivo { tipo: Tipo::Terminal(no, terminal), posicao: Mutex::new(0), flags }));
+            return Ok(Arquivo::novo(Tipo::Terminal(no, terminal), flags));
         }
         match no.tipo()? {
             vfs::Tipo::Diretorio if escrita => return Err(EISDIR),
@@ -100,19 +113,21 @@ impl Arquivo {
             vfs::Tipo::Arquivo if escrita && flags & O_TRUNC != 0 => no.truncar()?,
             _ => {}
         }
-        Ok(Arc::new(Arquivo { tipo: Tipo::No(no), posicao: Mutex::new(0), flags }))
+        Ok(Arquivo::novo(Tipo::No(no), flags))
     }
 
     pub fn ler(&self, buf: &mut [u8]) -> Result<usize, i64> {
-        if self.flags & O_ACESSO == O_WRONLY {
+        if self.flags() & O_ACESSO == O_WRONLY {
             return Err(EBADF);
         }
         let no = match &self.tipo {
-            Tipo::LeituraPipe(pipe) => return pipe.ler(buf),
+            Tipo::LeituraPipe(pipe) => return pipe.ler(buf, self.bloqueia()),
             Tipo::EscritaPipe(_) => return Err(EBADF),
             // Ler um terminal pode dormir até alguém digitar.
-            Tipo::Terminal(_, id) => return tty::ler(*id, buf),
-            Tipo::PtyMestre(_, id) => return tty::ler_mestre(*id, buf),
+            Tipo::Terminal(_, id) => return tty::ler(*id, buf, self.bloqueia()),
+            Tipo::PtyMestre(_, id) => return tty::ler_mestre(*id, buf, self.bloqueia()),
+            Tipo::Socket(s) => return s.receber(buf, self.bloqueia()).map(|(n, _)| n),
+            Tipo::Epoll(_) => return Err(EINVAL),
             Tipo::No(no) => no,
         };
         match no.tipo()? {
@@ -124,6 +139,7 @@ impl Arquivo {
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
             vfs::Tipo::Link | vfs::Tipo::Fifo => Err(EINVAL), // o open segue links e abre FIFOs como pipe
+            vfs::Tipo::Socket => Err(ENXIO),
             vfs::Tipo::Dispositivo(Dispositivo::Nulo) => Ok(0),
             vfs::Tipo::Dispositivo(Dispositivo::Zero) => {
                 buf.fill(0);
@@ -145,20 +161,22 @@ impl Arquivo {
     }
 
     pub fn escrever(&self, dados: &[u8]) -> Result<usize, i64> {
-        if self.flags & O_ACESSO == O_RDONLY {
+        if self.flags() & O_ACESSO == O_RDONLY {
             return Err(EBADF);
         }
         let no = match &self.tipo {
-            Tipo::EscritaPipe(pipe) => return pipe.escrever(dados),
+            Tipo::EscritaPipe(pipe) => return pipe.escrever(dados, self.bloqueia(), true),
             Tipo::LeituraPipe(_) => return Err(EBADF),
             Tipo::Terminal(_, id) => return tty::escrever(*id, dados),
             Tipo::PtyMestre(_, id) => return tty::escrever_mestre(*id, dados),
+            Tipo::Socket(s) => return s.enviar(dados, None, self.bloqueia(), true),
+            Tipo::Epoll(_) => return Err(EINVAL),
             Tipo::No(no) => no,
         };
         match no.tipo()? {
             vfs::Tipo::Arquivo => {
                 let mut posicao = self.posicao.lock();
-                if self.flags & O_APPEND != 0 {
+                if self.flags() & O_APPEND != 0 {
                     *posicao = no.tamanho()?;
                 }
                 let n = no.escrever(*posicao, dados)?;
@@ -167,6 +185,7 @@ impl Arquivo {
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
             vfs::Tipo::Link | vfs::Tipo::Fifo => Err(EINVAL),
+            vfs::Tipo::Socket => Err(ENXIO),
             vfs::Tipo::Dispositivo(Dispositivo::Bloco(i)) => {
                 let bloco = crate::blocos::listar().get(i as usize).cloned().ok_or(EIO)?;
                 let mut posicao = self.posicao.lock();
@@ -179,7 +198,14 @@ impl Arquivo {
     }
 
     pub fn flags(&self) -> u64 {
-        self.flags
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// `fcntl(F_SETFL)`: só O_APPEND e O_NONBLOCK mudam; o modo de acesso fica.
+    pub fn definir_flags(&self, novas: u64) {
+        let mutaveis = O_APPEND | O_NONBLOCK;
+        let atuais = self.flags();
+        self.flags.store(atuais & !mutaveis | novas & mutaveis, Ordering::Relaxed);
     }
 
     /// O nó do sistema de arquivos por trás (não existe para os pipes).
@@ -206,6 +232,8 @@ impl Arquivo {
             Tipo::EscritaPipe(pipe) => pipe.prontidao(true),
             Tipo::Terminal(_, id) => if tty::pode_ler(*id) { POLLIN | POLLOUT } else { POLLOUT },
             Tipo::PtyMestre(_, id) => if tty::pode_ler_mestre(*id) { POLLIN | POLLOUT } else { POLLOUT },
+            Tipo::Socket(s) => s.prontidao(),
+            Tipo::Epoll(e) => if e.tem_prontos() { POLLIN } else { 0 },
             Tipo::No(no) => match no.tipo() {
                 Ok(_) => POLLIN | POLLOUT, // arquivos comuns nunca bloqueiam
                 Err(_) => POLLERR,
@@ -219,7 +247,7 @@ impl Arquivo {
         let tamanho = match no.tipo()? {
             vfs::Tipo::Arquivo => no.tamanho()? as i64,
             vfs::Tipo::Diretorio | vfs::Tipo::Link => 0,
-            vfs::Tipo::Fifo => return Err(ESPIPE),
+            vfs::Tipo::Fifo | vfs::Tipo::Socket => return Err(ESPIPE),
             vfs::Tipo::Dispositivo(Dispositivo::Bloco(i)) => {
                 crate::blocos::listar().get(i as usize).map_or(0, |b| b.tamanho() as i64)
             }
@@ -255,7 +283,7 @@ impl Drop for Arquivo {
             }
             Tipo::Terminal(_, id) => tty::fechou(*id),
             Tipo::PtyMestre(_, id) => tty::fechar_mestre(*id),
-            Tipo::No(_) => {}
+            Tipo::No(_) | Tipo::Socket(_) | Tipo::Epoll(_) => {}
         }
     }
 }
@@ -286,7 +314,7 @@ impl Pipe {
             escritores: AtomicUsize::new(1),
             aberturas: [AtomicUsize::new(1), AtomicUsize::new(1)],
         });
-        let ponta = |tipo, flags| Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags });
+        let ponta = |tipo, flags| Arquivo::novo(tipo, flags);
         (
             ponta(Tipo::LeituraPipe(pipe.clone()), O_RDONLY),
             ponta(Tipo::EscritaPipe(pipe), O_WRONLY),
@@ -300,7 +328,7 @@ impl Pipe {
         }
     }
 
-    fn prontidao(&self, escrita: bool) -> u16 {
+    pub fn prontidao(&self, escrita: bool) -> u16 {
         let tamanho = self.dados.lock().len();
         if escrita {
             if self.leitores.load(Ordering::Relaxed) == 0 {
@@ -348,7 +376,7 @@ impl Pipe {
         processo::acordar(pipe.canal());
         // Montado já agora: se a espera for interrompida, o Drop desfaz a contagem.
         let tipo = if escrita { Tipo::EscritaPipe(pipe.clone()) } else { Tipo::LeituraPipe(pipe.clone()) };
-        let arquivo = Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags: flags & O_ACESSO });
+        let arquivo = Arquivo::novo(tipo, flags & (O_ACESSO | O_NONBLOCK));
         let outra = if escrita { &pipe.leitores } else { &pipe.escritores };
         // Espera alguém na outra ponta — ou que alguém tenha aparecido (e talvez
         // já ido embora) enquanto esperávamos.
@@ -365,11 +393,30 @@ impl Pipe {
     }
 
     /// O "canal" onde leitores e escritores dormem: o endereço do próprio pipe.
-    fn canal(&self) -> usize {
+    pub fn canal(&self) -> usize {
         self as *const Pipe as usize
     }
 
-    fn ler(&self, buf: &mut [u8]) -> Result<usize, i64> {
+    /// Um pipe com uma ponta de cada lado, sem descritores (os sockets
+    /// conectados usam dois destes, um para cada sentido).
+    pub fn conectado() -> Arc<Pipe> {
+        Arc::new(Pipe {
+            dados: Mutex::new(VecDeque::new()),
+            leitores: AtomicUsize::new(1),
+            escritores: AtomicUsize::new(1),
+            aberturas: [AtomicUsize::new(1), AtomicUsize::new(1)],
+        })
+    }
+
+    /// Uma das pontas saiu (fechou ou deu `shutdown`).
+    pub fn soltar(&self, escrita: bool) {
+        let ponta = if escrita { &self.escritores } else { &self.leitores };
+        ponta.fetch_sub(1, Ordering::Relaxed);
+        self.esvaziar_se_ninguem_usa();
+        processo::acordar(self.canal());
+    }
+
+    pub fn ler(&self, buf: &mut [u8], bloquear: bool) -> Result<usize, i64> {
         loop {
             {
                 let mut dados = self.dados.lock();
@@ -385,6 +432,9 @@ impl Pipe {
             if self.escritores.load(Ordering::Relaxed) == 0 {
                 return Ok(0); // ninguém mais vai escrever: fim de arquivo
             }
+            if !bloquear {
+                return Err(EAGAIN);
+            }
             if processo::tem_sinal_pendente() {
                 return Err(EINTR);
             }
@@ -392,13 +442,16 @@ impl Pipe {
         }
     }
 
-    fn escrever(&self, dados: &[u8]) -> Result<usize, i64> {
+    /// `sigpipe`: escrever sem leitor manda SIGPIPE (os sockets podem pedir que não).
+    pub fn escrever(&self, dados: &[u8], bloquear: bool, sigpipe: bool) -> Result<usize, i64> {
         let mut escritos = 0;
         while escritos < dados.len() {
             if self.leitores.load(Ordering::Relaxed) == 0 {
                 // Escrever num pipe sem leitor mata o processo com SIGPIPE,
                 // como no Unix (é o que encerra `programa | head`).
-                processo::enviar_sinal(processo::atual().pid, processo::SIGPIPE).ok();
+                if sigpipe {
+                    processo::enviar_sinal(processo::atual().pid, processo::SIGPIPE).ok();
+                }
                 return if escritos > 0 { Ok(escritos) } else { Err(EPIPE) };
             }
             {
@@ -411,6 +464,9 @@ impl Pipe {
                     processo::acordar(self.canal());
                     continue;
                 }
+            }
+            if !bloquear {
+                return if escritos > 0 { Ok(escritos) } else { Err(EAGAIN) };
             }
             if processo::tem_sinal_pendente() {
                 return if escritos > 0 { Ok(escritos) } else { Err(EINTR) };

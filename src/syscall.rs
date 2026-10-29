@@ -15,7 +15,7 @@ use crate::paginacao::EspacoEnderecos;
 use crate::paginacao::{Fonte, Regiao};
 use crate::processo::{self, MAX_ARQUIVOS};
 use crate::vfs::{self, Vnode};
-use crate::{heap, pit, porta, println, quadros, rtc, sinal, tty};
+use crate::{epoll, heap, pit, porta, println, quadros, rtc, sinal, socket, tty};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -53,7 +53,7 @@ pub fn init() {
     escrever_msr(SFMASK, (1 << 9) | (1 << 10) | (1 << 8));
 }
 
-type Resultado = Result<u64, i64>;
+pub(crate) type Resultado = Result<u64, i64>;
 
 pub fn tratar(ctx: &mut Contexto) {
     // ptrace: na entrada, o rastreador vê o número em orig_rax (e pode trocá-lo).
@@ -84,6 +84,30 @@ pub fn tratar(ctx: &mut Contexto) {
         }
         26 => sys_msync(a1, a2),
         28 => Ok(0), // madvise: só um conselho; pode ser ignorado
+        41 => socket::socket(a1, a2),
+        42 => socket::connect(a1, a2, a3),
+        43 => socket::accept(a1, a2, a3, 0),
+        288 => socket::accept(a1, a2, a3, a4),
+        44 => socket::sendto(a1, a2, a3, a4, a5, ctx.r9),
+        45 => socket::recvfrom(a1, a2, a3, a4, a5, ctx.r9),
+        46 => socket::sendmsg(a1, a2, a3),
+        47 => socket::recvmsg(a1, a2, a3),
+        48 => socket::shutdown(a1, a2),
+        49 => socket::bind(a1, a2, a3),
+        50 => socket::listen(a1, a2),
+        51 => socket::getsockname(a1, a2, a3),
+        52 => socket::getpeername(a1, a2, a3),
+        53 => socket::socketpair(a1, a2, a4),
+        54 => Ok(0), // setsockopt: as opções (tamanhos de buffer etc.) são aceitas e ignoradas
+        55 => socket::getsockopt(a1, a2, a3, a4, a5),
+        213 | 291 => epoll::criar(if numero == 291 { a1 } else { 0 }),
+        233 => epoll::controlar(a1, a2, a3, a4),
+        232 => epoll::esperar(a1, a2, a3, if a4 as i32 >= 0 { Some(a4 as i32 as u64) } else { None }),
+        281 => epoll::esperar(a1, a2, a3, if a4 as i32 >= 0 { Some(a4 as i32 as u64) } else { None }), // epoll_pwait (sem máscara)
+        29 => crate::shm::shmget(a1 as i32, a2, a3),
+        30 => crate::shm::shmat(a1 as i32, a2, a3),
+        31 => crate::shm::shmctl(a1 as i32, a2, a3),
+        67 => crate::shm::shmdt(a1),
         3 => sys_close(a1),
         4 => sys_stat(a1, a2),
         5 => sys_fstat(a1, a2),
@@ -214,16 +238,16 @@ fn espaco() -> &'static EspacoEnderecos {
     processo::atual().espaco().expect("syscall sem espaço de usuário")
 }
 
-fn ler_usuario(ptr: u64, tamanho: usize) -> Result<Vec<u8>, i64> {
+pub(crate) fn ler_usuario(ptr: u64, tamanho: usize) -> Result<Vec<u8>, i64> {
     espaco().copiar_de(ptr, tamanho).ok_or(EFAULT)
 }
 
-fn escrever_usuario(ptr: u64, dados: &[u8]) -> Result<(), i64> {
+pub(crate) fn escrever_usuario(ptr: u64, dados: &[u8]) -> Result<(), i64> {
     if espaco().copiar_para(ptr, dados) { Ok(()) } else { Err(EFAULT) }
 }
 
 /// Lê um caminho do programa e já o resolve em relação ao diretório atual.
-fn caminho(ptr: u64) -> Result<String, i64> {
+pub(crate) fn caminho(ptr: u64) -> Result<String, i64> {
     let texto = espaco().ler_string(ptr, 4096).ok_or(EFAULT)?;
     if texto.is_empty() {
         return Err(ENOENT);
@@ -236,7 +260,7 @@ fn termina_em_barra(ptr: u64) -> bool {
     espaco().ler_string(ptr, 4096).is_some_and(|s| s.len() > 1 && s.ends_with('/'))
 }
 
-fn arquivo(fd: u64) -> Result<Arc<Arquivo>, i64> {
+pub(crate) fn arquivo(fd: u64) -> Result<Arc<Arquivo>, i64> {
     processo::atual()
         .arquivos()
         .lista
@@ -247,7 +271,7 @@ fn arquivo(fd: u64) -> Result<Arc<Arquivo>, i64> {
 
 /// Põe o arquivo no menor descritor livre (regra do Unix: por isso `close(1)`
 /// seguido de `open` faz o arquivo virar a saída padrão).
-fn novo_descritor(arq: Arc<Arquivo>) -> Resultado {
+pub(crate) fn novo_descritor(arq: Arc<Arquivo>) -> Resultado {
     let tabela = &mut processo::atual().arquivos().lista;
     if let Some(fd) = tabela.iter().position(|a| a.is_none()) {
         tabela[fd] = Some(arq);
@@ -278,7 +302,7 @@ fn sys_write(fd: u64, buf: u64, tamanho: u64) -> Resultado {
     arq.escrever(&dados).map(|n| n as u64)
 }
 
-fn cred() -> vfs::Cred {
+pub(crate) fn cred() -> vfs::Cred {
     processo::atual().cred()
 }
 
@@ -314,7 +338,7 @@ fn caminho_at(dirfd: u64, ptr: u64) -> Result<String, i64> {
 }
 
 /// O diretório onde `caminho` está, conferindo que podemos escrever nele.
-fn pai_gravavel(caminho: &str) -> Result<Vnode, i64> {
+pub(crate) fn pai_gravavel(caminho: &str) -> Result<Vnode, i64> {
     let (pai, _) = vfs::separar(caminho)?;
     let pai = vfs::buscar_como(pai, cred())?;
     pai.permite(cred(), vfs::ESCREVER | vfs::EXECUTAR)?;
@@ -467,8 +491,11 @@ fn sys_fcntl(fd: u64, comando: u64, argumento: u64) -> Resultado {
             }
             Ok(0)
         }
-        F_GETFL => Ok(arq.flags() & 0o3),
-        F_SETFL => Ok(0), // O_NONBLOCK etc.: ignorados
+        F_GETFL => Ok(arq.flags() & (0o3 | crate::arquivo::O_APPEND | crate::arquivo::O_NONBLOCK)),
+        F_SETFL => {
+            arq.definir_flags(argumento);
+            Ok(0)
+        }
         _ => Err(EINVAL),
     }
 }
@@ -561,7 +588,10 @@ fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, desloca
     }
     let tamanho = (tamanho + 0xFFF) & !0xFFF;
     let compartilhada = flags & MAP_SHARED != 0;
-    let fonte = if flags & MAP_ANONYMOUS != 0 {
+    let fonte = if flags & MAP_ANONYMOUS != 0 && compartilhada {
+        // Páginas que o pai e os filhos (depois do fork) dividem de verdade.
+        Fonte::Segmento { segmento: crate::paginacao::Segmento::novo(tamanho), pagina: 0 }
+    } else if flags & MAP_ANONYMOUS != 0 {
         Fonte::Anonima
     } else {
         let arq = arquivo(fd)?;
@@ -593,7 +623,7 @@ fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, desloca
     };
     let regiao = Regiao { inicio, fim: inicio + tamanho, prot: prot as u8 & 7, compartilhada, fonte };
     let espaco = p.espaco().ok_or(EINVAL)?;
-    if compartilhada {
+    if compartilhada && matches!(regiao.fonte, Fonte::Arquivo { .. }) {
         if !espaco.criar_regiao_ja_alocada(regiao) {
             espaco.remover_faixa(inicio, inicio + tamanho);
             return Err(ENOMEM);
@@ -783,6 +813,10 @@ fn sys_time(ptr: u64) -> Resultado {
 
 fn sys_pipe(ptr: u64, flags: u64) -> Resultado {
     let (leitura, escrita) = Pipe::novo();
+    if flags & crate::arquivo::O_NONBLOCK != 0 {
+        leitura.definir_flags(crate::arquivo::O_NONBLOCK);
+        escrita.definir_flags(crate::arquivo::O_NONBLOCK);
+    }
     let fd_leitura = novo_descritor(leitura)?;
     let fd_escrita = match novo_descritor(escrita) {
         Ok(fd) => fd,
@@ -805,6 +839,7 @@ const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFSOCK: u32 = 0o140000;
 const S_IFLNK: u32 = 0o120000;
 
 /// A `struct stat` do Linux x86_64 (144 bytes); preenchemos os campos principais.
@@ -832,6 +867,7 @@ fn stat_do_no(no: &Vnode) -> Result<[u8; 144], i64> {
         vfs::Tipo::Dispositivo(_) => S_IFCHR,
         vfs::Tipo::Link => S_IFLNK,
         vfs::Tipo::Fifo => S_IFIFO,
+        vfs::Tipo::Socket => S_IFSOCK,
     };
     let m = no.meta()?;
     let mut stat = montar_stat(no.id(), tipo | m.permissoes, no.tamanho()?, m.modificado, m.uid, m.gid);
@@ -889,9 +925,12 @@ fn sys_link(existente: Result<String, i64>, novo: Result<String, i64>) -> Result
 }
 
 fn sys_fstat(fd: u64, buf: u64) -> Resultado {
-    let stat = match arquivo(fd)?.vnode() {
-        Some(no) => stat_do_no(no)?,
-        None => montar_stat(0, S_IFIFO | 0o600, 0, 0, 0, 0),
+    let arq = arquivo(fd)?;
+    let stat = match (arq.vnode(), &arq.tipo) {
+        (Some(no), _) => stat_do_no(no)?,
+        (None, Tipo::Socket(_)) => montar_stat(0, S_IFSOCK | 0o777, 0, 0, 0, 0),
+        (None, Tipo::Epoll(_)) => montar_stat(0, 0o600, 0, 0, 0, 0),
+        (None, _) => montar_stat(0, S_IFIFO | 0o600, 0, 0, 0, 0),
     };
     escrever_usuario(buf, &stat)?;
     Ok(0)
@@ -910,6 +949,7 @@ fn sys_getdents64(fd: u64, buf: u64, tamanho: u64) -> Resultado {
             vfs::Tipo::Dispositivo(_) => 2,  // DT_CHR
             vfs::Tipo::Link => 10,           // DT_LNK
             vfs::Tipo::Fifo => 1,            // DT_FIFO
+            vfs::Tipo::Socket => 12,         // DT_SOCK
         };
         entradas.push((nome, id, tipo));
     }

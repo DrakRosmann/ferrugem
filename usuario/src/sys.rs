@@ -223,6 +223,9 @@ impl Stat {
     pub fn eh_fifo(&self) -> bool {
         self.modo & 0o170000 == 0o010000
     }
+    pub fn eh_socket(&self) -> bool {
+        self.modo & 0o170000 == 0o140000
+    }
 }
 
 fn decodificar_stat(b: &[u8; 144]) -> Stat {

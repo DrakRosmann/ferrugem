@@ -68,6 +68,8 @@ pub enum Conteudo {
     Link(String),
     /// FIFO (pipe com nome): o pipe em si fica na tabela FIFOS.
     Fifo,
+    /// O endereço de um socket Unix (o socket em si fica em `socket::LIGADOS`).
+    Socket,
 }
 
 pub struct No {
@@ -129,6 +131,7 @@ pub enum Tipo {
     Dispositivo(Dispositivo),
     Link,
     Fifo,
+    Socket,
 }
 
 /// Qualquer arquivo ou diretório, esteja na memória, no disco ou no /proc.
@@ -207,6 +210,7 @@ impl Vnode {
                 Conteudo::Dispositivo(d) => Tipo::Dispositivo(*d),
                 Conteudo::Link(_) => Tipo::Link,
                 Conteudo::Fifo => Tipo::Fifo,
+                Conteudo::Socket => Tipo::Socket,
             }),
             Vnode::Disco(fs, inode) => {
                 let info = fs.info(*inode)?;
@@ -216,6 +220,8 @@ impl Vnode {
                     Tipo::Link
                 } else if info.fifo {
                     Tipo::Fifo
+                } else if info.socket {
+                    Tipo::Socket
                 } else {
                     Tipo::Arquivo
                 })
@@ -417,6 +423,7 @@ impl Vnode {
                         ext2::TIPO_ENTRADA_DIRETORIO => Tipo::Diretorio,
                         ext2::TIPO_ENTRADA_LINK => Tipo::Link,
                         ext2::TIPO_ENTRADA_FIFO => Tipo::Fifo,
+                        ext2::TIPO_ENTRADA_SOCKET => Tipo::Socket,
                         _ => Tipo::Arquivo,
                     };
                     (nome, (fs.id as u64) << 32 | i as u64, tipo)
@@ -693,6 +700,19 @@ pub fn criar_fifo(caminho: &str, meta: Meta) -> Result<(), i64> {
         Vnode::Disco(fs, dir) => fs.criar_fifo(dir, nome, meta.permissoes, meta.uid, meta.gid).map(|_| ()),
         Vnode::Proc(_) => Err(EACCES),
     }
+}
+
+/// Cria o nó de um socket Unix (o `bind`) e devolve o vnode dele.
+pub fn criar_socket(caminho: &str, meta: Meta) -> Result<Vnode, i64> {
+    let (pai, nome) = separar(caminho)?;
+    match buscar(pai)? {
+        Vnode::Memoria(_) => criar_na_memoria(caminho, Conteudo::Socket, Some(meta))?,
+        Vnode::Disco(fs, dir) => {
+            fs.criar_socket(dir, nome, meta.permissoes, meta.uid, meta.gid)?;
+        }
+        Vnode::Proc(_) => return Err(EACCES),
+    }
+    buscar(caminho)
 }
 
 /// Cria um link simbólico em `caminho` apontando para `alvo`.

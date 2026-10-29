@@ -32,6 +32,18 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const ENOTSOCK: i64 = 88;
+pub const EDESTADDRREQ: i64 = 89;
+pub const EMSGSIZE: i64 = 90;
+pub const EPROTOTYPE: i64 = 91;
+pub const ENOPROTOOPT: i64 = 92;
+pub const ESOCKTNOSUPPORT: i64 = 94;
+pub const EOPNOTSUPP: i64 = 95;
+pub const EAFNOSUPPORT: i64 = 97;
+pub const EADDRINUSE: i64 = 98;
+pub const EISCONN: i64 = 106;
+pub const ENOTCONN: i64 = 107;
+pub const ECONNREFUSED: i64 = 111;
 pub const ETIMEDOUT: i64 = 110;
 
 /// Interno do kernel (o programa nunca vê): "refaça esta chamada de sistema

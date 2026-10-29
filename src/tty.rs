@@ -284,7 +284,7 @@ pub fn receber(id: IdTerminal, c: char) {
 }
 
 /// Entrega no máximo uma linha (no modo canônico). Dorme enquanto não houver nada.
-pub fn ler(id: IdTerminal, buf: &mut [u8]) -> Result<usize, i64> {
+pub fn ler(id: IdTerminal, buf: &mut [u8], bloquear: bool) -> Result<usize, i64> {
     let t = terminal(id)?;
     // Quem não está em primeiro plano no seu terminal de controle não lê o
     // teclado: o grupo dele é parado com SIGTTIN, e esta chamada é refeita
@@ -328,6 +328,9 @@ pub fn ler(id: IdTerminal, buf: &mut [u8]) -> Result<usize, i64> {
         // Pseudo-terminal cujo mestre fechou: ninguém mais vai digitar.
         if !t.mestre_aberto.load(Ordering::Relaxed) {
             return Err(EIO);
+        }
+        if !bloquear {
+            return Err(EAGAIN);
         }
         if processo::tem_sinal_pendente() {
             return Err(EINTR);
@@ -505,7 +508,7 @@ pub fn abrir_mestre(uid: u32, gid: u32) -> Result<IdTerminal, i64> {
 }
 
 /// Lê o que os programas do escravo escreveram (a "tela" do pseudo-terminal).
-pub fn ler_mestre(id: IdTerminal, buf: &mut [u8]) -> Result<usize, i64> {
+pub fn ler_mestre(id: IdTerminal, buf: &mut [u8], bloquear: bool) -> Result<usize, i64> {
     let t = terminal(id)?;
     loop {
         {
@@ -517,6 +520,9 @@ pub fn ler_mestre(id: IdTerminal, buf: &mut [u8]) -> Result<usize, i64> {
                 }
                 return Ok(n);
             }
+        }
+        if !bloquear {
+            return Err(EAGAIN);
         }
         if processo::tem_sinal_pendente() {
             return Err(EINTR);
