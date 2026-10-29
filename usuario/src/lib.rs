@@ -32,6 +32,7 @@ mod lista_livre;
 mod memoria;
 pub mod sha256;
 pub mod sys;
+pub mod truetype;
 pub mod usuarios;
 
 pub use alloc::boxed::Box;

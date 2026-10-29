@@ -136,7 +136,14 @@ interface gráfica.
   painel com relógio, janelas arrastáveis, terminais (emulador com cores
   ANSI ligado a um pseudo-terminal com um `sh`) e janelas de outros
   programas, que conversam com o servidor por um socket Unix e desenham numa
-  memória compartilhada (`ulib::janela`; exemplo: `pintar`).
+  memória compartilhada (`ulib::janela`; exemplos: `pintar`, `fontes`).
+- **Texto:** a fonte da VGA ganha no boot as letras acentuadas que faltam
+  (ã, õ, Á, Â, Ã, Ê, Í, Ó, Ô, Õ, Ú), geradas no estilo dela: consoles de
+  texto e terminais da interface mostram o português inteiro. E fontes
+  **TrueType** de qualquer tamanho, com bordas suaves (`ulib::truetype`: um
+  leitor de .ttf e um rasterizador por acumulação de área, feitos aqui),
+  usadas no painel e nos títulos; o `make` copia DejaVu Sans e Liberation
+  Mono do sistema de quem compila, se houver.
 
 - **Várias CPUs (SMP):** x2APIC, CPUs achadas pela MADT do ACPI e acordadas
   por INIT-SIPI-SIPI (`trampolim.asm`), dados por CPU com `swapgs`, timer do
@@ -194,6 +201,8 @@ interface gráfica.
 | `src/smp.rs`, `trampolim.asm` | Várias CPUs: APIC, ACPI, acordar as outras, a trava do kernel |
 | `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
 | `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
+| `usuario/src/truetype.rs` | Fontes TrueType: leitor de .ttf e rasterizador com suavização |
+| `comum/cp437.rs` | A tabela da fonte da VGA e as letras acentuadas geradas no boot |
 | `comum/lista_livre.rs` | Alocador usado pelo kernel e pelos programas |
 | `usuario/src/lib.rs` + `sys.rs`, `io.rs` | `ulib`, a biblioteca dos programas |
 | `usuario/src/bin/*.rs` | Um programa por arquivo, todos vão para `/bin` |
@@ -261,8 +270,10 @@ de páginas. O `make run` usa 4 CPUs.
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica:** mais programas com janela, redimensionar janelas,
-   fontes maiores, acentos completos (a fonte da VGA não tem "ã").
+4. **Interface gráfica, rumo a um desktop como o XFCE:** uma biblioteca de
+   componentes (botões, campos de texto, listas, menus); redimensionar,
+   maximizar e minimizar; barra de tarefas e menu de aplicativos;
+   gerenciador de arquivos, editor de texto, visualizador de imagens.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

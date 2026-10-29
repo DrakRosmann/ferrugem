@@ -53,6 +53,11 @@ BINARIOS_DIN := $(DINAMICO)/ld-ferrugem.so $(DINAMICO)/libsaudacao.so $(DINAMICO
 # carregador) e o c/ola.c ganha uma versão dinâmica, /bin/ola-dinamico.
 MUSL_SO      := $(wildcard ferramentas/musl/lib/libc.so)
 BINARIOS_DIN += $(if $(MUSL_SO),$(BUILD)/c/ola-dinamico)
+# Fontes TrueType para a interface gráfica: as que o sistema de quem compila
+# tiver (não entram no repositório). Sem elas, tudo usa a fonte da VGA.
+FONTES_TT := $(wildcard /usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf \
+                        /usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf \
+                        /usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf)
 # Programas de terceiros, sem nenhuma modificação (`make lua`).
 LUA        := $(wildcard ferramentas/lua/lua)
 
@@ -142,6 +147,7 @@ $(INITRD): $(USUARIO_OK) $(ARQUIVOS_RAIZ) $(BINARIOS_C) $(BINARIOS_DIN) $(LUA)
 	mkdir -p $(RAIZ)/lib $(RAIZ)/var/log $(RAIZ)/var/spool/cron
 	cp $(DINAMICO)/ld-ferrugem.so $(DINAMICO)/libsaudacao.so $(RAIZ)/lib/
 	cp $(DINAMICO)/dinamico $(RAIZ)/bin/
+	$(if $(FONTES_TT),mkdir -p $(RAIZ)/usr/share/fonts && cp $(FONTES_TT) $(RAIZ)/usr/share/fonts/)
 	$(if $(MUSL_SO),cp $(MUSL_SO) $(RAIZ)/lib/ld-musl-x86_64.so.1 && cp $(BUILD)/c/ola-dinamico $(RAIZ)/bin/)
 	chmod 4755 $(RAIZ)/bin/su $(RAIZ)/bin/passwd $(RAIZ)/bin/crontab    # setuid root
 	chmod 700 $(RAIZ)/var/spool/cron

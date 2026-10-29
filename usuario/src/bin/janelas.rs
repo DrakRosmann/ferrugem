@@ -26,6 +26,7 @@
 #![no_main]
 
 use ulib::grafico::{Fonte, Quadro, ALTURA_LETRA, LARGURA_LETRA};
+use ulib::truetype::FonteTT;
 use ulib::sys;
 use ulib::*;
 
@@ -53,6 +54,53 @@ const CURSOR: [&str; 16] = [
     "#", "##", "#.#", "#..#", "#...#", "#....#", "#.....#", "#......#", "#.......#", "#........#", "#.....####",
     "#..#..#", "#.# #..#", "##  #..#", "#    #..#", "      ##",
 ];
+
+// -----------------------------------------------------------------------------
+// As letras da interface
+// -----------------------------------------------------------------------------
+
+/// Painel, botões e títulos usam uma fonte TrueType (com bordas suaves), se
+/// houver em /usr/share/fonts; os terminais, a fonte da VGA (monoespaçada).
+struct Letras {
+    vga: Fonte,
+    normal: Option<FonteTT>,
+    negrito: Option<FonteTT>,
+}
+
+const TAMANHO_LETRA: u16 = 13;
+
+impl Letras {
+    fn carregar(vga: Fonte) -> Letras {
+        let normal = FonteTT::carregar("/usr/share/fonts/DejaVuSans.ttf");
+        let negrito = FonteTT::carregar("/usr/share/fonts/DejaVuSans-Bold.ttf");
+        Letras { vga, normal, negrito }
+    }
+
+    fn tt(&mut self, negrito: bool) -> Option<&mut FonteTT> {
+        if negrito && self.negrito.is_some() { self.negrito.as_mut() } else { self.normal.as_mut() }
+    }
+
+    /// Texto centrado na vertical numa faixa de `altura` pixels que começa em `y`.
+    fn escrever(&mut self, q: &mut Quadro, x: i32, y: i32, altura: i32, texto: &str, cor: u32, negrito: bool) -> i32 {
+        match self.tt(negrito) {
+            Some(f) => {
+                let (_, linha) = f.metricas(TAMANHO_LETRA);
+                q.texto_tt(f, x, y + (altura - linha) / 2, texto, TAMANHO_LETRA, cor)
+            }
+            None => {
+                q.texto(&self.vga, x, y + (altura - ALTURA_LETRA) / 2, texto, cor, None);
+                texto.chars().count() as i32 * LARGURA_LETRA
+            }
+        }
+    }
+
+    fn largura(&mut self, texto: &str, negrito: bool) -> i32 {
+        match self.tt(negrito) {
+            Some(f) => f.largura(texto, TAMANHO_LETRA),
+            None => texto.chars().count() as i32 * LARGURA_LETRA,
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // O emulador de terminal
@@ -344,19 +392,19 @@ impl Janela {
         }
     }
 
-    fn desenhar(&self, q: &mut Quadro, fonte: &Fonte, ativa: bool) {
+    fn desenhar(&self, q: &mut Quadro, letras: &mut Letras, ativa: bool) {
         let (w, h) = (self.largura_total(), self.altura_total());
         q.retangulo(self.x + 4, self.y + 4, w, h, 0x0E2630); // sombra
         q.retangulo(self.x, self.y, w, h, COR_BORDA);
         let (cx, cy) = (self.x + BORDA, self.y + BORDA);
         q.retangulo(cx, cy, self.largura, TITULO, if ativa { COR_ATIVA } else { COR_INATIVA });
-        q.texto(fonte, cx + 6, cy + 2, &self.titulo, COR_TEXTO, None);
+        letras.escrever(q, cx + 6, cy, TITULO, &self.titulo, COR_TEXTO, true);
         let fx = cx + self.largura - 18;
         q.retangulo(fx, cy + 2, 16, 16, 0x2B2F38);
-        q.letra(fonte, fx + 4, cy + 2, 'x', COR_TEXTO, None);
+        q.letra(&letras.vga, fx + 4, cy + 2, 'x', COR_TEXTO, None);
         let y0 = cy + TITULO;
         match &self.conteudo {
-            Conteudo::Terminal(t) => t.desenhar(q, fonte, cx, y0, ativa),
+            Conteudo::Terminal(t) => t.desenhar(q, &letras.vga, cx, y0, ativa),
             Conteudo::Cliente(c) => {
                 let n = (self.largura * self.altura) as usize;
                 let imagem = unsafe { core::slice::from_raw_parts(c.pixels as *const u32, n) };
@@ -381,7 +429,7 @@ struct Servidor {
     imagem: Vec<u32>,
     largura: i32,
     altura: i32,
-    fonte: Fonte,
+    letras: Letras,
     janelas: Vec<Janela>, // a última é a de cima (a ativa)
     pendentes: Vec<(i32, Vec<u8>)>, // conectados que ainda não pediram janela
     mouse: (i32, i32),
@@ -402,21 +450,24 @@ impl Servidor {
     fn compor(&mut self) {
         let hora = String::from(&sys::formatar_data(sys::hora_atual())[11..16]);
         // Empréstimos separados de cada campo: a imagem muda, o resto só é lido.
-        let Servidor { imagem, largura, altura, fonte, janelas, painel, .. } = self;
+        let Servidor { imagem, largura, altura, letras, janelas, painel, .. } = self;
         let (largura, altura) = (*largura, *altura);
         let mut q = Quadro { pixels: imagem, largura, altura };
         q.retangulo(0, PAINEL, largura, altura - PAINEL, COR_FUNDO);
-        q.texto(fonte, largura / 2 - 5 * 8, altura / 2, "FerrugemOS", 0x2F6A7E, None);
+        let marca = letras.largura("FerrugemOS", true);
+        letras.escrever(&mut q, (largura - marca) / 2, altura / 2, 20, "FerrugemOS", 0x2F6A7E, true);
         q.retangulo(0, 0, largura, PAINEL, COR_PAINEL);
-        q.texto(fonte, 8, 4, "FerrugemOS", COR_ATIVA, None);
+        letras.escrever(&mut q, 10, 0, PAINEL, "FerrugemOS", COR_ATIVA, true);
         for b in painel.iter() {
             q.retangulo(b.x, 3, b.largura, PAINEL - 6, 0x30353F);
-            q.texto(fonte, b.x + 8, 4, b.rotulo, COR_TEXTO, None);
+            letras.escrever(&mut q, b.x + 10, 3, PAINEL - 6, b.rotulo, COR_TEXTO, false);
         }
-        q.texto(fonte, largura - 8 * 10, 4, &format!("{} UTC", hora), COR_TEXTO, None);
+        let relogio = format!("{} UTC", hora);
+        let w = letras.largura(&relogio, false);
+        letras.escrever(&mut q, largura - w - 12, 0, PAINEL, &relogio, COR_TEXTO, false);
         let n = janelas.len();
         for (i, j) in janelas.iter().enumerate() {
-            j.desenhar(&mut q, fonte, i + 1 == n);
+            j.desenhar(&mut q, letras, i + 1 == n);
         }
         self.hora_mostrada = hora;
         // Copia para a tela (o cursor é redesenhado por cima em seguida).
@@ -764,10 +815,11 @@ fn principal(_args: &[&str]) -> i32 {
     let _ = sys::mudar_permissoes(ulib::janela::SOCKET, 0o666);
     sys::ignorar_sinal(sys::SIGPIPE, true); // um programa que fechou não derruba o servidor
 
+    let mut letras = Letras::carregar(fonte);
     let mut painel = Vec::new();
-    let mut x = 110;
+    let mut x = 20 + letras.largura("FerrugemOS", true) + 16;
     for rotulo in ["Terminal", "Pintar", "Sair"] {
-        let largura = rotulo.len() as i32 * 8 + 16;
+        let largura = letras.largura(rotulo, false) + 20;
         painel.push(Botao { x, largura, rotulo });
         x += largura + 8;
     }
@@ -776,7 +828,7 @@ fn principal(_args: &[&str]) -> i32 {
         imagem: vec![0; (largura * altura) as usize],
         largura,
         altura,
-        fonte,
+        letras,
         janelas: Vec::new(),
         pendentes: Vec::new(),
         mouse: (largura / 2, altura / 2),

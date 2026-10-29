@@ -1399,6 +1399,44 @@ fn varias_cpus() -> R {
     Ok(())
 }
 
+fn fontes_truetype() -> R {
+    use ulib::truetype::FonteTT;
+    let Some(mut f) = FonteTT::carregar("/usr/share/fonts/DejaVuSans.ttf") else {
+        return if sys::stat("/usr/share/fonts/DejaVuSans.ttf").is_ok() {
+            Err(String::from("não consegui ler a DejaVuSans.ttf"))
+        } else {
+            Ok(()) // o sistema de quem compilou não tinha a fonte
+        };
+    };
+    // "ã" é um glifo próprio (ou composto de "a" + "~"); um caractere que não existe vira o 0.
+    if f.indice('a') == 0 || f.indice('ã') == 0 || f.indice('ã') == f.indice('a') || f.indice('\u{10FFF0}') != 0 {
+        return Err(String::from("cmap: índices errados"));
+    }
+    let g = f.glifo('A', 32);
+    let (cheios, meios) = g.alfa.iter().fold((0, 0), |(c, m), &a| (c + (a == 255) as u32, m + (a > 0 && a < 255) as u32));
+    if !(18..=26).contains(&g.largura) || !(22..=28).contains(&g.altura) || cheios < 60 || meios < 20 {
+        return Err(format!("'A' em 32 px: {}x{}, {} pixels cheios, {} na borda", g.largura, g.altura, cheios, meios));
+    }
+    // O "A" é simétrico: a cobertura de cada linha também.
+    let w = g.largura as usize;
+    let linha = g.altura as usize / 2;
+    let soma = |de: usize, ate: usize| g.alfa[linha * w + de..linha * w + ate].iter().map(|&a| a as u32).sum::<u32>();
+    let (esquerda, direita) = (soma(0, w / 2), soma(w - w / 2, w));
+    if esquerda.abs_diff(direita) > 255 {
+        return Err(format!("o 'A' saiu torto: {} × {}", esquerda, direita));
+    }
+    // Um glifo composto ("Ã" = "A" + "~") cobre mais que o "A" sozinho.
+    let a: u32 = f.glifo('A', 20).alfa.iter().map(|&v| v as u32).sum();
+    let a_til: u32 = f.glifo('Ã', 20).alfa.iter().map(|&v| v as u32).sum();
+    if a_til <= a {
+        return Err(String::from("o 'Ã' não ganhou o til"));
+    }
+    if f.largura("FerrugemOS", 13) < 60 {
+        return Err(String::from("largura do texto"));
+    }
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1409,7 +1447,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 57] = [
+    let testes: [(&str, fn() -> R); 58] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1467,6 +1505,7 @@ fn principal(args: &[&str]) -> i32 {
         ("interface gráfica: framebuffer, servidor de janelas e um cliente", interface_grafica),
         ("bibliotecas dinâmicas: ld-ferrugem.so, ld-musl, PIE e ASLR", bibliotecas_dinamicas),
         ("várias CPUs: 4 processos em CPUs diferentes, ao mesmo tempo", varias_cpus),
+        ("fontes TrueType: cmap, glifos compostos, suavização", fontes_truetype),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

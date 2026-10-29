@@ -6,6 +6,7 @@
 //! dividem com o servidor (memória compartilhada).
 
 use crate::sys;
+use crate::truetype::FonteTT;
 use alloc::vec::Vec;
 
 /// Uma imagem para desenhar: `pixels` tem `largura * altura` itens.
@@ -106,6 +107,41 @@ impl Quadro<'_> {
         for (i, c) in texto.chars().enumerate() {
             self.letra(fonte, x + i as i32 * LARGURA_LETRA, y, c, frente, fundo);
         }
+    }
+
+    /// Mistura `cor` no pixel com a opacidade `alfa` (0 = nada, 255 = cor inteira).
+    pub fn misturar(&mut self, x: i32, y: i32, cor: u32, alfa: u8) {
+        if x < 0 || y < 0 || x >= self.largura || y >= self.altura || alfa == 0 {
+            return;
+        }
+        let i = (y * self.largura + x) as usize;
+        if alfa == 255 {
+            self.pixels[i] = cor;
+            return;
+        }
+        let (a, fundo) = (alfa as u32, self.pixels[i]);
+        let canal = |d: u32| (((cor >> d) & 0xFF) * a + ((fundo >> d) & 0xFF) * (255 - a)) / 255;
+        self.pixels[i] = canal(16) << 16 | canal(8) << 8 | canal(0);
+    }
+
+    /// Texto numa fonte TrueType de `tamanho` pixels. `(x, y)` é o canto de
+    /// cima à esquerda da linha. Devolve a largura desenhada.
+    pub fn texto_tt(&mut self, fonte: &mut FonteTT, x: i32, y: i32, texto: &str, tamanho: u16, cor: u32) -> i32 {
+        let (sobe, _) = fonte.metricas(tamanho);
+        let base = y + sobe;
+        let mut caneta = x * 64; // em 1/64 de pixel: as letras não acumulam arredondamentos
+        for c in texto.chars() {
+            let g = fonte.glifo(c, tamanho);
+            let (gx, gy) = ((caneta + 32) / 64 + g.esquerda, base - g.topo);
+            for linha in 0..g.altura {
+                for coluna in 0..g.largura {
+                    let a = g.alfa[(linha * g.largura + coluna) as usize];
+                    self.misturar(gx + coluna, gy + linha, cor, a);
+                }
+            }
+            caneta += g.avanco;
+        }
+        (caneta + 32) / 64 - x
     }
 
     /// Copia outra imagem (`largura` × `altura`) para (x, y), cortando o que sobrar.
