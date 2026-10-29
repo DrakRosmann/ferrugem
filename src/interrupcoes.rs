@@ -143,7 +143,9 @@ pub fn init() {
     let idt = unsafe { &mut *(&raw mut IDT) };
     for (vetor, entrada) in idt.iter_mut().enumerate() {
         let ist = if vetor == 8 { gdt::IST_DOUBLE_FAULT } else { 0 };
-        let nivel = if vetor == 0x80 { 3 } else { 0 };
+        // O DPL diz de qual anel dá para chamar o vetor com uma instrução:
+        // int3 (breakpoint, 3) e int 0x80 (syscall) valem para os programas.
+        let nivel = if vetor == 0x80 || vetor == 3 { 3 } else { 0 };
         *entrada = Entrada::nova(tabela_isr[vetor], ist, nivel);
     }
 
@@ -236,9 +238,13 @@ const NOMES_EXCECOES: [&str; 32] = [
 #[unsafe(no_mangle)]
 extern "C" fn tratar_interrupcao(ctx: &mut Contexto) -> *mut Contexto {
     match ctx.vetor {
-        // `int3` é a única exceção "inofensiva": avisamos e seguimos. O RIP
-        // salvo já aponta para a instrução seguinte.
-        3 => println!("[int3] breakpoint em {:#x}; seguindo em frente", ctx.rip),
+        // Passo a passo (#DB, com a flag TF) e breakpoint (`int3`) num programa
+        // viram SIGTRAP: é assim que o depurador fica sabendo.
+        1 | 3 if ctx.veio_do_usuario() => {
+            ctx.rflags &= !(1 << 8);
+            let _ = processo::enviar_sinal_a_mim(crate::sinal::SIGTRAP);
+        }
+        3 => println!("[int3] breakpoint no kernel em {:#x}; seguindo em frente", ctx.rip),
         0..=31 => excecao(ctx),
         32..=47 => irq((ctx.vetor - 32) as u8),
         0x80 => syscall::tratar(ctx),

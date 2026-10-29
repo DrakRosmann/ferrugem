@@ -500,6 +500,13 @@ impl EspacoEnderecos {
     /// Endereço físico por trás de `virt`, se for uma página de usuário
     /// (e gravável, se `escrita`).
     fn fisico(&self, virt: u64, escrita: bool) -> Option<u64> {
+        self.fisico_com(virt, escrita, escrita)
+    }
+
+    /// `quebrar_cow`: antes de escrever, dá à página uma cópia só deste
+    /// processo (mesmo sem permissão de escrita: é o caso do carregador e do
+    /// ptrace pondo um breakpoint no código).
+    fn fisico_com(&self, virt: u64, escrita: bool, quebrar_cow: bool) -> Option<u64> {
         // O kernel lê e escreve a memória do programa pelo endereço físico
         // (sem passar pela MMU), então ele mesmo faz o papel do page fault:
         // materializa a página e respeita o copy-on-write.
@@ -513,10 +520,18 @@ impl EspacoEnderecos {
             }
         }
         let entrada = self.entrada(virt, false)?;
-        if escrita && *entrada & COPIA_NA_ESCRITA != 0 {
+        // Uma página só de leitura (código) também é dividida depois de um
+        // fork, só que sem a marca de copy-on-write: escrever nela à força
+        // (um breakpoint) mudaria o código dos outros processos também.
+        let dividida = *entrada & COPIA_NA_ESCRITA != 0
+            || quadros::donos(*entrada & ENDERECO) > 1 && !self.regiao_de(virt).is_some_and(|r| r.compartilhada);
+        if quebrar_cow && dividida {
             let regiao_permite = self.regiao_de(virt).is_some_and(|r| r.prot & PROT_ESCREVER != 0);
-            if !regiao_permite || !self.copiar_pagina(entrada, virt & !0xFFF) {
+            if escrita && !regiao_permite || !self.copiar_pagina(entrada, virt & !0xFFF) {
                 return None;
+            }
+            if !regiao_permite {
+                *entrada &= !ESCRITA; // a cópia é privada, mas continua só de leitura
             }
         }
         let e = *entrada;
@@ -538,10 +553,21 @@ impl EspacoEnderecos {
     /// Copia de/para a memória do processo página por página, pelo endereço
     /// físico. Funciona com qualquer CR3 ativo e nunca causa page fault no
     /// kernel: um ponteiro inválido de um programa vira só `false` (EFAULT).
-    fn copiar(&self, mut virt: u64, tamanho: usize, escrita: bool, mut f: impl FnMut(*mut u8, usize, usize)) -> bool {
+    fn copiar(&self, virt: u64, tamanho: usize, escrita: bool, f: impl FnMut(*mut u8, usize, usize)) -> bool {
+        self.copiar_com(virt, tamanho, escrita, escrita, f)
+    }
+
+    fn copiar_com(
+        &self,
+        mut virt: u64,
+        tamanho: usize,
+        escrita: bool,
+        quebrar_cow: bool,
+        mut f: impl FnMut(*mut u8, usize, usize),
+    ) -> bool {
         let mut feito = 0;
         while feito < tamanho {
-            let Some(fisico) = self.fisico(virt, escrita) else { return false };
+            let Some(fisico) = self.fisico_com(virt, escrita, quebrar_cow) else { return false };
             let n = ((TAMANHO_PAGINA - (virt & (TAMANHO_PAGINA - 1))) as usize).min(tamanho - feito);
             f(fisico as *mut u8, feito, n);
             feito += n;
@@ -557,9 +583,11 @@ impl EspacoEnderecos {
         })
     }
 
-    /// Como `copiar_para`, mas também em páginas só de leitura (para carregar o programa).
+    /// Como `copiar_para`, mas também em páginas só de leitura (para carregar
+    /// o programa, ou para o ptrace pôr um breakpoint). Nunca escreve numa
+    /// página dividida com outro processo: desfaz o copy-on-write antes.
     pub fn gravar(&self, virt: u64, dados: &[u8]) -> bool {
-        self.copiar(virt, dados.len(), false, |destino, i, n| unsafe {
+        self.copiar_com(virt, dados.len(), false, true, |destino, i, n| unsafe {
             core::ptr::copy_nonoverlapping(dados[i..].as_ptr(), destino, n)
         })
     }

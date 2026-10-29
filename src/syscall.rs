@@ -56,7 +56,13 @@ pub fn init() {
 type Resultado = Result<u64, i64>;
 
 pub fn tratar(ctx: &mut Contexto) {
-    let numero = ctx.rax;
+    // ptrace: na entrada, o rastreador vê o número em orig_rax (e pode trocá-lo).
+    *processo::syscall_em_andamento() = ctx.rax;
+    if processo::esta_rastreado() {
+        ctx.rax = (-ENOSYS) as u64;
+        processo::parada_de_syscall();
+    }
+    let numero = *processo::syscall_em_andamento();
     let (a1, a2, a3, a4, a5) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.r10, ctx.r8);
     let resultado = match numero {
         0 => sys_read(a1, a2, a3),
@@ -133,6 +139,7 @@ pub fn tratar(ctx: &mut Contexto) {
         158 => sys_arch_prctl(a1, a2),
         186 => Ok(processo::atual().pid as u64), // gettid
         200 => processo::enviar_a_thread(0, a1 as u32, a2 as u32).map(|_| 0), // tkill
+        101 => processo::ptrace(a1, a2 as u32, a3, a4),
         202 => sys_futex(a1, a2, a3, a4, a5, ctx.r9),
         201 => sys_time(a1),
         218 => {
@@ -180,6 +187,9 @@ pub fn tratar(ctx: &mut Contexto) {
         Ok(valor) => valor,
         Err(erro) => (-erro) as u64,
     };
+    if processo::esta_rastreado() {
+        processo::parada_de_syscall(); // e na saída, com o resultado em rax
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -103,7 +103,7 @@ interrompe o programa que está rodando.
 - `init` (processo 1) → `login` → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
   `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`,
   e controle de jobs: Ctrl+Z, `jobs`, `fg`, `bg`.
-- `login su passwd id whoami chmod chown env ln readlink ls cat echo cp mv rm mkdir rmdir
+- `rastro` (um strace: `rastro ls`, `rastro -c lua script.lua`), `login su passwd id whoami chmod chown env ln readlink ls cat echo cp mv rm mkdir rmdir
   touch grep wc head ps kill sleep date uptime free df uname clear desligar
   reiniciar teste`.
 - **Em C, com a musl** (`c/`): `ola` e `testec`, a bateria de testes da libc

@@ -9,7 +9,7 @@
 
 use core::arch::asm;
 use core::hint::black_box;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use ulib::sys;
 use ulib::*;
 
@@ -848,6 +848,149 @@ fn sem_memoria() -> R {
     if livre_kib() > 100_000 { Ok(()) } else { Err(String::from("a memória não voltou")) }
 }
 
+// ------------------------------------------------------------------ ptrace
+
+/// Começa um filho rastreado, que para (SIGSTOP) antes de rodar `f`.
+fn filho_rastreado(f: fn() -> i32) -> Result<i32, String> {
+    match sys::fork() {
+        Ok(0) => {
+            let _ = sys::ptrace(sys::PTRACE_TRACEME, 0, 0, 0);
+            let _ = sys::matar(sys::pid(), sys::SIGSTOP);
+            sys::sair(f());
+        }
+        Ok(pid) => match sys::esperar_com(pid, 0).map_err(erro)? {
+            Some((_, s)) if sys::sinal_que_parou(s) == Some(sys::SIGSTOP) => Ok(pid),
+            outro => Err(format!("o filho não parou: {:?}", outro)),
+        },
+        Err(e) => Err(erro(e)),
+    }
+}
+
+/// Espera o rastreado parar com `sinal` (ou terminar: devolve None).
+fn esperar_parada(pid: i32) -> Result<Option<i32>, String> {
+    match sys::esperar_com(pid, 0).map_err(erro)? {
+        Some((_, s)) => Ok(sys::sinal_que_parou(s)),
+        None => Err(String::from("sem status")),
+    }
+}
+
+fn rastrear_syscalls() -> R {
+    let pid = filho_rastreado(|| {
+        let _ = sys::pid(); // getpid (39)
+        3
+    })?;
+    sys::ptrace(sys::PTRACE_SETOPTIONS, pid, 0, sys::PTRACE_O_TRACESYSGOOD).map_err(erro)?;
+    let mut vistas = Vec::new();
+    let mut entrando = true;
+    loop {
+        sys::ptrace(sys::PTRACE_SYSCALL, pid, 0, 0).map_err(erro)?;
+        match sys::esperar_com(pid, 0).map_err(erro)? {
+            Some((_, s)) if sys::sinal_que_parou(s) == Some(sys::SIGTRAP | 0x80) => {
+                if entrando {
+                    vistas.push(sys::ptrace_registradores(pid).map_err(erro)?.orig_rax());
+                }
+                entrando = !entrando;
+            }
+            Some((_, s)) if sys::codigo_de_saida(s) == Some(3) => break,
+            outro => return Err(format!("status inesperado: {:?}", outro)),
+        }
+    }
+    if vistas.contains(&39) && vistas.last() == Some(&60) {
+        Ok(())
+    } else {
+        Err(format!("syscalls vistas: {:?}", vistas))
+    }
+}
+
+static ALVO: AtomicU64 = AtomicU64::new(0x1234_5678);
+
+fn ler_e_escrever_memoria() -> R {
+    let pid = filho_rastreado(|| (ALVO.load(Ordering::SeqCst) & 0xFF) as i32)?;
+    let endereco = &raw const ALVO as u64;
+    let lido = sys::ptrace_ler(pid, endereco).map_err(erro)?;
+    sys::ptrace(sys::PTRACE_POKEDATA, pid, endereco, 0xABCD).map_err(erro)?;
+    sys::ptrace(sys::PTRACE_CONT, pid, 0, 0).map_err(erro)?;
+    let (_, status) = sys::esperar(pid).map_err(erro)?;
+    // O filho viu o valor novo; o pai (que divide a página por copy-on-write) não.
+    match (lido, sys::codigo_de_saida(status), ALVO.load(Ordering::SeqCst)) {
+        (0x1234_5678, Some(0xCD), 0x1234_5678) => Ok(()),
+        outro => Err(format!("{:x?}", outro)),
+    }
+}
+
+#[inline(never)]
+extern "C" fn ponto_de_parada() -> i32 {
+    black_box(21) * 2
+}
+
+fn breakpoint() -> R {
+    let pid = filho_rastreado(|| ponto_de_parada())?;
+    let endereco = ponto_de_parada as *const () as u64;
+    // Troca o primeiro byte da função por `int3` (0xCC), como faz um depurador.
+    let original = sys::ptrace_ler(pid, endereco).map_err(erro)?;
+    sys::ptrace(sys::PTRACE_POKEDATA, pid, endereco, (original & !0xFF) | 0xCC).map_err(erro)?;
+    sys::ptrace(sys::PTRACE_CONT, pid, 0, 0).map_err(erro)?;
+    if esperar_parada(pid)? != Some(sys::SIGTRAP) {
+        return Err(String::from("não parou no breakpoint"));
+    }
+    let mut regs = sys::ptrace_registradores(pid).map_err(erro)?;
+    if regs.rip() != endereco + 1 {
+        return Err(format!("parou em {:#x}, esperava {:#x}", regs.rip(), endereco + 1));
+    }
+    // Desfaz: o byte original volta e o RIP recua para refazer a instrução.
+    sys::ptrace(sys::PTRACE_POKEDATA, pid, endereco, original).map_err(erro)?;
+    regs.definir_rip(endereco);
+    sys::ptrace_definir_registradores(pid, &regs).map_err(erro)?;
+    sys::ptrace(sys::PTRACE_CONT, pid, 0, 0).map_err(erro)?;
+    let (_, status) = sys::esperar(pid).map_err(erro)?;
+    // O breakpoint foi só no filho: o código do pai (mesmas páginas, antes) está intacto.
+    if ponto_de_parada() != 42 {
+        return Err(String::from("o breakpoint apareceu no processo pai"));
+    }
+    if sys::codigo_de_saida(status) == Some(42) { Ok(()) } else { Err(format!("status {:#x}", status)) }
+}
+
+fn passo_a_passo() -> R {
+    let pid = filho_rastreado(|| {
+        let mut x = 0u64;
+        for i in 0..100 {
+            x = black_box(x + i);
+        }
+        (x % 7) as i32
+    })?;
+    let mut ultimo_rip = 0;
+    let mut mudou = 0;
+    for _ in 0..200 {
+        sys::ptrace(sys::PTRACE_SINGLESTEP, pid, 0, 0).map_err(erro)?;
+        if esperar_parada(pid)? != Some(sys::SIGTRAP) {
+            return Err(String::from("um passo não parou com SIGTRAP"));
+        }
+        let rip = sys::ptrace_registradores(pid).map_err(erro)?.rip();
+        mudou += (rip != ultimo_rip) as u32;
+        ultimo_rip = rip;
+    }
+    sys::ptrace(sys::PTRACE_CONT, pid, 0, 0).map_err(erro)?;
+    let (_, status) = sys::esperar(pid).map_err(erro)?;
+    if mudou >= 150 && sys::codigo_de_saida(status).is_some() {
+        Ok(())
+    } else {
+        Err(format!("o RIP mudou {} vezes em 200 passos; status {:#x}", mudou, status))
+    }
+}
+
+fn ptrace_permissao() -> R {
+    let status = em_filho(|| {
+        if !virar_usuario_comum() {
+            return 100;
+        }
+        match sys::ptrace(sys::PTRACE_ATTACH, 1, 0, 0) {
+            Err(e) if e == sys::EPERM => 0,
+            _ => 1,
+        }
+    })?;
+    if sys::codigo_de_saida(status) == Some(0) { Ok(()) } else { Err(format!("status {:#x}", status)) }
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -858,7 +1001,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 43] = [
+    let testes: [(&str, fn() -> R); 48] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -902,6 +1045,11 @@ fn principal(args: &[&str]) -> i32 {
         ("MAP_SHARED anônimo é o mesmo no pai e no filho", compartilhada_entre_processos),
         ("ASLR: a pilha muda de lugar a cada execução", aslr),
         ("sem memória: só o culpado morre", sem_memoria),
+        ("ptrace: parar em cada syscall", rastrear_syscalls),
+        ("ptrace: ler e escrever a memória do rastreado", ler_e_escrever_memoria),
+        ("ptrace: breakpoint com int3", breakpoint),
+        ("ptrace: passo a passo (200 instruções)", passo_a_passo),
+        ("ptrace: usuário comum não rastreia o init", ptrace_permissao),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

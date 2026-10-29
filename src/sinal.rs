@@ -31,6 +31,7 @@ use alloc::sync::Arc;
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGILL: u32 = 4;
+pub const SIGTRAP: u32 = 5;
 pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;

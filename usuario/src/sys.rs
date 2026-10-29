@@ -449,7 +449,8 @@ pub fn codigo_de_saida(status: i32) -> Option<i32> {
 
 /// `Some(sinal)` se o processo foi morto por um sinal.
 pub fn sinal_que_matou(status: i32) -> Option<i32> {
-    if status & 0x7F != 0 { Some(status & 0x7F) } else { None }
+    // 0x7f no byte baixo quer dizer "parado", não "morto pelo sinal 127".
+    if status & 0x7F != 0 && status & 0xFF != 0x7F { Some(status & 0x7F) } else { None }
 }
 
 pub const SIGINT: i32 = 2;
@@ -718,4 +719,67 @@ pub fn mprotect(endereco: usize, tamanho: usize, prot: u64) -> Resultado<()> {
 
 pub fn msync(endereco: usize, tamanho: usize) -> Resultado<()> {
     conferir(unsafe { syscall(26, endereco as u64, tamanho as u64, 4, 0) }).map(|_| ())
+}
+
+// -----------------------------------------------------------------------------
+// ptrace: depuradores e o `rastro` (strace)
+// -----------------------------------------------------------------------------
+
+pub const PTRACE_TRACEME: u64 = 0;
+pub const PTRACE_PEEKDATA: u64 = 2;
+pub const PTRACE_POKEDATA: u64 = 5;
+pub const PTRACE_CONT: u64 = 7;
+pub const PTRACE_KILL: u64 = 8;
+pub const PTRACE_SINGLESTEP: u64 = 9;
+pub const PTRACE_GETREGS: u64 = 12;
+pub const PTRACE_SETREGS: u64 = 13;
+pub const PTRACE_ATTACH: u64 = 16;
+pub const PTRACE_DETACH: u64 = 17;
+pub const PTRACE_SYSCALL: u64 = 24;
+pub const PTRACE_SETOPTIONS: u64 = 0x4200;
+/// As paradas em syscalls chegam como SIGTRAP | 0x80 (diferente de um SIGTRAP de verdade).
+pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
+pub const SIGTRAP: i32 = 5;
+
+pub fn ptrace(pedido: u64, pid: i32, endereco: u64, dados: u64) -> Resultado<u64> {
+    conferir(unsafe { syscall(101, pedido, pid as u64, endereco, dados) })
+}
+
+/// Lê 8 bytes da memória do processo rastreado.
+pub fn ptrace_ler(pid: i32, endereco: u64) -> Resultado<u64> {
+    let mut valor = 0u64;
+    ptrace(PTRACE_PEEKDATA, pid, endereco, &raw mut valor as u64)?;
+    Ok(valor)
+}
+
+/// Os registradores (`struct user_regs_struct`).
+#[derive(Clone, Copy)]
+pub struct Registradores(pub [u64; 27]);
+
+impl Registradores {
+    pub fn rax(&self) -> u64 { self.0[10] }
+    pub fn rdi(&self) -> u64 { self.0[14] }
+    pub fn rsi(&self) -> u64 { self.0[13] }
+    pub fn rdx(&self) -> u64 { self.0[12] }
+    pub fn r10(&self) -> u64 { self.0[7] }
+    pub fn r8(&self) -> u64 { self.0[9] }
+    pub fn r9(&self) -> u64 { self.0[8] }
+    /// O número da syscall em andamento.
+    pub fn orig_rax(&self) -> u64 { self.0[15] }
+    pub fn rip(&self) -> u64 { self.0[16] }
+    pub fn definir_rip(&mut self, v: u64) { self.0[16] = v }
+    /// Os seis argumentos de uma syscall, na ordem do Linux.
+    pub fn argumentos(&self) -> [u64; 6] {
+        [self.rdi(), self.rsi(), self.rdx(), self.r10(), self.r8(), self.r9()]
+    }
+}
+
+pub fn ptrace_registradores(pid: i32) -> Resultado<Registradores> {
+    let mut r = Registradores([0; 27]);
+    ptrace(PTRACE_GETREGS, pid, 0, r.0.as_mut_ptr() as u64)?;
+    Ok(r)
+}
+
+pub fn ptrace_definir_registradores(pid: i32, r: &Registradores) -> Resultado<()> {
+    ptrace(PTRACE_SETREGS, pid, 0, r.0.as_ptr() as u64).map(|_| ())
 }

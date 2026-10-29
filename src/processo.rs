@@ -110,6 +110,21 @@ pub enum Estado {
     Zumbi,
 }
 
+/// O estado do ptrace de uma tarefa rastreada.
+#[derive(Default)]
+struct Rastreio {
+    rastreador: Pid,
+    opcoes: u64,
+    /// Parar na entrada e na saída da próxima chamada de sistema (PTRACE_SYSCALL).
+    em_syscalls: bool,
+    /// Parada pelo rastreador: um SIGCONT não a solta, só ele.
+    parada: bool,
+    /// O sinal que o rastreador mandou entregar ao soltar (0 = engolir o sinal).
+    sinal_ao_soltar: u32,
+    /// A syscall em andamento (o "orig_rax" que o rastreador vê e pode trocar).
+    syscall: u64,
+}
+
 /// Uma tarefa: uma thread. Um processo de uma thread só é uma tarefa com
 /// `pid == tgid`; as threads extras de um processo têm o mesmo `tgid` e
 /// dividem com ele memória, arquivos, diretório e tratadores de sinal.
@@ -148,6 +163,8 @@ pub struct Processo {
     saida_do_grupo: Arc<Dividido<Option<i32>>>,
     /// Acordado por um FUTEX_WAKE (e não por prazo vencido ou sinal).
     acordado_por_futex: bool,
+    /// ptrace: quem está rastreando esta tarefa (0 = ninguém), e como.
+    rastreio: Rastreio,
     /// Formato do `wait` do Unix: (código << 8) se saiu, ou o número do sinal que o matou.
     pub status: i32,
     /// Identidade: o uid/gid *real* (quem é) e o *efetivo* (com que direitos
@@ -193,6 +210,7 @@ impl Processo {
             thread_morta: false,
             saida_do_grupo: Dividido::novo(None),
             acordado_por_futex: false,
+            rastreio: Rastreio::default(),
             status: 0,
             uid: 0,
             gid: 0,
@@ -426,7 +444,15 @@ pub fn ao_voltar_para_usuario(ctx: &mut Contexto, foi_o_timer: bool) {
     if foi_o_timer {
         escalonar(); // preempção: o programa perde a vez, mesmo que não queira
     }
-    while let Some(numero) = atual().sinais.retirar() {
+    while let Some(mut numero) = atual().sinais.retirar() {
+        // Rastreado: antes de qualquer sinal (menos SIGKILL), o rastreador é
+        // avisado e decide qual sinal entregar de fato (ou nenhum).
+        if atual().rastreio.rastreador != 0 && numero != SIGKILL {
+            numero = parada_de_rastreio(numero);
+            if numero == 0 {
+                continue;
+            }
+        }
         let acao = atual().sinais.acoes()[numero as usize];
         if numero == SIGKILL {
             sair(numero as i32);
@@ -448,6 +474,46 @@ pub fn ao_voltar_para_usuario(ctx: &mut Contexto, foi_o_timer: bool) {
         }
         sair(numero as i32);
     }
+}
+
+/// Para a tarefa atual para o rastreador olhar (ptrace-stop). `codigo` é o
+/// que o `wait` dele vai ver. Devolve o sinal que ele mandou entregar.
+fn parada_de_rastreio(codigo: u32) -> u32 {
+    let p = atual();
+    let rastreador = p.rastreio.rastreador;
+    p.estado = Estado::Parado;
+    p.rastreio.parada = true;
+    p.rastreio.sinal_ao_soltar = 0;
+    p.parada_a_relatar = Some(codigo);
+    acordar(canal_filhos(rastreador));
+    let _ = enviar_sinal(rastreador, sinal::SIGCHLD);
+    escalonar();
+    let p = atual();
+    p.rastreio.parada = false;
+    p.rastreio.sinal_ao_soltar
+}
+
+/// Chamada na entrada e na saída de cada syscall. Se o rastreador pediu
+/// PTRACE_SYSCALL, para (e ele pode ler e trocar os registradores).
+pub fn parada_de_syscall() {
+    let p = atual();
+    if p.rastreio.rastreador == 0 || !p.rastreio.em_syscalls {
+        return;
+    }
+    const PTRACE_O_TRACESYSGOOD: u64 = 1;
+    let codigo = sinal::SIGTRAP | if p.rastreio.opcoes & PTRACE_O_TRACESYSGOOD != 0 { 0x80 } else { 0 };
+    let sinal = parada_de_rastreio(codigo);
+    if sinal != 0 {
+        let _ = enviar_a_tarefa(atual().pid, sinal);
+    }
+}
+
+pub fn esta_rastreado() -> bool {
+    atual().rastreio.rastreador != 0
+}
+
+pub fn syscall_em_andamento() -> &'static mut u64 {
+    &mut atual().rastreio.syscall
 }
 
 /// Coloca o processo em estado Parado e avisa o pai (que pode estar num `wait`).
@@ -724,6 +790,9 @@ pub fn exec(ctx: &mut Contexto, caminho: &str, args: Vec<String>, ambiente: Vec<
     p.executavel = caminho.to_string();
     p.argumentos = args;
     p.sinais.ao_executar();
+    if p.rastreio.rastreador != 0 {
+        p.sinais.pendentes |= 1 << sinal::SIGTRAP; // o rastreador vê o programa novo antes da 1ª instrução
+    }
     // Descritores marcados com close-on-exec não passam para o programa novo.
     let a = p.arquivos();
     let fecha = a.fecha_no_exec;
@@ -790,6 +859,17 @@ pub fn sair(status: i32) -> ! {
     p.status = status;
     p.estado = Estado::Zumbi;
     let (pid, pai) = (p.pid, p.pai);
+
+    // Quem eu rastreava fica livre (e volta a rodar, se estava parado por mim).
+    for q in tabela().processos.iter_mut() {
+        if q.rastreio.rastreador == pid {
+            // Solta, mas sem esquecer a syscall em que ele estava parado.
+            q.rastreio = Rastreio { syscall: q.rastreio.syscall, ..Rastreio::default() };
+            if q.estado == Estado::Parado {
+                q.estado = Estado::Pronto;
+            }
+        }
+    }
 
     // Os filhos órfãos são adotados pelo init.
     let mut orfao_zumbi = false;
@@ -858,13 +938,15 @@ pub fn esperar(pid: i64, opcoes: u64) -> Result<(Pid, i32), i64> {
         let mut zumbi = None;
         let mut parado = None;
         for (i, q) in t.processos.iter().enumerate().skip(1) {
-            if q.pai == eu && q.eh_lider() && serve(q) {
+            let rastreado = q.rastreio.rastreador == eu;
+            if (q.pai == eu && q.eh_lider() || rastreado) && serve(q) {
                 tem_filho = true;
-                if q.estado == Estado::Zumbi {
+                if q.estado == Estado::Zumbi && q.pai == eu {
                     zumbi = Some(i);
                     break;
                 }
-                if opcoes & WUNTRACED != 0 && q.parada_a_relatar.is_some() {
+                // As paradas de quem eu rastreio aparecem sempre, mesmo sem WUNTRACED.
+                if (opcoes & WUNTRACED != 0 || rastreado) && q.parada_a_relatar.is_some() {
                     parado = Some(i);
                 }
             }
@@ -922,6 +1004,10 @@ pub fn enviar_sinal(pid: Pid, sinal: u32) -> Result<(), i64> {
     enviar_a_tarefa(pid, sinal)
 }
 
+pub fn enviar_sinal_a_mim(sinal: u32) -> Result<(), i64> {
+    enviar_a_tarefa(atual().pid, sinal)
+}
+
 /// Sinal para uma thread específica (`tgkill`).
 pub fn enviar_a_thread(tgid: Pid, tid: Pid, sinal: u32) -> Result<(), i64> {
     match buscar(tid) {
@@ -941,7 +1027,7 @@ fn enviar_a_tarefa(pid: Pid, sinal: u32) -> Result<(), i64> {
     let bit = 1u64 << sinal;
     if sinal == sinal::SIGCONT {
         p.sinais.pendentes &= !sinal::PARADAS;
-        if p.estado == Estado::Parado {
+        if p.estado == Estado::Parado && !p.rastreio.parada {
             p.estado = Estado::Pronto; // as chamadas em que ele dormia conferem tudo de novo
             p.parada_a_relatar = None;
         }
@@ -954,7 +1040,7 @@ fn enviar_a_tarefa(pid: Pid, sinal: u32) -> Result<(), i64> {
     // Parar outro processo é imediato, mesmo que ele esteja dormindo numa
     // chamada de sistema: ao continuar, ela segue de onde estava (sem EINTR).
     // O processo atual para na volta para o modo usuário.
-    if !core::ptr::eq(p, atual()) && p.sinais.pararia(sinal) {
+    if !core::ptr::eq(p, atual()) && p.sinais.pararia(sinal) && p.rastreio.rastreador == 0 {
         if p.estado != Estado::Parado {
             parar(p, sinal);
         }
@@ -1306,4 +1392,166 @@ pub fn futex_mudar_fila(endereco: u64, acordar: u64, mover: u64, destino: u64, e
         }
     }
     Ok(acordados + movidos)
+}
+
+// -----------------------------------------------------------------------------
+// ptrace: um processo olhando e controlando outro (depuradores, strace)
+// -----------------------------------------------------------------------------
+
+const PTRACE_TRACEME: u64 = 0;
+const PTRACE_PEEKTEXT: u64 = 1;
+const PTRACE_PEEKDATA: u64 = 2;
+const PTRACE_PEEKUSER: u64 = 3;
+const PTRACE_POKETEXT: u64 = 4;
+const PTRACE_POKEDATA: u64 = 5;
+const PTRACE_CONT: u64 = 7;
+const PTRACE_KILL: u64 = 8;
+const PTRACE_SINGLESTEP: u64 = 9;
+const PTRACE_GETREGS: u64 = 12;
+const PTRACE_SETREGS: u64 = 13;
+const PTRACE_GETFPREGS: u64 = 14;
+const PTRACE_SETFPREGS: u64 = 15;
+const PTRACE_ATTACH: u64 = 16;
+const PTRACE_DETACH: u64 = 17;
+const PTRACE_SYSCALL: u64 = 24;
+const PTRACE_SETOPTIONS: u64 = 0x4200;
+const FLAG_TF: u64 = 1 << 8;
+
+/// Os registradores no formato `struct user_regs_struct` do Linux (27 × 8 bytes).
+fn registradores(q: &Processo) -> [u64; 27] {
+    let c = unsafe { &*q.contexto() };
+    [
+        c.r15, c.r14, c.r13, c.r12, c.rbp, c.rbx, c.r11, c.r10, c.r9, c.r8, c.rax, c.rcx, c.rdx, c.rsi, c.rdi,
+        q.rastreio.syscall, c.rip, c.cs, c.rflags, c.rsp, c.ss, q.fs_base, 0, 0, 0, 0, 0,
+    ]
+}
+
+fn definir_registradores(q: &mut Processo, r: &[u64; 27]) {
+    let c = unsafe { &mut *q.contexto() };
+    (c.r15, c.r14, c.r13, c.r12, c.rbp, c.rbx, c.r11, c.r10, c.r9, c.r8) =
+        (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]);
+    (c.rax, c.rcx, c.rdx, c.rsi, c.rdi) = (r[10], r[11], r[12], r[13], r[14]);
+    q.rastreio.syscall = r[15];
+    c.rip = r[16];
+    // Nada de voltar para o anel 0 ou mexer em flags do sistema.
+    c.rflags = (r[18] & (0xCD5 | FLAG_TF)) | 0x202;
+    c.rsp = r[19];
+    q.fs_base = r[21];
+}
+
+/// A tarefa que o processo atual rastreia e que está parada esperando por ele.
+fn rastreada_parada(pid: Pid) -> Result<&'static mut Processo, i64> {
+    let eu = atual().tgid;
+    let q = buscar(pid).ok_or(ESRCH)?;
+    if q.rastreio.rastreador != eu || !q.rastreio.parada {
+        return Err(ESRCH);
+    }
+    Ok(q)
+}
+
+pub fn ptrace(pedido: u64, pid: Pid, endereco: u64, dados: u64) -> Result<u64, i64> {
+    let eu = atual();
+    match pedido {
+        PTRACE_TRACEME => {
+            if eu.rastreio.rastreador != 0 {
+                return Err(EPERM);
+            }
+            eu.rastreio.rastreador = eu.pai;
+            return Ok(0);
+        }
+        PTRACE_ATTACH => {
+            let (meu_euid, meu_uid, meu_tgid) = (eu.euid, eu.uid, eu.tgid);
+            let q = buscar(pid).ok_or(ESRCH)?;
+            let pode = meu_euid == 0 || q.uid == meu_uid && q.euid == meu_uid;
+            if q.tgid == 1 || q.tgid == meu_tgid || q.rastreio.rastreador != 0 || !pode {
+                return Err(EPERM);
+            }
+            q.rastreio.rastreador = meu_tgid;
+            return enviar_a_tarefa(pid, sinal::SIGSTOP).map(|_| 0);
+        }
+        _ => {}
+    }
+
+    let q = rastreada_parada(pid)?;
+    let espaco_dele = q.espaco().ok_or(ESRCH)?;
+    let meu_espaco = atual().espaco().ok_or(EFAULT)?;
+    let soltar = |q: &mut Processo, sinal: u64, em_syscalls: bool, passo: bool| {
+        q.rastreio.em_syscalls = em_syscalls;
+        q.rastreio.sinal_ao_soltar = sinal as u32;
+        let c = unsafe { &mut *q.contexto() };
+        c.rflags = if passo { c.rflags | FLAG_TF } else { c.rflags & !FLAG_TF };
+        q.parada_a_relatar = None;
+        q.estado = Estado::Pronto;
+    };
+    match pedido {
+        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
+            let palavra = espaco_dele.copiar_de(endereco, 8).ok_or(EFAULT)?;
+            if !meu_espaco.copiar_para(dados, &palavra) {
+                return Err(EFAULT);
+            }
+            Ok(0)
+        }
+        PTRACE_PEEKUSER => {
+            let i = (endereco / 8) as usize;
+            let valor = *registradores(q).get(i).ok_or(EIO)?;
+            if !meu_espaco.copiar_para(dados, &valor.to_le_bytes()) {
+                return Err(EFAULT);
+            }
+            Ok(0)
+        }
+        PTRACE_POKETEXT | PTRACE_POKEDATA => {
+            if espaco_dele.gravar(endereco, &dados.to_le_bytes()) { Ok(0) } else { Err(EFAULT) }
+        }
+        PTRACE_GETREGS => {
+            let bytes: Vec<u8> = registradores(q).iter().flat_map(|r| r.to_le_bytes()).collect();
+            if meu_espaco.copiar_para(dados, &bytes) { Ok(0) } else { Err(EFAULT) }
+        }
+        PTRACE_SETREGS => {
+            let bytes = meu_espaco.copiar_de(dados, 27 * 8).ok_or(EFAULT)?;
+            let mut r = [0u64; 27];
+            for (i, v) in r.iter_mut().enumerate() {
+                *v = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+            }
+            definir_registradores(q, &r);
+            Ok(0)
+        }
+        PTRACE_GETFPREGS => {
+            if meu_espaco.copiar_para(dados, &q.fpu.0) { Ok(0) } else { Err(EFAULT) }
+        }
+        PTRACE_SETFPREGS => {
+            let bytes = meu_espaco.copiar_de(dados, 512).ok_or(EFAULT)?;
+            let mascara = u32::from_le_bytes(fpu_inicial().0[28..32].try_into().unwrap());
+            q.fpu.0.copy_from_slice(&bytes);
+            let mxcsr = u32::from_le_bytes(q.fpu.0[24..28].try_into().unwrap()) & mascara;
+            q.fpu.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+            Ok(0)
+        }
+        PTRACE_SETOPTIONS => {
+            q.rastreio.opcoes = dados;
+            Ok(0)
+        }
+        PTRACE_CONT => {
+            soltar(q, dados, false, false);
+            Ok(0)
+        }
+        PTRACE_SYSCALL => {
+            soltar(q, dados, true, false);
+            Ok(0)
+        }
+        PTRACE_SINGLESTEP => {
+            soltar(q, dados, false, true);
+            Ok(0)
+        }
+        PTRACE_DETACH => {
+            soltar(q, dados, false, false);
+            q.rastreio = Rastreio { syscall: q.rastreio.syscall, ..Rastreio::default() };
+            Ok(0)
+        }
+        PTRACE_KILL => {
+            q.sinais.pendentes |= 1 << SIGKILL;
+            soltar(q, 0, false, false);
+            Ok(0)
+        }
+        _ => Err(EIO),
+    }
 }
