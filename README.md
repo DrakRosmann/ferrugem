@@ -137,6 +137,12 @@ interface gráfica.
   ANSI ligado a um pseudo-terminal com um `sh`) e janelas de outros
   programas, que conversam com o servidor por um socket Unix e desenham numa
   memória compartilhada (`ulib::janela`; exemplos: `pintar`, `fontes`).
+- **Componentes de interface** (`ulib::ui`, em "modo imediato", como a Dear
+  ImGui): rótulos, botões, caixas de seleção, opções, campo de texto,
+  lista com rolagem (roda do mouse, barra, setas), deslizante, barra de
+  progresso, barra de menus com menus suspensos e caixas de diálogo
+  modais; foco pelo teclado (Tab, Enter, espaço, setas). O `componentes`
+  mostra todos. O mouse PS/2 ganhou a roda (modo IntelliMouse).
 - **Texto:** a fonte da VGA ganha no boot as letras acentuadas que faltam
   (ã, õ, Á, Â, Ã, Ê, Í, Ó, Ô, Õ, Ú), geradas no estilo dela: consoles de
   texto e terminais da interface mostram o português inteiro. E fontes
@@ -202,6 +208,7 @@ interface gráfica.
 | `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
 | `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
 | `usuario/src/truetype.rs` | Fontes TrueType: leitor de .ttf e rasterizador com suavização |
+| `usuario/src/ui.rs` | Componentes de interface (botões, campos, listas, menus, diálogos) |
 | `comum/cp437.rs` | A tabela da fonte da VGA e as letras acentuadas geradas no boot |
 | `comum/lista_livre.rs` | Alocador usado pelo kernel e pelos programas |
 | `usuario/src/lib.rs` + `sys.rs`, `io.rs` | `ulib`, a biblioteca dos programas |
@@ -270,8 +277,7 @@ de páginas. O `make run` usa 4 CPUs.
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica, rumo a um desktop como o XFCE:** uma biblioteca de
-   componentes (botões, campos de texto, listas, menus); redimensionar,
+4. **Interface gráfica, rumo a um desktop como o XFCE:** redimensionar,
    maximizar e minimizar; barra de tarefas e menu de aplicativos;
    gerenciador de arquivos, editor de texto, visualizador de imagens.
 

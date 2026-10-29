@@ -1437,6 +1437,130 @@ fn fontes_truetype() -> R {
     Ok(())
 }
 
+/// O estado de um programa de teste para a ulib::ui (desenhado numa imagem na memória).
+struct ProgramaDeTeste {
+    cliques: u32,
+    marcada: bool,
+    campo: ulib::ui::CampoTexto,
+    enter: bool,
+    lista: ulib::ui::Lista,
+    escolhido: Option<usize>,
+    dialogo: Option<ulib::ui::Dialogo>,
+    resposta: Option<usize>,
+}
+
+impl ProgramaDeTeste {
+    /// Um evento: o Ui o anota e o programa é desenhado (de novo, se um clique mudou algo).
+    fn evento(&mut self, ui: &mut ulib::ui::Ui, pixels: &mut [u32], e: Option<ulib::janela::Evento>) {
+        if let Some(e) = e {
+            ui.receber(&e);
+        }
+        loop {
+            {
+                let mut t = ui.comecar(ulib::grafico::Quadro::novo(pixels, 400, 300));
+                if t.botao("Contar") {
+                    self.cliques += 1;
+                }
+                t.caixa("Marcar", &mut self.marcada);
+                self.enter |= t.campo(&mut self.campo, 200);
+                let itens: Vec<String> = (0..30).map(|i| format!("item {}", i)).collect();
+                if let Some(i) = t.lista(&mut self.lista, &itens, 200, 100) {
+                    self.escolhido = Some(i);
+                }
+                if let Some(b) = t.dialogo(&mut self.dialogo) {
+                    self.resposta = Some(b);
+                }
+            }
+            if !ui.precisa_redesenhar() {
+                break;
+            }
+        }
+    }
+}
+
+fn componentes_da_interface() -> R {
+    use ulib::janela::{Evento, Seta};
+    let mut ui = ulib::ui::Ui::novo();
+    let mut pixels = vec![0u32; 400 * 300];
+    let mut p = ProgramaDeTeste {
+        cliques: 0,
+        marcada: false,
+        campo: ulib::ui::CampoTexto::novo(""),
+        enter: false,
+        lista: ulib::ui::Lista::default(),
+        escolhido: None,
+        dialogo: None,
+        resposta: None,
+    };
+    let botao = |x, y, apertado| Some(Evento::Botao { x, y, botao: 1, apertado });
+    let clicar = |p: &mut ProgramaDeTeste, ui: &mut ulib::ui::Ui, pixels: &mut [u32], x, y| {
+        p.evento(ui, pixels, botao(x, y, true));
+        p.evento(ui, pixels, botao(x, y, false));
+    };
+    // Disposição: botão em y=12, caixa em y=46, campo em y=80, lista em y=114 (100 de altura).
+    p.evento(&mut ui, &mut pixels, None);
+    clicar(&mut p, &mut ui, &mut pixels, 20, 20);
+    if p.cliques != 1 {
+        return Err(format!("o botão contou {} cliques", p.cliques));
+    }
+    // Apertar no botão e soltar fora dele não é um clique.
+    p.evento(&mut ui, &mut pixels, botao(20, 20, true));
+    p.evento(&mut ui, &mut pixels, Some(Evento::Mover { x: 300, y: 250 }));
+    p.evento(&mut ui, &mut pixels, botao(300, 250, false));
+    if p.cliques != 1 {
+        return Err(String::from("soltar fora do botão contou um clique"));
+    }
+    clicar(&mut p, &mut ui, &mut pixels, 16, 59);
+    if !p.marcada {
+        return Err(String::from("a caixa não foi marcada"));
+    }
+    // O campo: clicar dá o foco; o teclado edita.
+    clicar(&mut p, &mut ui, &mut pixels, 50, 93);
+    for e in [
+        Evento::Tecla('o'),
+        Evento::Tecla('l'),
+        Evento::Tecla('á'),
+        Evento::Tecla('\u{8}'),
+        Evento::Seta(Seta::Esquerda),
+        Evento::Tecla('X'),
+        Evento::Tecla('\n'),
+    ] {
+        p.evento(&mut ui, &mut pixels, Some(e));
+    }
+    if p.campo.texto != "oXl" || !p.enter {
+        return Err(format!("campo: {:?} (Enter: {})", p.campo.texto, p.enter));
+    }
+    // A lista: a roda rola, o clique escolhe, a seta desce.
+    p.evento(&mut ui, &mut pixels, Some(Evento::Roda { x: 50, y: 150, giro: 2 }));
+    if p.lista.rolagem <= 0 {
+        return Err(String::from("a roda não rolou a lista"));
+    }
+    clicar(&mut p, &mut ui, &mut pixels, 50, 120);
+    let Some(i) = p.escolhido.filter(|&i| i > 0 && p.lista.selecionado == Some(i)) else {
+        return Err(format!("lista: escolhido {:?}, selecionado {:?}", p.escolhido, p.lista.selecionado));
+    };
+    p.evento(&mut ui, &mut pixels, Some(Evento::Seta(Seta::Baixo)));
+    if p.lista.selecionado != Some(i + 1) {
+        return Err(String::from("a seta não desceu na lista"));
+    }
+    // Com uma caixa de diálogo aberta, o resto da janela não recebe nada.
+    p.dialogo = Some(ulib::ui::Dialogo::novo("Pergunta", "Tudo certo?", &["Sim", "Não"]));
+    p.evento(&mut ui, &mut pixels, None);
+    clicar(&mut p, &mut ui, &mut pixels, 20, 20);
+    if p.cliques != 1 {
+        return Err(String::from("o botão atrás da caixa de diálogo recebeu o clique"));
+    }
+    p.evento(&mut ui, &mut pixels, Some(Evento::Tecla('\n')));
+    if p.resposta != Some(0) || p.dialogo.is_some() {
+        return Err(format!("diálogo: resposta {:?}", p.resposta));
+    }
+    clicar(&mut p, &mut ui, &mut pixels, 20, 20);
+    if p.cliques != 2 {
+        return Err(String::from("depois do diálogo, o botão não voltou a funcionar"));
+    }
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1447,7 +1571,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 58] = [
+    let testes: [(&str, fn() -> R); 59] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1506,6 +1630,7 @@ fn principal(args: &[&str]) -> i32 {
         ("bibliotecas dinâmicas: ld-ferrugem.so, ld-musl, PIE e ASLR", bibliotecas_dinamicas),
         ("várias CPUs: 4 processos em CPUs diferentes, ao mesmo tempo", varias_cpus),
         ("fontes TrueType: cmap, glifos compostos, suavização", fontes_truetype),
+        ("componentes da interface: botão, caixa, campo, lista, diálogo", componentes_da_interface),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

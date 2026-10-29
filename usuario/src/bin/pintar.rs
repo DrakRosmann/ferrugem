@@ -83,7 +83,7 @@ fn principal(_args: &[&str]) -> i32 {
                 limpar(&mut j, cor);
                 j.mostrar();
             }
-            Evento::Tecla(_) => {}
+            Evento::Tecla(_) | Evento::Roda { .. } | Evento::Seta(_) => {}
             Evento::Fechar => break,
         }
     }

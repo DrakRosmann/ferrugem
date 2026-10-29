@@ -438,6 +438,8 @@ struct Servidor {
     arrastando: Option<(i32, i32)>,
     /// O botão está apertado dentro de um programa (os movimentos vão para ele).
     segurando_cliente: bool,
+    /// O mouse está sobre o conteúdo do programa da janela de cima.
+    mouse_no_cliente: bool,
     cursor_desenhado: Option<(i32, i32)>,
     painel: Vec<Botao>,
     sair: bool,
@@ -452,7 +454,7 @@ impl Servidor {
         // Empréstimos separados de cada campo: a imagem muda, o resto só é lido.
         let Servidor { imagem, largura, altura, letras, janelas, painel, .. } = self;
         let (largura, altura) = (*largura, *altura);
-        let mut q = Quadro { pixels: imagem, largura, altura };
+        let mut q = Quadro::novo(imagem, largura, altura);
         q.retangulo(0, PAINEL, largura, altura - PAINEL, COR_FUNDO);
         let marca = letras.largura("FerrugemOS", true);
         letras.escrever(&mut q, (largura - marca) / 2, altura / 2, 20, "FerrugemOS", 0x2F6A7E, true);
@@ -596,9 +598,10 @@ impl Servidor {
         }
     }
 
-    /// Pacotes de 3 bytes do /dev/mouse.
+    /// Pacotes de 4 bytes do /dev/mouse (o 4º é a roda).
     fn pacotes_do_mouse(&mut self, dados: &[u8]) {
-        for p in dados.chunks_exact(3) {
+        let mut andou = false;
+        for p in dados.chunks_exact(4) {
             if p[0] & 0xC0 != 0 {
                 continue; // estouro: pacote sem sentido
             }
@@ -606,6 +609,18 @@ impl Servidor {
             let dy = p[2] as i32 - if p[0] & 0x20 != 0 { 256 } else { 0 };
             self.mouse.0 = (self.mouse.0 + dx).clamp(0, self.largura - 1);
             self.mouse.1 = (self.mouse.1 - dy).clamp(0, self.altura - 1);
+            andou |= dx != 0 || dy != 0;
+            // A roda vai para o programa que está debaixo do cursor.
+            let giro = p[3] as i8 as i32;
+            if giro != 0 {
+                let (x, y) = self.mouse;
+                if let Some(j) = self.janelas.iter().rev().find(|j| j.dentro(x, y)) {
+                    if let Conteudo::Cliente(c) = &j.conteudo {
+                        let (lx, ly) = j.local(x, y);
+                        let _ = sys::escrever_tudo(c.fd, format!("roda {} {} {}\n", lx, ly, giro).as_bytes());
+                    }
+                }
+            }
             let botoes = p[0] & 3;
             let mudou = botoes ^ self.botoes;
             self.botoes = botoes;
@@ -618,11 +633,19 @@ impl Servidor {
                 j.x = self.mouse.0 - ox;
                 j.y = (self.mouse.1 - oy).max(PAINEL);
                 self.sujo = true;
-            } else if self.segurando_cliente && (dx != 0 || dy != 0) {
-                if let Some(j) = self.janelas.last() {
-                    let (lx, ly) = j.local(self.mouse.0, self.mouse.1);
+            }
+        }
+        // Um "mover" por leitura (a posição final) para o programa da janela
+        // de cima: com o botão apertado nele, ou com o mouse por cima dele
+        // (e mais um ao sair, para ele apagar o realce do que estava embaixo).
+        if andou && self.arrastando.is_none() {
+            if let Some(j) = self.janelas.last() {
+                let (lx, ly) = j.local(self.mouse.0, self.mouse.1);
+                let dentro = lx >= 0 && ly >= 0 && lx < j.largura && ly < j.altura;
+                if self.segurando_cliente || dentro || self.mouse_no_cliente {
                     self.mandar_ao_cliente(&format!("mover {} {}\n", lx, ly));
                 }
+                self.mouse_no_cliente = dentro;
             }
         }
     }
@@ -634,7 +657,17 @@ impl Servidor {
                 let _ = sys::escrever_tudo(t.mestre, dados);
             }
             Conteudo::Cliente(c) => {
-                for ch in String::from_utf8_lossy(dados).chars() {
+                // As setas chegam como ESC [ A..D: para os programas, viram "seta A".
+                let texto = String::from_utf8_lossy(dados);
+                let mut letras = texto.chars().peekable();
+                while let Some(ch) = letras.next() {
+                    if ch == '\x1b' && letras.peek() == Some(&'[') {
+                        letras.next();
+                        if let Some(l @ 'A'..='D') = letras.next() {
+                            let _ = sys::escrever_tudo(c.fd, format!("seta {}\n", l).as_bytes());
+                        }
+                        continue;
+                    }
                     let _ = sys::escrever_tudo(c.fd, format!("tecla {}\n", ch as u32).as_bytes());
                 }
             }
@@ -835,6 +868,7 @@ fn principal(_args: &[&str]) -> i32 {
         botoes: 0,
         arrastando: None,
         segurando_cliente: false,
+        mouse_no_cliente: false,
         cursor_desenhado: None,
         painel,
         sair: false,

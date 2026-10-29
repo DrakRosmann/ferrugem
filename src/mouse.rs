@@ -10,10 +10,15 @@
 //!           bits 4-5 = sinal de dx e dy
 //!   byte 1: dx (quanto andou para a direita)
 //!   byte 2: dy (quanto andou para CIMA)
+//!   byte 3: a roda (só no modo IntelliMouse): -1 = para cima, +1 = para baixo
 //! ```
 //!
-//! `/dev/mouse` entrega esses pacotes como vieram — é o mesmo formato do
-//! `/dev/input/mice` do Linux.
+//! O modo IntelliMouse (com a roda) é ligado por uma "senha": mudar a taxa de
+//! amostragem para 200, 100 e 80, nessa ordem. Se o mouse passar a dizer que
+//! é do tipo 3, os pacotes ganham o 4º byte.
+//!
+//! `/dev/mouse` entrega sempre pacotes de 4 bytes (o da roda é 0 num mouse
+//! sem roda).
 
 use crate::erro::*;
 use crate::porta::{inb, outb};
@@ -26,12 +31,15 @@ const DADOS: u16 = 0x60;
 const STATUS: u16 = 0x64;
 
 struct Estado {
-    pacote: [u8; 3],
+    pacote: [u8; 4],
     recebidos: usize,
+    /// 3 bytes por pacote, ou 4 com a roda.
+    tamanho: usize,
     fila: VecDeque<u8>,
 }
 
-static ESTADO: Mutex<Estado> = Mutex::new(Estado { pacote: [0; 3], recebidos: 0, fila: VecDeque::new() });
+static ESTADO: Mutex<Estado> =
+    Mutex::new(Estado { pacote: [0; 4], recebidos: 0, tamanho: 3, fila: VecDeque::new() });
 static LEITORES: AtomicUsize = AtomicUsize::new(0);
 
 fn canal() -> usize {
@@ -76,7 +84,16 @@ pub fn init() -> bool {
         esperar_para_escrever();
         outb(DADOS, (config | 0x02) & !0x20);
     }
-    let ok = mandar_ao_mouse(0xF6) == Some(0xFA) && mandar_ao_mouse(0xF4) == Some(0xFA); // padrão; ligar
+    let mut ok = mandar_ao_mouse(0xF6) == Some(0xFA); // configuração padrão
+    // A "senha" do IntelliMouse; depois, quem é você? (0xF2: o tipo)
+    for taxa in [200, 100, 80] {
+        mandar_ao_mouse(0xF3);
+        mandar_ao_mouse(taxa);
+    }
+    if mandar_ao_mouse(0xF2) == Some(0xFA) && esperar_resposta() == Some(3) {
+        ESTADO.lock().tamanho = 4;
+    }
+    ok &= mandar_ao_mouse(0xF4) == Some(0xFA); // começa a mandar pacotes
     // descarta o que tenha sobrado
     while unsafe { inb(STATUS) } & 1 != 0 {
         unsafe { inb(DADOS) };
@@ -96,10 +113,13 @@ pub fn receber(byte: u8) {
     let i = e.recebidos;
     e.pacote[i] = byte;
     e.recebidos += 1;
-    if e.recebidos == 3 {
+    if e.recebidos == e.tamanho {
         e.recebidos = 0;
-        if LEITORES.load(Ordering::Relaxed) > 0 && e.fila.len() < 3 * 128 {
-            let pacote = e.pacote;
+        if LEITORES.load(Ordering::Relaxed) > 0 && e.fila.len() < 4 * 128 {
+            let mut pacote = e.pacote;
+            if e.tamanho == 3 {
+                pacote[3] = 0;
+            }
             e.fila.extend(pacote);
             drop(e);
             processo::acordar(canal());
@@ -122,12 +142,12 @@ pub fn fechar() {
     }
 }
 
-/// Entrega pacotes inteiros (múltiplos de 3 bytes).
+/// Entrega pacotes inteiros (múltiplos de 4 bytes).
 pub fn ler(buf: &mut [u8], bloquear: bool) -> Result<usize, i64> {
     loop {
         {
             let mut e = ESTADO.lock();
-            let n = (buf.len() / 3 * 3).min(e.fila.len());
+            let n = (buf.len() / 4 * 4).min(e.fila.len());
             if n > 0 {
                 for (destino, b) in buf.iter_mut().zip(e.fila.drain(..n)) {
                     *destino = b;
@@ -143,6 +163,10 @@ pub fn ler(buf: &mut [u8], bloquear: bool) -> Result<usize, i64> {
         }
         processo::dormir(canal());
     }
+}
+
+pub fn tem_roda() -> bool {
+    ESTADO.lock().tamanho == 4
 }
 
 pub fn pode_ler() -> bool {

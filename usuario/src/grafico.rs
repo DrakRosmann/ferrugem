@@ -10,10 +10,13 @@ use crate::truetype::FonteTT;
 use alloc::vec::Vec;
 
 /// Uma imagem para desenhar: `pixels` tem `largura * altura` itens.
+/// Nada é desenhado fora do `recorte` (x, y, largura, altura): é assim que
+/// um campo de texto comprido não vaza para fora da sua caixa.
 pub struct Quadro<'a> {
     pub pixels: &'a mut [u32],
     pub largura: i32,
     pub altura: i32,
+    pub recorte: (i32, i32, i32, i32),
 }
 
 /// A fonte 8×16 que o kernel leu da VGA (`/dev/fonte`), no code page 437.
@@ -37,23 +40,77 @@ impl Fonte {
     }
 }
 
-impl Quadro<'_> {
+impl<'a> Quadro<'a> {
+    pub fn novo(pixels: &'a mut [u32], largura: i32, altura: i32) -> Quadro<'a> {
+        Quadro { pixels, largura, altura, recorte: (0, 0, largura, altura) }
+    }
+
+    /// Daqui em diante, só desenha dentro deste retângulo (e dentro da imagem).
+    pub fn recortar(&mut self, x: i32, y: i32, largura: i32, altura: i32) {
+        let (x0, y0) = (x.max(0), y.max(0));
+        let (x1, y1) = ((x + largura).min(self.largura), (y + altura).min(self.altura));
+        self.recorte = (x0, y0, (x1 - x0).max(0), (y1 - y0).max(0));
+    }
+
+    pub fn sem_recorte(&mut self) {
+        self.recorte = (0, 0, self.largura, self.altura);
+    }
+
+    fn dentro(&self, x: i32, y: i32) -> bool {
+        let (rx, ry, rl, ra) = self.recorte;
+        x >= rx && y >= ry && x < rx + rl && y < ry + ra
+    }
+
     pub fn ponto(&mut self, x: i32, y: i32, cor: u32) {
-        if x >= 0 && y >= 0 && x < self.largura && y < self.altura {
+        if self.dentro(x, y) {
             self.pixels[(y * self.largura + x) as usize] = cor;
         }
     }
 
-    /// Retângulo cheio (a parte fora da imagem é cortada).
+    /// Retângulo cheio (a parte fora do recorte é cortada).
     pub fn retangulo(&mut self, x: i32, y: i32, largura: i32, altura: i32, cor: u32) {
-        let (x0, y0) = (x.max(0), y.max(0));
-        let (x1, y1) = ((x + largura).min(self.largura), (y + altura).min(self.altura));
+        let (rx, ry, rl, ra) = self.recorte;
+        let (x0, y0) = (x.max(rx), y.max(ry));
+        let (x1, y1) = ((x + largura).min(rx + rl), (y + altura).min(ry + ra));
         if x0 >= x1 || y0 >= y1 {
             return;
         }
         for linha in y0..y1 {
             let inicio = (linha * self.largura) as usize;
             self.pixels[inicio + x0 as usize..inicio + x1 as usize].fill(cor);
+        }
+    }
+
+    /// Retângulo cheio com os cantos arredondados (raio de 3 pixels).
+    pub fn retangulo_arredondado(&mut self, x: i32, y: i32, largura: i32, altura: i32, cor: u32) {
+        // Quantos pixels cada uma das 3 linhas de cima e de baixo perde nos cantos.
+        const RECUO: [i32; 3] = [2, 1, 1];
+        for (i, &r) in RECUO.iter().enumerate() {
+            let i = i as i32;
+            self.retangulo(x + r, y + i, largura - 2 * r, 1, cor);
+            self.retangulo(x + r, y + altura - 1 - i, largura - 2 * r, 1, cor);
+        }
+        self.retangulo(x, y + 3, largura, altura - 6, cor);
+    }
+
+    /// Círculo cheio de centro (cx, cy).
+    pub fn circulo(&mut self, cx: i32, cy: i32, raio: i32, cor: u32) {
+        for dy in -raio..=raio {
+            // a meia-largura da linha: o maior dx com dx² + dy² ≤ raio²
+            let mut dx = 0;
+            while (dx + 1) * (dx + 1) + dy * dy <= raio * raio {
+                dx += 1;
+            }
+            self.retangulo(cx - dx, cy + dy, 2 * dx + 1, 1, cor);
+        }
+    }
+
+    /// Escurece a imagem inteira (o fundo atrás de uma caixa de diálogo).
+    pub fn escurecer(&mut self, alfa: u8) {
+        for y in 0..self.altura {
+            for x in 0..self.largura {
+                self.misturar(x, y, 0, alfa);
+            }
         }
     }
 
@@ -89,7 +146,8 @@ impl Quadro<'_> {
 
     /// Uma letra em (x, y); `fundo` None deixa o fundo como está.
     pub fn letra(&mut self, fonte: &Fonte, x: i32, y: i32, c: char, frente: u32, fundo: Option<u32>) {
-        if x + LARGURA_LETRA <= 0 || y + ALTURA_LETRA <= 0 || x >= self.largura || y >= self.altura {
+        let (rx, ry, rl, ra) = self.recorte;
+        if x + LARGURA_LETRA <= rx || y + ALTURA_LETRA <= ry || x >= rx + rl || y >= ry + ra {
             return;
         }
         for (dy, &bits) in fonte.glifo(c).iter().enumerate() {
@@ -111,7 +169,7 @@ impl Quadro<'_> {
 
     /// Mistura `cor` no pixel com a opacidade `alfa` (0 = nada, 255 = cor inteira).
     pub fn misturar(&mut self, x: i32, y: i32, cor: u32, alfa: u8) {
-        if x < 0 || y < 0 || x >= self.largura || y >= self.altura || alfa == 0 {
+        if !self.dentro(x, y) || alfa == 0 {
             return;
         }
         let i = (y * self.largura + x) as usize;
@@ -146,11 +204,12 @@ impl Quadro<'_> {
 
     /// Copia outra imagem (`largura` × `altura`) para (x, y), cortando o que sobrar.
     pub fn copiar(&mut self, origem: &[u32], largura: i32, altura: i32, x: i32, y: i32) {
-        let (x0, x1) = (x.max(0), (x + largura).min(self.largura));
+        let (rx, ry, rl, ra) = self.recorte;
+        let (x0, x1) = (x.max(rx), (x + largura).min(rx + rl));
         if x0 >= x1 {
             return;
         }
-        for linha in y.max(0)..(y + altura).min(self.altura) {
+        for linha in y.max(ry)..(y + altura).min(ry + ra) {
             let o = ((linha - y) * largura + (x0 - x)) as usize;
             let d = (linha * self.largura + x0) as usize;
             let n = (x1 - x0) as usize;

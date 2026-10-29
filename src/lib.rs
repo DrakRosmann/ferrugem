@@ -159,7 +159,11 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     pic::init();
     pit::init();
     teclado::init();
-    let mouse = if mouse::init() { ", mouse PS/2" } else { "" };
+    let mouse = match mouse::init() {
+        true if mouse::tem_roda() => ", mouse PS/2 com roda",
+        true => ", mouse PS/2",
+        false => "",
+    };
     ok(format_args!("PIC, timer a {} Hz, teclado ABNT2{} e serial", pit::FREQUENCIA, mouse));
     if let Some(descricao) = video {
         ok(format_args!("{}", descricao));

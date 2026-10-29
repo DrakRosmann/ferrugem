@@ -9,7 +9,8 @@
 //!
 //! ```text
 //!   cliente → servidor:  janela 300 200 Título\n     atualizar\n
-//!   servidor → cliente:  ok 12\n  tecla 97\n  botao 10 20 1 1\n  mover 11 21\n  fechar\n
+//!   servidor → cliente:  ok 12\n  tecla 97\n  seta A\n  botao 10 20 1 1\n  mover 11 21\n
+//!                        roda 11 21 -1\n  fechar\n
 //! ```
 
 use crate::grafico::Quadro;
@@ -19,6 +20,14 @@ use alloc::format;
 use alloc::string::String;
 
 pub const SOCKET: &str = "/tmp/.janelas";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Seta {
+    Cima,
+    Baixo,
+    Direita,
+    Esquerda,
+}
 
 pub struct Janela {
     fd: i32,
@@ -32,8 +41,13 @@ pub enum Evento {
     Tecla(char),
     /// botao: 1 = esquerdo, 2 = direito; apertado: true ao apertar, false ao soltar.
     Botao { x: i32, y: i32, botao: u8, apertado: bool },
-    /// O mouse andou com algum botão apertado dentro da janela.
+    /// O mouse andou dentro da janela (ou fora dela, com um botão apertado
+    /// desde que estava dentro).
     Mover { x: i32, y: i32 },
+    /// A roda do mouse girou: negativo para cima, positivo para baixo.
+    Roda { x: i32, y: i32, giro: i32 },
+    /// Uma seta do teclado.
+    Seta(Seta),
     /// Clicaram no "x" da janela.
     Fechar,
 }
@@ -58,7 +72,7 @@ impl Janela {
     pub fn quadro(&mut self) -> Quadro<'_> {
         let n = (self.largura * self.altura) as usize;
         let pixels = unsafe { core::slice::from_raw_parts_mut(self.pixels as *mut u32, n) };
-        Quadro { pixels, largura: self.largura, altura: self.altura }
+        Quadro::novo(pixels, self.largura, self.altura)
     }
 
     /// Pede ao servidor para mostrar o que foi desenhado.
@@ -88,6 +102,17 @@ impl Janela {
                     let (x, y) = (numero(), numero());
                     Some(Evento::Mover { x, y })
                 }
+                Some("roda") => {
+                    let (x, y, giro) = (numero(), numero(), numero());
+                    Some(Evento::Roda { x, y, giro })
+                }
+                Some("seta") => match partes.next() {
+                    Some("A") => Some(Evento::Seta(Seta::Cima)),
+                    Some("B") => Some(Evento::Seta(Seta::Baixo)),
+                    Some("C") => Some(Evento::Seta(Seta::Direita)),
+                    Some("D") => Some(Evento::Seta(Seta::Esquerda)),
+                    _ => None,
+                },
                 Some("fechar") => Some(Evento::Fechar),
                 _ => None,
             };
