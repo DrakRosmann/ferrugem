@@ -40,6 +40,7 @@ mod mouse;
 mod registro;
 mod video;
 mod shm;
+mod smp;
 mod socket;
 mod tty;
 mod vfs;
@@ -102,7 +103,8 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     }
     let info = unsafe { multiboot::Info::de_endereco(endereco_info) };
 
-    gdt::init();
+    let tss = gdt::init();
+    smp::init_principal(tss); // o GS aponta para os dados desta CPU; ela já segura a trava do kernel
     interrupcoes::init();
     syscall::init();
     ok(format_args!(
@@ -164,6 +166,8 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     if let Err(erro) = processo::criar_init("/bin/init") {
         panic!("não consegui carregar /bin/init (erro {})", erro);
     }
+    let cpus = smp::iniciar();
+    ok(format_args!("CPUs: {} (x2APIC; uma trava para o kernel, programas em paralelo)", cpus));
     ok("processo 1 (/bin/init) criado; passando o controle ao escalonador");
     println!();
 

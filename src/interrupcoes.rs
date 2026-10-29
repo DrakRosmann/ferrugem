@@ -14,7 +14,7 @@
 //!   vetor  0x80       chamadas de sistema (syscall.rs)
 //! ```
 
-use crate::{gdt, pic, pit, println, processo, serial, syscall, teclado};
+use crate::{gdt, pic, pit, println, processo, serial, smp, syscall, teclado};
 use core::arch::asm;
 use core::fmt;
 use core::mem::size_of;
@@ -139,6 +139,16 @@ struct Ponteiro {
     base: u64,
 }
 
+/// As outras CPUs usam a mesma IDT (smp.rs).
+pub fn carregar_idt() {
+    let idt = unsafe { &*(&raw const IDT) };
+    let ponteiro = Ponteiro {
+        limite: (size_of::<[Entrada; 256]>() - 1) as u16,
+        base: idt.as_ptr() as u64,
+    };
+    unsafe { asm!("lidt [{}]", in(reg) &ponteiro, options(readonly, nostack, preserves_flags)) };
+}
+
 pub fn init() {
     let idt = unsafe { &mut *(&raw mut IDT) };
     for (vetor, entrada) in idt.iter_mut().enumerate() {
@@ -237,6 +247,9 @@ const NOMES_EXCECOES: [&str; 32] = [
 /// que deve ser restaurado na volta.
 #[unsafe(no_mangle)]
 extern "C" fn tratar_interrupcao(ctx: &mut Contexto) -> *mut Contexto {
+    // Só uma CPU por vez no kernel (smp.rs). Viemos de um programa ou do
+    // `hlt` do ocioso, sem a trava; ou do próprio kernel no boot, já com ela.
+    let peguei = smp::travar();
     match ctx.vetor {
         // Passo a passo (#DB, com a flag TF) e breakpoint (`int3`) num programa
         // viram SIGTRAP: é assim que o depurador fica sabendo.
@@ -248,13 +261,19 @@ extern "C" fn tratar_interrupcao(ctx: &mut Contexto) -> *mut Contexto {
         0..=31 => excecao(ctx),
         32..=47 => irq((ctx.vetor - 32) as u8),
         0x80 => syscall::tratar(ctx),
+        smp::VETOR_TIMER => smp::tique_local(),
+        smp::VETOR_ESPURIO => {}
         vetor => println!("[interrupção] vetor {} inesperado", vetor),
     }
     // A troca de processo acontece dentro de `ao_voltar_para_usuario`, por
     // `troca_contexto`: quando voltarmos aqui, já é a vez deste processo de novo.
     if ctx.veio_do_usuario() {
-        let foi_o_timer = ctx.vetor == 32;
+        let foi_o_timer = ctx.vetor == 32 || ctx.vetor == smp::VETOR_TIMER;
         processo::ao_voltar_para_usuario(ctx, foi_o_timer);
+    }
+    // De volta ao programa (ou ao `hlt`): a trava fica livre para as outras CPUs.
+    if peguei {
+        smp::destravar();
     }
     ctx
 }

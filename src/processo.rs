@@ -21,7 +21,7 @@ use crate::erro::*;
 use crate::interrupcoes::Contexto;
 use crate::paginacao::{self, EspacoEnderecos, Falha, Fonte, PROT_ESCREVER, PROT_LER, Regiao};
 use crate::sinal::{self, Sinais};
-use crate::{elf, gdt, pit, println, syscall, vfs};
+use crate::{elf, gdt, pit, println, smp, syscall, vfs};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
-use core::ptr::null_mut;
+use alloc::format;
 
 pub type Pid = u32;
 
@@ -269,7 +269,7 @@ impl Processo {
             for i in 0..6 {
                 (quadro as *mut u64).add(i).write(0); // r15, r14, r13, r12, rbx, rbp
             }
-            (quadro as *mut u64).add(6).write(isr_sair as *const () as u64); // endereço de retorno
+            (quadro as *mut u64).add(6).write(comeco_de_processo as *const () as u64); // endereço de retorno
         }
         self.rsp_salvo = quadro;
     }
@@ -277,7 +277,8 @@ impl Processo {
 
 unsafe extern "C" {
     fn troca_contexto(salvar_rsp_em: *mut u64, novo_rsp: u64);
-    fn isr_sair();
+    /// Solta a trava do kernel e vai para `isr_sair` (interrupcoes.asm).
+    fn comeco_de_processo();
 }
 
 /// A área do `fxsave`: 512 bytes, alinhados em 16.
@@ -303,25 +304,42 @@ fn restaurar_fpu(estado: &EstadoFpu) {
     unsafe { asm!("fxrstor64 [{}]", in(reg) estado.0.as_ptr(), options(nostack, preserves_flags)) };
 }
 
-/// Lido por `entrada_syscall` (asm): a pilha de kernel do processo atual.
-#[unsafe(no_mangle)]
-static mut PILHA_KERNEL_ATUAL: u64 = 0;
-
 struct Tabela {
-    processos: Vec<Box<Processo>>, // o índice 0 é sempre o ocioso
-    atual: *mut Processo,
+    /// O índice 0 é o ocioso da CPU principal (os das outras CPUs ficam fora
+    /// da tabela, cada um na sua `Cpu`: ninguém mais os escolhe).
+    processos: Vec<Box<Processo>>,
     proximo_pid: Pid,
 }
 
-static mut TABELA: Tabela = Tabela { processos: Vec::new(), atual: null_mut(), proximo_pid: 0 };
+static mut TABELA: Tabela = Tabela { processos: Vec::new(), proximo_pid: 0 };
 
 fn tabela() -> &'static mut Tabela {
-    // Seguro pela regra de ouro: só o kernel mexe, e com interrupções desligadas.
+    // Seguro pela regra de ouro: só uma CPU por vez no kernel (a trava de
+    // smp.rs), e com as interrupções desligadas.
     unsafe { &mut *(&raw mut TABELA) }
 }
 
+/// O processo que *esta* CPU está rodando.
 pub fn atual() -> &'static mut Processo {
-    unsafe { &mut *tabela().atual }
+    unsafe { &mut *smp::cpu().atual }
+}
+
+/// A FPU zerada, no MXCSR padrão (em cada CPU, no boot dela).
+pub fn preparar_fpu() {
+    unsafe { asm!("fninit", "ldmxcsr [{}]", in(reg) &0x1F80u32, options(nostack)) };
+}
+
+/// O ocioso de uma CPU extra (fica na `Cpu` dela, fora da tabela).
+pub fn novo_ocioso(cpu: usize) -> *mut Processo {
+    let mut p = Processo::novo(0, format!("ocioso{}", cpu));
+    p.pilha_kernel = Vec::new(); // usa a pilha com que a CPU acordou
+    p.estado = Estado::Rodando;
+    Box::leak(p)
+}
+
+/// Qual espaço de endereçamento o processo usa (0 = só o do kernel).
+fn espaco_de(p: &Processo) -> usize {
+    p.memoria.as_ref().map_or(0, |m| Arc::as_ptr(m) as *const () as usize)
 }
 
 fn buscar(pid: Pid) -> Option<&'static mut Processo> {
@@ -330,17 +348,14 @@ fn buscar(pid: Pid) -> Option<&'static mut Processo> {
 
 /// Transforma o fluxo do boot no processo 0, o "ocioso".
 pub fn init() {
-    unsafe {
-        // FPU zerada, MXCSR padrão (todas as exceções de ponto flutuante mascaradas).
-        asm!("fninit", "ldmxcsr [{}]", in(reg) &0x1F80u32, options(nostack));
-        salvar_fpu(&mut *(&raw mut FPU_INICIAL));
-    }
+    // FPU zerada, MXCSR padrão (todas as exceções de ponto flutuante mascaradas).
+    preparar_fpu();
+    unsafe { salvar_fpu(&mut *(&raw mut FPU_INICIAL)) };
     let mut ocioso = Processo::novo(0, "ocioso".to_string());
     ocioso.pilha_kernel = Vec::new(); // ele usa a pilha do boot
     ocioso.estado = Estado::Rodando;
-    let t = tabela();
-    t.atual = &mut *ocioso;
-    t.processos.push(ocioso);
+    smp::cpu().atual = &mut *ocioso;
+    tabela().processos.push(ocioso);
 }
 
 /// O que o processo 0 faz para sempre: escalonar e, se não houver ninguém
@@ -351,32 +366,47 @@ pub fn ocioso() -> ! {
         escalonar();
         // Sem ninguém para rodar: boa hora de mandar o cache sujo para o disco.
         let agora = pit::milissegundos();
-        if agora - ultima_gravacao >= 3000 {
+        if smp::numero() == 0 && agora - ultima_gravacao >= 3000 {
             vfs::sincronizar_tudo();
             ultima_gravacao = agora;
         }
+        // Dormindo, esta CPU não usa o kernel: a trava fica com as outras.
         // `sti; hlt` é atômico (o sti só vale depois da instrução seguinte):
         // nenhuma interrupção se perde entre os dois.
+        smp::destravar();
         unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
+        smp::travar();
     }
 }
 
 /// Escolhe o próximo processo pronto (rodízio, ou "round-robin") e troca para ele.
+///
+/// Com várias CPUs: cada uma escolhe para si, e um processo cujo espaço de
+/// endereçamento já está em uso em outra CPU (outra thread dele) espera.
 pub fn escalonar() {
     let t = tabela();
-    let atual = t.atual;
-    // Threads que já terminaram (de outras pilhas: a atual ainda está em uso).
+    let cpu = smp::cpu();
+    let atual = cpu.atual;
+    // Threads que já terminaram (de outras pilhas: a atual ainda está em uso;
+    // e uma zumbi nunca é a atual de outra CPU, que já teria trocado de processo).
     t.processos.retain(|p| !(p.thread_morta && p.estado == Estado::Zumbi && !core::ptr::eq(&**p, atual)));
+    // Os espaços de endereçamento que as outras CPUs estão usando agora.
+    let ocupados: Vec<usize> = smp::todas()
+        .filter(|c| c.id != cpu.id && !c.atual.is_null())
+        .map(|c| espaco_de(unsafe { &*c.atual }))
+        .filter(|&e| e != 0)
+        .collect();
     unsafe {
         if (*atual).estado == Estado::Rodando {
             (*atual).estado = Estado::Pronto;
         }
         let n = t.processos.len();
         let posicao = t.processos.iter().position(|p| core::ptr::eq(&**p, atual)).unwrap_or(0);
-        let mut proximo: *mut Processo = &mut *t.processos[0];
+        let mut proximo: *mut Processo = cpu.ocioso;
         for k in 1..=n {
             let i = (posicao + k) % n;
-            if i != 0 && t.processos[i].estado == Estado::Pronto {
+            let p = &t.processos[i];
+            if i != 0 && p.estado == Estado::Pronto && !ocupados.contains(&espaco_de(p)) {
                 proximo = &mut *t.processos[i];
                 break;
             }
@@ -386,11 +416,11 @@ pub fn escalonar() {
             return;
         }
 
-        t.atual = proximo;
+        cpu.atual = proximo;
         if !(*proximo).pilha_kernel.is_empty() {
             let topo = (*proximo).topo_pilha();
             gdt::definir_rsp0(topo);
-            PILHA_KERNEL_ATUAL = topo;
+            cpu.pilha_kernel = topo;
         }
         match (*proximo).espaco() {
             Some(espaco) => espaco.ativar(),
@@ -419,9 +449,16 @@ pub fn acordar(canal: usize) {
     }
 }
 
-/// A cada tique do timer.
+/// O timer de uma CPU extra: só conta o tempo do processo dela.
+pub fn contar_tique() {
+    if !smp::cpu().atual.is_null() {
+        atual().tiques += 1;
+    }
+}
+
+/// A cada tique do PIT (na CPU principal): relógio, prazos e alarmes.
 pub fn tique() {
-    if tabela().atual.is_null() {
+    if smp::cpu().atual.is_null() {
         return;
     }
     atual().tiques += 1;

@@ -105,6 +105,7 @@ pub fn tratar(ctx: &mut Contexto) {
         232 => epoll::esperar(a1, a2, a3, if a4 as i32 >= 0 { Some(a4 as i32 as u64) } else { None }),
         281 => epoll::esperar(a1, a2, a3, if a4 as i32 >= 0 { Some(a4 as i32 as u64) } else { None }), // epoll_pwait (sem máscara)
         103 => crate::registro::syscall(a1, a2, a3), // syslog: o registro do kernel (dmesg)
+        309 => sys_getcpu(a1, a2),
         29 => crate::shm::shmget(a1 as i32, a2, a3),
         30 => crate::shm::shmat(a1 as i32, a2, a3),
         31 => crate::shm::shmctl(a1 as i32, a2, a3),
@@ -677,6 +678,17 @@ fn sys_mprotect(endereco: u64, tamanho: u64, prot: u64) -> Resultado {
 fn sys_msync(endereco: u64, tamanho: u64) -> Resultado {
     let (inicio, fim) = faixa_valida(endereco, tamanho)?;
     processo::atual().espaco().ok_or(EINVAL)?.sincronizar(inicio, fim);
+    Ok(0)
+}
+
+/// `getcpu`: em qual CPU (e nó NUMA, sempre 0) o processo está rodando.
+fn sys_getcpu(ptr_cpu: u64, ptr_no: u64) -> Resultado {
+    if ptr_cpu != 0 {
+        escrever_usuario(ptr_cpu, &(crate::smp::numero() as u32).to_le_bytes())?;
+    }
+    if ptr_no != 0 {
+        escrever_usuario(ptr_no, &0u32.to_le_bytes())?;
+    }
     Ok(0)
 }
 

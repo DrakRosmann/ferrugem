@@ -43,7 +43,7 @@ mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E offset=1048576
         printf '%s\r' "$comando"
         sleep 10
     done
-} | timeout 70 qemu-system-x86_64 -cpu max -kernel build/ferrugem.bin -initrd build/initrd.tar -m 256M \
+} | timeout 70 qemu-system-x86_64 -cpu max -smp 4 -kernel build/ferrugem.bin -initrd build/initrd.tar -m 256M \
         -drive file="$disco",format=raw,if=ide,index=0 \
         -drive file="$particionado",format=raw,if=ide,index=1 \
         -display none -chardev stdio,id=s0,signal=off -serial chardev:s0 -no-reboot > "$saida" 2>&1
@@ -90,7 +90,7 @@ mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E offset=1048576
     printf 'root\r'; sleep 0.5; printf 'root\r'; sleep 1.5
     printf 'teste\r'; sleep 12
     printf 'desligar\r'; sleep 3
-} | timeout 40 qemu-system-x86_64 -cpu max -kernel build/ferrugem.bin -append "raiz=/dev/hda" -m 256M \
+} | timeout 40 qemu-system-x86_64 -cpu max -smp 4 -kernel build/ferrugem.bin -append "raiz=/dev/hda" -m 256M \
         -drive file="$sistema",format=raw,if=ide,index=0 \
         -drive file="$particionado.2",format=raw,if=ide,index=1 \
         -display none -chardev stdio,id=s0,signal=off -serial chardev:s0 -no-reboot > "$saida.2" 2>&1

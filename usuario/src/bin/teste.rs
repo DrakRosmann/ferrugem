@@ -1329,6 +1329,64 @@ fn bibliotecas_dinamicas() -> R {
     Ok(())
 }
 
+/// Uma conta pesada; anota em `cpus` (um bit por CPU) onde ela rodou.
+fn conta_pesada(iteracoes: u64, cpus: &AtomicU64) -> u64 {
+    let mut x = 1u64;
+    for i in 0..iteracoes {
+        x = black_box(x.wrapping_mul(6364136223846793005).wrapping_add(i));
+        if i % 65536 == 0 {
+            cpus.fetch_or(1 << sys::cpu_atual(), Ordering::Relaxed);
+        }
+    }
+    x
+}
+
+fn varias_cpus() -> R {
+    let info = sys::ler_arquivo("/proc/cpuinfo").map_err(erro)?;
+    let n = String::from_utf8_lossy(&info).matches("processor").count();
+    if n < 2 {
+        return Ok(()); // com uma CPU só, não há o que provar
+    }
+    // Memória dividida com os filhos: a máscara das CPUs por onde passaram.
+    let pagina = sys::mmap(4096, sys::PROT_READ | sys::PROT_WRITE, sys::MAP_SHARED | sys::MAP_ANONYMOUS, -1, 0)
+        .map_err(erro)?;
+    let cpus = unsafe { &*(pagina as *const AtomicU64) };
+    // Quanto trabalho dá uns 300 ms aqui.
+    let inicio = sys::tempo_ms();
+    conta_pesada(2_000_000, cpus);
+    let iteracoes = 2_000_000 * 300 / (sys::tempo_ms() - inicio).max(1);
+    let rodar = |quantos: usize| -> Result<u64, String> {
+        let inicio = sys::tempo_ms();
+        let mut filhos = Vec::new();
+        for _ in 0..quantos {
+            match sys::fork().map_err(erro)? {
+                0 => {
+                    conta_pesada(iteracoes, cpus);
+                    sys::sair(0);
+                }
+                pid => filhos.push(pid),
+            }
+        }
+        for pid in filhos {
+            let _ = sys::esperar(pid);
+        }
+        Ok(sys::tempo_ms() - inicio)
+    };
+    let sozinho = rodar(1)?;
+    cpus.store(0, Ordering::Relaxed);
+    let juntos = rodar(4)?;
+    let usadas = cpus.load(Ordering::Relaxed).count_ones();
+    let _ = sys::munmap(pagina, 4096);
+    if usadas < 2 {
+        return Err(format!("os 4 processos rodaram em {} CPU", usadas));
+    }
+    // Em série, 4 contas levariam 4x mais; em paralelo, bem menos.
+    if juntos * 10 > sozinho * 30 {
+        return Err(format!("sem paralelismo: 1 conta em {} ms, 4 em {} ms", sozinho, juntos));
+    }
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1339,7 +1397,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 56] = [
+    let testes: [(&str, fn() -> R); 57] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1396,6 +1454,7 @@ fn principal(args: &[&str]) -> i32 {
         ("pseudo-terminais: eco, Ctrl+C e SIGHUP", pseudo_terminais),
         ("interface gráfica: framebuffer, servidor de janelas e um cliente", interface_grafica),
         ("bibliotecas dinâmicas: PT_INTERP, ld-ferrugem.so, PIE e ASLR", bibliotecas_dinamicas),
+        ("várias CPUs: 4 processos em CPUs diferentes, ao mesmo tempo", varias_cpus),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

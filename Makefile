@@ -66,7 +66,8 @@ USUARIO_SRC := $(wildcard usuario/src/*.rs usuario/src/bin/*.rs) $(wildcard comu
                usuario/Cargo.toml usuario/usuario.ld
 ARQUIVOS_RAIZ := $(shell find raiz -type f)
 
-QEMU := qemu-system-x86_64 -cpu max -kernel $(KERNEL) -initrd $(INITRD) -m 256M \
+# 4 CPUs (o kernel acorda as outras três: veja src/smp.rs).
+QEMU := qemu-system-x86_64 -cpu max -smp 4 -kernel $(KERNEL) -initrd $(INITRD) -m 256M \
         -drive file=$(DISCO),format=raw,if=ide,index=0
 
 .PHONY: all run run-nox run-sistema sistema teste clean disco musl lua
@@ -82,7 +83,12 @@ $(BOOT_O): boot/boot.asm | $(BUILD)
 $(ISR_O): src/interrupcoes.asm | $(BUILD)
 	nasm -f elf64 $< -o $@
 
-$(RUSTLIB): $(RUST_SRC)
+# O código onde as outras CPUs começam (16 bits): binário puro, embutido no kernel.
+TRAMPOLIM := $(BUILD)/trampolim.bin
+$(TRAMPOLIM): src/trampolim.asm | $(BUILD)
+	nasm -f bin $< -o $@
+
+$(RUSTLIB): $(RUST_SRC) $(TRAMPOLIM)
 	RUSTFLAGS="$(FLAGS_KERNEL)" cargo build --release --target $(TARGET)
 
 # 1) liga boot.o + interrupções + Rust num ELF de 64 bits
@@ -165,7 +171,7 @@ sistema: $(INITRD)
 
 # Raiz no disco: sem initrd; o kernel monta o hda como "/" (raiz=/dev/hda).
 run-sistema: $(KERNEL) $(SISTEMA)
-	qemu-system-x86_64 -cpu max -kernel $(KERNEL) -append "raiz=/dev/hda" -m 256M \
+	qemu-system-x86_64 -cpu max -smp 4 -kernel $(KERNEL) -append "raiz=/dev/hda" -m 256M \
 		-drive file=$(SISTEMA),format=raw,if=ide,index=0 \
 		-chardev stdio,id=serial0,signal=off -serial chardev:serial0
 

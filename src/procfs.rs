@@ -267,11 +267,19 @@ fn global(g: Global) -> String {
             format!("{}.{:02} {}.{:02}\n", ms / 1000, ms % 1000 / 10, ocioso / 1000, ocioso % 1000 / 10)
         }
         Global::Version => String::from("FerrugemOS version 0.5.0 (rustc, sem std) #1 x86_64\n"),
-        Global::Cpuinfo => format!(
-            "processor\t: 0\nmodel name\t: {}\nrdrand\t\t: {}\n\n",
-            marca_da_cpu(),
-            if crate::aleatorio::tem_hardware() { "sim" } else { "não" }
-        ),
+        Global::Cpuinfo => {
+            let mut t = String::new();
+            for c in crate::smp::todas() {
+                t.push_str(&format!(
+                    "processor\t: {}\nmodel name\t: {}\napicid\t\t: {}\nrdrand\t\t: {}\n\n",
+                    c.id,
+                    marca_da_cpu(),
+                    c.apic,
+                    if crate::aleatorio::tem_hardware() { "sim" } else { "não" }
+                ));
+            }
+            t
+        }
         Global::Mounts => {
             let mut t = String::new();
             for (dispositivo, ponto, tipo) in vfs::montagens() {

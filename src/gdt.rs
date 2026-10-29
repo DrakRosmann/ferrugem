@@ -31,7 +31,7 @@ const SELETOR_TSS: u16 = 0x28;
 pub const IST_DOUBLE_FAULT: u8 = 1;
 
 #[repr(C, packed(4))]
-struct Tss {
+pub struct Tss {
     reservado1: u32,
     rsp: [u64; 3],
     reservado2: u64,
@@ -44,30 +44,42 @@ struct Tss {
 #[repr(C, align(16))]
 struct Pilha([u8; 16 * 1024]);
 
-static mut PILHA_DOUBLE_FAULT: Pilha = Pilha([0; 16 * 1024]);
+/// A GDT e a TSS de uma CPU. Cada CPU precisa da sua TSS: é nela que fica a
+/// pilha de kernel do processo que *aquela* CPU está rodando (rsp0).
+pub struct Gdt {
+    tabela: [u64; 7],
+    pub tss: Tss,
+    pilha_double_fault: Pilha,
+}
 
-static mut TSS: Tss = Tss {
-    reservado1: 0,
-    rsp: [0; 3],
-    reservado2: 0,
-    ist: [0; 7],
-    reservado3: 0,
-    reservado4: 0,
-    // Base do mapa de permissões de E/S além do fim da TSS = "sem mapa".
-    iomap_base: size_of::<Tss>() as u16,
-};
+impl Gdt {
+    pub const fn nova() -> Gdt {
+        Gdt {
+            tabela: [
+                0,
+                0x00AF_9A00_0000_FFFF, // código do kernel
+                0x00CF_9200_0000_FFFF, // dados do kernel
+                0x00CF_F200_0000_FFFF, // dados de usuário  (DPL 3)
+                0x00AF_FA00_0000_FFFF, // código de usuário (DPL 3)
+                0,                     // TSS: preenchida em carregar(), pois depende do endereço
+                0,
+            ],
+            tss: Tss {
+                reservado1: 0,
+                rsp: [0; 3],
+                reservado2: 0,
+                ist: [0; 7],
+                reservado3: 0,
+                reservado4: 0,
+                iomap_base: size_of::<Tss>() as u16,
+            },
+            pilha_double_fault: Pilha([0; 16 * 1024]),
+        }
+    }
+}
 
-static mut GDT: [u64; 7] = [
-    0,
-    // Bits: 43 executável | 44 código/dados | 45-46 DPL | 47 presente | 53 64 bits
-    // (o bit 41 permite leitura no código e escrita nos dados)
-    0x00AF_9A00_0000_FFFF, // código do kernel
-    0x00CF_9200_0000_FFFF, // dados do kernel
-    0x00CF_F200_0000_FFFF, // dados de usuário  (DPL 3)
-    0x00AF_FA00_0000_FFFF, // código de usuário (DPL 3)
-    0,                     // TSS: preenchida em init(), pois depende do endereço
-    0,
-];
+/// A da CPU principal (as outras são criadas no heap, em smp.rs).
+static mut GDT_BSP: Gdt = Gdt::nova();
 
 #[repr(C, packed)]
 struct Ponteiro {
@@ -76,20 +88,26 @@ struct Ponteiro {
 }
 
 /// A pilha que a CPU usa quando um programa (anel 3) é interrompido ou faz
-/// uma syscall. O escalonador troca a cada processo.
+/// uma syscall. O escalonador troca a cada processo (na TSS desta CPU).
 pub fn definir_rsp0(topo: u64) {
-    unsafe { (*(&raw mut TSS)).rsp[0] = topo };
+    unsafe { (*crate::smp::cpu().tss).rsp[0] = topo };
 }
 
-pub fn init() {
+/// A da CPU principal, no boot.
+pub fn init() -> *mut Tss {
+    unsafe { carregar(&mut *(&raw mut GDT_BSP)) }
+}
+
+/// Carrega a GDT e a TSS na CPU que está rodando. Devolve a TSS (para o rsp0).
+pub fn carregar(g: &'static mut Gdt) -> *mut Tss {
     unsafe {
-        let topo = (&raw const PILHA_DOUBLE_FAULT) as u64 + size_of::<Pilha>() as u64;
-        (*(&raw mut TSS)).ist[(IST_DOUBLE_FAULT - 1) as usize] = topo;
+        let topo = g.pilha_double_fault.0.as_ptr() as u64 + size_of::<Pilha>() as u64;
+        g.tss.ist[(IST_DOUBLE_FAULT - 1) as usize] = topo;
 
         // O descritor de TSS em 64 bits tem 16 bytes, com a base espalhada em pedaços.
-        let base = (&raw const TSS) as u64;
+        let base = (&raw const g.tss) as u64;
         let limite = size_of::<Tss>() as u64 - 1;
-        let gdt = &mut *(&raw mut GDT);
+        let gdt = &mut g.tabela;
         gdt[5] = (limite & 0xFFFF)
             | ((base & 0xFF_FFFF) << 16)
             | (0x89 << 40) // presente + tipo 9 (TSS de 64 bits disponível)
@@ -123,5 +141,6 @@ pub fn init() {
             options(nostack, preserves_flags),
         );
         asm!("ltr {0:x}", in(reg) SELETOR_TSS, options(nostack, preserves_flags));
+        &raw mut g.tss
     }
 }

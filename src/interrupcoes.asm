@@ -22,8 +22,9 @@ global tabela_isr
 global isr_sair
 global troca_contexto
 global entrada_syscall
+global comeco_de_processo
 extern tratar_interrupcao
-extern PILHA_KERNEL_ATUAL
+extern processo_comecou
 
 section .text
 bits 64
@@ -43,6 +44,13 @@ isr_%[i]:
 %endrep
 
 isr_comum:
+    ; Veio de um programa (o CS empilhado tem anel 3)? Então o GS ainda é o
+    ; dele: `swapgs` traz o do kernel, que aponta para a `Cpu` desta CPU (smp.rs).
+    ; [rsp] = vetor, [rsp+8] = código de erro, [rsp+16] = RIP, [rsp+24] = CS
+    test qword [rsp + 24], 3
+    jz isr_salvar
+    swapgs
+isr_salvar:
     ; A ordem aqui é o inverso da ordem dos campos de `Contexto` em interrupcoes.rs
     push rax
     push rbx
@@ -88,8 +96,19 @@ isr_sair:
     pop rcx
     pop rbx
     pop rax
+    test qword [rsp + 24], 3        ; voltando para um programa? devolve o GS dele
+    jz .para_o_kernel
+    swapgs
+.para_o_kernel:
     add rsp, 16                     ; descarta vetor e código de erro
     iretq                           ; restaura RIP, CS, RFLAGS, RSP e SS
+
+; Um processo novo começa a vida aqui: o primeiro `troca_contexto` para ele
+; "retorna" para este ponto. Ele vai direto para o modo usuário, então
+; precisa soltar a trava do kernel que herdou de quem o escalonou.
+comeco_de_processo:
+    call processo_comecou
+    jmp isr_sair
 
 ; -----------------------------------------------------------------------------
 ; troca_contexto(salvar_rsp_em: *mut u64 [RDI], novo_rsp: u64 [RSI])
@@ -126,19 +145,17 @@ troca_contexto:
 ; e a volta é por `iretq`.
 ; -----------------------------------------------------------------------------
 entrada_syscall:
-    mov [rel rsp_usuario], rsp
-    mov rsp, [rel PILHA_KERNEL_ATUAL]
+    swapgs                          ; GS → a `Cpu` desta CPU (smp.rs)
+    mov [gs:8], rsp                 ; Cpu.rsp_usuario
+    mov rsp, [gs:0]                 ; Cpu.pilha_kernel: a do processo atual
     push qword 0x1B                 ; SS  = dados de usuário  (0x18 | anel 3)
-    push qword [rel rsp_usuario]    ; RSP do usuário
+    push qword [gs:8]               ; RSP do usuário
     push r11                        ; RFLAGS
     push qword 0x23                 ; CS  = código de usuário (0x20 | anel 3)
     push rcx                        ; RIP de volta
     push qword 0                    ; código de erro
     push qword 0x80                 ; vetor: o mesmo do `int 0x80`
-    jmp isr_comum
-
-section .bss
-rsp_usuario: resq 1                 ; uma CPU só: um lugar temporário basta
+    jmp isr_salvar                  ; (o swapgs já foi feito)
 
 ; -----------------------------------------------------------------------------
 ; Tabela com o endereço de cada stub; o Rust usa para preencher a IDT.

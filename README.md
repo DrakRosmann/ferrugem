@@ -138,6 +138,10 @@ interface gráfica.
   programas, que conversam com o servidor por um socket Unix e desenham numa
   memória compartilhada (`ulib::janela`; exemplo: `pintar`).
 
+- **Várias CPUs (SMP):** x2APIC, CPUs achadas pela MADT do ACPI e acordadas
+  por INIT-SIPI-SIPI (`trampolim.asm`), dados por CPU com `swapgs`, timer do
+  APIC em cada uma; uma trava para o kernel e programas em paralelo
+  (`getcpu`, `/proc/cpuinfo`).
 - **Bibliotecas dinâmicas:** o kernel carrega executáveis PIE (`ET_DYN`) numa
   base sorteada e, se o programa pede um carregador (`PT_INTERP`), carrega os
   dois e começa por ele, com o vetor auxiliar completo (`AT_BASE`,
@@ -184,6 +188,7 @@ interface gráfica.
 | `src/ata.rs`, `ext2.rs` | Driver de disco e sistema de arquivos ext2 |
 | `src/tty.rs`, `teclado.rs`, `serial.rs`, `vga.rs` | Consoles, pseudo-terminais e dispositivos de entrada e saída |
 | `src/socket.rs`, `epoll.rs`, `shm.rs` | Sockets Unix, epoll, memória compartilhada |
+| `src/smp.rs`, `trampolim.asm` | Várias CPUs: APIC, ACPI, acordar as outras, a trava do kernel |
 | `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
 | `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
 | `comum/lista_livre.rs` | Alocador usado pelo kernel e pelos programas |
@@ -227,17 +232,31 @@ Quem espera alguma coisa (teclado, pipe, filho, tempo) dorme num "canal" e
 é acordado quando o evento acontece.
 
 O kernel roda sempre com interrupções desligadas (elas só ficam ligadas em modo
-usuário e no processo ocioso). Numa CPU só, isso faz o kernel inteiro funcionar
-como uma grande seção crítica, a mesma ideia do "big kernel lock" das primeiras
-versões do Linux.
+usuário e no processo ocioso).
+
+### Várias CPUs
+
+No boot, o kernel lê a tabela MADT do ACPI, liga o x2APIC e acorda as outras
+CPUs (INIT, SIPI, SIPI): cada uma começa em modo real no `trampolim.asm` e
+sobe sozinha até o modo longo. Cada CPU tem os seus dados (GS, via `swapgs`),
+a sua TSS, o seu processo ocioso e o timer do seu APIC.
+
+O kernel inteiro é protegido por **uma trava só** (o "big kernel lock" das
+primeiras versões do Linux com SMP): uma CPU a pega ao entrar no kernel e a
+solta ao voltar para o programa (ou ao dormir no `hlt`). Só uma CPU por vez
+roda código do kernel; os programas rodam em paralelo. E um mesmo espaço de
+endereçamento (as threads de um processo) roda numa CPU por vez, então
+nenhuma CPU fica com traduções velhas na TLB quando outra muda as tabelas
+de páginas. O `make run` usa 4 CPUs.
 
 ## Próximos passos
 
 1. **Portar mais programas de verdade:** o Lua 5.4 já roda sem modificações
    (`make lua`); depois, `dash` e `busybox`. O kernel avisa quando falta uma
    syscall: `chamada de sistema N não implementada`.
-2. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs — exige trocar o
-   "big kernel lock" por locks de verdade), boot UEFI.
+2. **Hardware moderno:** IOAPIC (as IRQs ainda vêm do PIC, só para a CPU
+   principal), trocar a trava única do kernel por travas finas (e então
+   threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
 4. **Interface gráfica:** mais programas com janela, redimensionar janelas,
    fontes maiores, acentos completos (a fonte da VGA não tem "ã").

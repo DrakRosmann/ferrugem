@@ -805,6 +805,13 @@ pub fn enviar_para(fd: i32, dados: &[u8], caminho: &str) -> Resultado<usize> {
     conferir(r).map(|n| n as usize)
 }
 
+/// Em qual CPU este programa está rodando agora (`getcpu`).
+pub fn cpu_atual() -> u32 {
+    let mut cpu = 0u32;
+    unsafe { syscall(309, &raw mut cpu as u64, 0, 0, 0) };
+    cpu
+}
+
 /// `poll`: espera algum dos descritores ficar pronto (ou `prazo_ms`; -1 = sem prazo).
 /// Cada item: (descritor, eventos pedidos); devolve os eventos de cada um.
 pub fn poll(itens: &[(i32, u16)], prazo_ms: i32) -> Resultado<Vec<u16>> {
