@@ -61,6 +61,15 @@ fn receber(c: char) {
     tty::receber(vga::ativa() as tty::IdTerminal, c);
 }
 
+/// Alt+tecla, para quem capturou o teclado: ESC antes da tecla (como os
+/// terminais fazem com a tecla "meta"). É assim que o servidor de janelas
+/// vê o Alt+Tab.
+fn prefixo_alt() {
+    if let Some(fila) = CAPTURA.lock().as_mut() {
+        fila.push_back(0x1B);
+    }
+}
+
 /// Setas (só para quem capturou o teclado; os consoles não as usam).
 fn seta(letra: u8) {
     let mut captura = CAPTURA.lock();
@@ -182,6 +191,9 @@ impl Estado {
             _ if solta => {}
             _ => {
                 if let Some((normal, com_shift)) = mapa_abnt2(codigo) {
+                    if self.alt && !self.ctrl {
+                        prefixo_alt();
+                    }
                     // Ctrl+letra vira um caractere de controle: Ctrl+C = 3, Ctrl+D = 4...
                     if self.ctrl && normal.is_ascii_lowercase() {
                         receber(((normal as u8) & 0x1F) as char);

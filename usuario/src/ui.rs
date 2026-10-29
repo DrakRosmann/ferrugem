@@ -74,6 +74,15 @@ pub enum Tecla {
     Tab,
     Esc,
     Seta(Seta),
+    /// Ctrl+C e Ctrl+V.
+    Copiar,
+    Colar,
+}
+
+/// O que os componentes pedem à janela (a área de transferência).
+pub enum Pedido {
+    Copiar(String),
+    Colar,
 }
 
 /// O estado de um campo de texto: o texto e onde está o cursor (em caracteres).
@@ -142,6 +151,8 @@ pub struct Ui {
     modal: bool,
     redesenhar: bool,
     sair: bool,
+    /// Para o laço repassar à janela.
+    pub pedidos: Vec<Pedido>,
 }
 
 impl Default for Ui {
@@ -171,6 +182,7 @@ impl Ui {
             modal: false,
             redesenhar: false,
             sair: false,
+            pedidos: Vec::new(),
         }
     }
 
@@ -198,9 +210,16 @@ impl Ui {
                 '\n' | '\r' => Tecla::Enter,
                 '\t' => Tecla::Tab,
                 '\u{1b}' => Tecla::Esc,
+                '\u{3}' => Tecla::Copiar,
+                '\u{16}' => Tecla::Colar,
                 c => Tecla::Letra(c),
             }),
             Evento::Fechar => self.sair = true,
+            Evento::Tamanho { .. } => self.redesenhar = true,
+            // O texto colado chega como se tivesse sido digitado.
+            Evento::Colar(ref texto) => {
+                self.teclas.extend(texto.chars().filter(|c| !c.is_control()).map(Tecla::Letra));
+            }
         }
     }
 
@@ -585,7 +604,14 @@ impl Tela<'_> {
             campo.cursor = (0..=n).min_by_key(|&i| (largura_ate(self.ui, campo, i) - alvo).abs()).unwrap_or(n);
         }
         let mut enter = false;
-        let teclas = [Tecla::Apagar, Tecla::Enter, Tecla::Seta(Seta::Esquerda), Tecla::Seta(Seta::Direita)];
+        let teclas = [
+            Tecla::Apagar,
+            Tecla::Enter,
+            Tecla::Seta(Seta::Esquerda),
+            Tecla::Seta(Seta::Direita),
+            Tecla::Copiar,
+            Tecla::Colar,
+        ];
         while self.focado(id) {
             let Some(i) = self.ui.teclas.iter().position(|t| matches!(t, Tecla::Letra(_)) || teclas.contains(t)) else {
                 break;
@@ -605,6 +631,9 @@ impl Tela<'_> {
                 Tecla::Seta(Seta::Esquerda) => campo.cursor = campo.cursor.saturating_sub(1),
                 Tecla::Seta(Seta::Direita) => campo.cursor = (campo.cursor + 1).min(campo.texto.chars().count()),
                 Tecla::Enter => enter = true,
+                // Sem seleção de trecho: Ctrl+C copia o campo inteiro.
+                Tecla::Copiar => self.ui.pedidos.push(Pedido::Copiar(campo.texto.clone())),
+                Tecla::Colar => self.ui.pedidos.push(Pedido::Colar),
                 _ => {}
             }
         }
@@ -980,6 +1009,12 @@ pub fn laco(janela: &mut Janela, ui: &mut Ui, mut f: impl FnMut(&mut Tela)) {
             // Um clique muda o estado do programa: desenha de novo com ele.
             if !ui.precisa_redesenhar() || vezes == 3 {
                 break;
+            }
+        }
+        for pedido in core::mem::take(&mut ui.pedidos) {
+            match pedido {
+                Pedido::Copiar(texto) => janela.copiar(&texto),
+                Pedido::Colar => janela.pedir_colagem(),
             }
         }
         janela.mostrar();

@@ -1530,6 +1530,18 @@ fn componentes_da_interface() -> R {
     if p.campo.texto != "oXl" || !p.enter {
         return Err(format!("campo: {:?} (Enter: {})", p.campo.texto, p.enter));
     }
+    // Área de transferência: Ctrl+C pede para copiar o campo; Ctrl+V pede o
+    // texto, que chega (Evento::Colar) como se fosse digitado.
+    p.evento(&mut ui, &mut pixels, Some(Evento::Tecla('\u{3}')));
+    p.evento(&mut ui, &mut pixels, Some(Evento::Tecla('\u{16}')));
+    let pedidos = core::mem::take(&mut ui.pedidos);
+    if !matches!(&pedidos[..], [ulib::ui::Pedido::Copiar(t), ulib::ui::Pedido::Colar] if t == "oXl") {
+        return Err(String::from("Ctrl+C / Ctrl+V não pediram copiar e colar"));
+    }
+    p.evento(&mut ui, &mut pixels, Some(Evento::Colar(String::from("ão"))));
+    if p.campo.texto != "oXãol" {
+        return Err(format!("colar: {:?}", p.campo.texto));
+    }
     // A lista: a roda rola, o clique escolhe, a seta desce.
     p.evento(&mut ui, &mut pixels, Some(Evento::Roda { x: 50, y: 150, giro: 2 }));
     if p.lista.rolagem <= 0 {

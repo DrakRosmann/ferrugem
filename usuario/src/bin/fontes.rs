@@ -33,9 +33,22 @@ fn principal(_args: &[&str]) -> i32 {
         }
     };
     let mut fontes = fontes;
+    desenhar(&mut j, &mut fontes);
+    while let Some(evento) = j.evento() {
+        match evento {
+            Evento::Fechar => break,
+            Evento::Tamanho { .. } => desenhar(&mut j, &mut fontes),
+            _ => {}
+        }
+    }
+    0
+}
+
+fn desenhar(j: &mut Janela, fontes: &mut [(&str, FonteTT)]) {
     {
         let mut q = j.quadro();
-        q.retangulo(0, 0, 620, 440, 0xFFFFFF);
+        let (l, a) = (q.largura, q.altura);
+        q.retangulo(0, 0, l, a, 0xFFFFFF);
         let mut y = 10;
         for (nome, f) in fontes.iter_mut() {
             q.texto_tt(f, 12, y, nome, 11, 0x888888);
@@ -52,10 +65,4 @@ fn principal(_args: &[&str]) -> i32 {
         q.texto_tt(f, 12, y, "FerrugemOS", 48, 0xB7410E);
     }
     j.mostrar();
-    while let Some(evento) = j.evento() {
-        if let Evento::Fechar = evento {
-            break;
-        }
-    }
-    0
 }

@@ -22,8 +22,9 @@ const CORES: [u32; 8] = [0x000000, 0xCC3333, 0x33AA33, 0x3366CC, 0xE0A020, 0xAA4
 
 fn limpar(j: &mut Janela, cor: u32) {
     let mut q = j.quadro();
-    q.retangulo(0, 0, LARGURA, ALTURA, 0xFFFFFF);
-    let largura = LARGURA / CORES.len() as i32;
+    let (largura_total, altura_total) = (q.largura, q.altura);
+    q.retangulo(0, 0, largura_total, altura_total, 0xFFFFFF);
+    let largura = largura_total / CORES.len() as i32;
     for (i, &c) in CORES.iter().enumerate() {
         let x = i as i32 * largura;
         q.retangulo(x, 0, largura, PALETA, c);
@@ -31,7 +32,7 @@ fn limpar(j: &mut Janela, cor: u32) {
             q.moldura(x + 2, 2, largura - 4, PALETA - 4, 0xFFFFFF);
         }
     }
-    q.retangulo(0, PALETA, LARGURA, 1, 0x888888);
+    q.retangulo(0, PALETA, largura_total, 1, 0x888888);
 }
 
 fn principal(_args: &[&str]) -> i32 {
@@ -51,11 +52,11 @@ fn principal(_args: &[&str]) -> i32 {
         match evento {
             Evento::Botao { x, y, botao, apertado: true } => {
                 if y < PALETA {
-                    let i = (x / (LARGURA / CORES.len() as i32)) as usize;
+                    let i = (x / (j.largura / CORES.len() as i32)) as usize;
                     cor = CORES[i.min(CORES.len() - 1)];
                     // redesenha só a paleta, com a cor nova marcada
+                    let largura = j.largura / CORES.len() as i32;
                     let mut q = j.quadro();
-                    let largura = LARGURA / CORES.len() as i32;
                     for (k, &c) in CORES.iter().enumerate() {
                         let x = k as i32 * largura;
                         q.retangulo(x, 0, largura, PALETA, c);
@@ -83,7 +84,11 @@ fn principal(_args: &[&str]) -> i32 {
                 limpar(&mut j, cor);
                 j.mostrar();
             }
-            Evento::Tecla(_) | Evento::Roda { .. } | Evento::Seta(_) => {}
+            Evento::Tamanho { .. } => {
+                limpar(&mut j, cor); // o desenho não é guardado: a tela nova começa limpa
+                j.mostrar();
+            }
+            Evento::Tecla(_) | Evento::Roda { .. } | Evento::Seta(_) | Evento::Colar(_) => {}
             Evento::Fechar => break,
         }
     }

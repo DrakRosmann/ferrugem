@@ -56,10 +56,12 @@ interrompe o programa que está rodando. Alt+F1..F4 troca de console.
 
 **Interface gráfica:** com `make run`, entre na janela do QEMU e digite
 `janelas`. Clique na janela do QEMU para ele capturar o mouse (Ctrl+Alt+G
-solta). No painel: **Terminal** abre outro terminal, **Pintar** abre o
-programa de desenho e **Sair** volta ao modo texto. As janelas são arrastadas
-pelo título e fechadas no "x". Se algo travar, Ctrl+Alt+Backspace derruba a
-interface gráfica.
+solta). O menu **Aplicativos** (no alto) abre terminais e programas e tem o
+"Sair". As janelas são arrastadas pelo título, redimensionadas pelo canto de
+baixo, minimizadas e maximizadas pelos botões (ou com dois cliques no
+título); a barra de tarefas, embaixo, alterna entre elas, e Alt+Tab também.
+No terminal, arrastar copia e o botão direito cola; nos programas, Ctrl+C e
+Ctrl+V. Se algo travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 
 ## O que já existe
 
@@ -132,11 +134,15 @@ interface gráfica.
   `/dev/teclado`; a fonte 8×16 lida da própria VGA (`/dev/fonte`). Ao fechar
   o framebuffer, o kernel repõe os registradores, a fonte e o texto do modo
   texto.
-- **Servidor de janelas** (`janelas`), em modo usuário: área de trabalho,
-  painel com relógio, janelas arrastáveis, terminais (emulador com cores
-  ANSI ligado a um pseudo-terminal com um `sh`) e janelas de outros
-  programas, que conversam com o servidor por um socket Unix e desenham numa
-  memória compartilhada (`ulib::janela`; exemplos: `pintar`, `fontes`).
+- **Servidor de janelas** (`janelas`), em modo usuário: painel com o menu
+  Aplicativos e relógio, barra de tarefas, janelas que se arrastam,
+  redimensionam, minimizam e maximizam, Alt+Tab, área de transferência
+  (copiar e colar entre terminais e programas), e redesenho só do que
+  mudou. Terminais (emulador com cores ANSI ligado a um pseudo-terminal
+  com um `sh`, que recebe SIGWINCH ao mudar de tamanho; seleção com o
+  mouse) e janelas de outros programas, que conversam com o servidor por
+  um socket Unix e desenham numa memória compartilhada (`ulib::janela`;
+  exemplos: `pintar`, `fontes`, `componentes`).
 - **Componentes de interface** (`ulib::ui`, em "modo imediato", como a Dear
   ImGui): rótulos, botões, caixas de seleção, opções, campo de texto,
   lista com rolagem (roda do mouse, barra, setas), deslizante, barra de
@@ -277,9 +283,9 @@ de páginas. O `make run` usa 4 CPUs.
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica, rumo a um desktop como o XFCE:** redimensionar,
-   maximizar e minimizar; barra de tarefas e menu de aplicativos;
-   gerenciador de arquivos, editor de texto, visualizador de imagens.
+4. **Interface gráfica, rumo a um desktop como o XFCE:** gerenciador de
+   arquivos, editor de texto, visualizador de imagens (PNG), monitor do
+   sistema, configurações (papel de parede, tema); mouse absoluto no QEMU.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

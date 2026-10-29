@@ -9,8 +9,13 @@
 //!
 //! ```text
 //!   cliente → servidor:  janela 300 200 Título\n     atualizar\n
+//!                        copiar <texto>\n   colar\n          (a área de transferência)
 //!   servidor → cliente:  ok 12\n  tecla 97\n  seta A\n  botao 10 20 1 1\n  mover 11 21\n
-//!                        roda 11 21 -1\n  fechar\n
+//!                        roda 11 21 -1\n  fechar\n  colar <texto>\n
+//!                        tamanho 400 300 13\n   (redimensionada: a imagem nova é o segmento 13)
+//!
+//! O texto da área de transferência vai numa linha só: `\\` vira `\\\\` e a
+//! quebra de linha vira `\\n`.
 //! ```
 
 use crate::grafico::Quadro;
@@ -50,6 +55,40 @@ pub enum Evento {
     Seta(Seta),
     /// Clicaram no "x" da janela.
     Fechar,
+    /// A janela mudou de tamanho: a imagem nova (`quadro()`) está em branco.
+    Tamanho { largura: i32, altura: i32 },
+    /// A resposta de `pedir_colagem`: o texto da área de transferência.
+    Colar(String),
+}
+
+/// Põe o texto numa linha só, para o protocolo.
+pub fn escapar(texto: &str) -> String {
+    let mut s = String::with_capacity(texto.len());
+    for c in texto.chars() {
+        match c {
+            '\\' => s.push_str("\\\\"),
+            '\n' => s.push_str("\\n"),
+            c => s.push(c),
+        }
+    }
+    s
+}
+
+pub fn desescapar(texto: &str) -> String {
+    let mut s = String::with_capacity(texto.len());
+    let mut letras = texto.chars();
+    while let Some(c) = letras.next() {
+        if c == '\\' {
+            match letras.next() {
+                Some('n') => s.push('\n'),
+                Some(o) => s.push(o),
+                None => {}
+            }
+        } else {
+            s.push(c);
+        }
+    }
+    s
 }
 
 impl Janela {
@@ -78,6 +117,16 @@ impl Janela {
     /// Pede ao servidor para mostrar o que foi desenhado.
     pub fn mostrar(&mut self) {
         let _ = sys::escrever_tudo(self.fd, b"atualizar\n");
+    }
+
+    /// Põe um texto na área de transferência (a que todos os programas dividem).
+    pub fn copiar(&mut self, texto: &str) {
+        let _ = sys::escrever_tudo(self.fd, format!("copiar {}\n", escapar(texto)).as_bytes());
+    }
+
+    /// Pede o texto da área de transferência: ele chega como `Evento::Colar`.
+    pub fn pedir_colagem(&mut self) {
+        let _ = sys::escrever_tudo(self.fd, b"colar\n");
     }
 
     /// O descritor do socket (para esperar com `poll` junto com outras coisas).
@@ -114,6 +163,18 @@ impl Janela {
                     _ => None,
                 },
                 Some("fechar") => Some(Evento::Fechar),
+                Some("colar") => Some(Evento::Colar(desescapar(linha.get(6..).unwrap_or("")))),
+                Some("tamanho") => {
+                    let (largura, altura, id) = (numero(), numero(), numero());
+                    match sys::shmat(id) {
+                        Ok(novos) if largura > 0 && altura > 0 => {
+                            let _ = sys::shmdt(self.pixels);
+                            (self.pixels, self.largura, self.altura) = (novos, largura, altura);
+                            Some(Evento::Tamanho { largura, altura })
+                        }
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             if evento.is_some() {
