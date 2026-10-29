@@ -93,11 +93,12 @@ pub fn tratar(ctx: &mut Contexto) {
         34 => sys_pause(),
         35 => sys_nanosleep(a1),
         37 => sys_alarm(a1),
-        39 => Ok(processo::atual().pid as u64),
-        56 => sys_clone(ctx, a1, a2, ctx.r8),
+        39 => Ok(processo::atual().tgid as u64),
+        56 => sys_clone(ctx, a1, a2, a3, a4, a5),
         57 | 58 => processo::fork(ctx).map(|pid| pid as u64), // vfork vira fork
         59 => sys_execve(ctx, a1, a2, a3),
-        60 | 231 => processo::sair(((a1 & 0xFF) << 8) as i32),
+        60 => processo::sair_da_thread(((a1 & 0xFF) << 8) as i32),
+        231 => processo::sair(((a1 & 0xFF) << 8) as i32),
         61 => sys_wait4(a1, a2, a3),
         62 => processo::sinalizar(a1 as i32 as i64, a2 as u32).map(|_| 0),
         63 => sys_uname(a1),
@@ -130,13 +131,19 @@ pub fn tratar(ctx: &mut Contexto) {
         121 => processo::grupo_e_sessao(a1 as u32).map(|(g, _)| g as u64),
         124 => processo::grupo_e_sessao(a1 as u32).map(|(_, s)| s as u64),
         158 => sys_arch_prctl(a1, a2),
-        200 => processo::enviar_sinal(a1 as u32, a2 as u32).map(|_| 0), // tkill: thread = processo
+        186 => Ok(processo::atual().pid as u64), // gettid
+        200 => processo::enviar_a_thread(0, a1 as u32, a2 as u32).map(|_| 0), // tkill
+        202 => sys_futex(a1, a2, a3, a4, a5, ctx.r9),
         201 => sys_time(a1),
-        218 => Ok(processo::atual().pid as u64), // set_tid_address: uma thread por processo
+        218 => {
+            // set_tid_address: onde zerar o tid quando esta thread terminar
+            processo::atual().limpar_tid = a1;
+            Ok(processo::atual().pid as u64)
+        }
         230 => sys_nanosleep(a3), // clock_nanosleep (sem TIMER_ABSTIME)
         257 => caminho_at(a1, a2).and_then(|c| abrir_caminho(c, a3, ctx.r10)),
         258 => caminho_at(a1, a2).and_then(|c| mkdir_caminho(c, a3)),
-        234 => processo::pode_sinalizar(a2 as u32).and_then(|_| processo::enviar_sinal(a2 as u32, a3 as u32)).map(|_| 0), // tgkill
+        234 => processo::pode_sinalizar(a1 as u32).and_then(|_| processo::enviar_a_thread(a1 as u32, a2 as u32, a3 as u32)).map(|_| 0), // tgkill
         262 => sys_newfstatat(a1, a2, a3, ctx.r10),
         270 => prazo_de_timespec(a5).and_then(|prazo| sys_select(a1, a2, a3, a4, prazo)), // pselect6 (sem máscara)
         271 => prazo_de_timespec(a3).and_then(|prazo| sys_poll(a1, a2, prazo)), // ppoll (sem máscara)
@@ -180,7 +187,7 @@ pub fn tratar(ctx: &mut Contexto) {
 // -----------------------------------------------------------------------------
 
 fn espaco() -> &'static EspacoEnderecos {
-    processo::atual().espaco.as_ref().expect("syscall sem espaço de usuário")
+    processo::atual().espaco().expect("syscall sem espaço de usuário")
 }
 
 fn ler_usuario(ptr: u64, tamanho: usize) -> Result<Vec<u8>, i64> {
@@ -197,7 +204,7 @@ fn caminho(ptr: u64) -> Result<String, i64> {
     if texto.is_empty() {
         return Err(ENOENT);
     }
-    Ok(vfs::normalizar(&processo::atual().diretorio, &texto))
+    Ok(vfs::normalizar(&processo::atual().fs().diretorio, &texto))
 }
 
 /// "dir/" obriga a seguir um link no fim do caminho (e exige que dê num diretório).
@@ -207,7 +214,8 @@ fn termina_em_barra(ptr: u64) -> bool {
 
 fn arquivo(fd: u64) -> Result<Arc<Arquivo>, i64> {
     processo::atual()
-        .arquivos
+        .arquivos()
+        .lista
         .get(fd as usize)
         .and_then(|a| a.clone())
         .ok_or(EBADF)
@@ -216,7 +224,7 @@ fn arquivo(fd: u64) -> Result<Arc<Arquivo>, i64> {
 /// Põe o arquivo no menor descritor livre (regra do Unix: por isso `close(1)`
 /// seguido de `open` faz o arquivo virar a saída padrão).
 fn novo_descritor(arq: Arc<Arquivo>) -> Resultado {
-    let tabela = &mut processo::atual().arquivos;
+    let tabela = &mut processo::atual().arquivos().lista;
     if let Some(fd) = tabela.iter().position(|a| a.is_none()) {
         tabela[fd] = Some(arq);
         return Ok(fd as u64);
@@ -252,7 +260,7 @@ fn cred() -> vfs::Cred {
 
 /// Permissões de um arquivo novo: as pedidas, menos as da umask.
 fn permissoes_novas(pedidas: u64) -> u32 {
-    pedidas as u32 & 0o7777 & !processo::atual().umask
+    pedidas as u32 & 0o7777 & !processo::atual().fs().umask
 }
 
 const O_CLOEXEC: u64 = 0o2000000;
@@ -265,7 +273,7 @@ fn sys_open(ptr: u64, flags: u64, permissoes: u64) -> Resultado {
 fn abrir_caminho(caminho: String, flags: u64, permissoes: u64) -> Resultado {
     let fd = novo_descritor(Arquivo::abrir(&caminho, flags, cred(), permissoes_novas(permissoes))?)?;
     if flags & O_CLOEXEC != 0 {
-        processo::atual().fecha_no_exec |= 1 << fd;
+        processo::atual().arquivos().fecha_no_exec |= 1 << fd;
     }
     Ok(fd)
 }
@@ -335,9 +343,9 @@ fn sys_chown(ptr: u64, uid: u64, gid: u64) -> Resultado {
 }
 
 fn sys_umask(nova: u64) -> Resultado {
-    let p = processo::atual();
-    let antiga = p.umask;
-    p.umask = nova as u32 & 0o777;
+    let fs = processo::atual().fs();
+    let antiga = fs.umask;
+    fs.umask = nova as u32 & 0o777;
     Ok(antiga as u64)
 }
 
@@ -390,10 +398,10 @@ fn sys_ioctl(fd: u64, pedido: u64, ptr: u64) -> Resultado {
 }
 
 fn sys_close(fd: u64) -> Resultado {
-    let p = processo::atual();
-    let entrada = p.arquivos.get_mut(fd as usize).ok_or(EBADF)?;
+    let a = processo::atual().arquivos();
+    let entrada = a.lista.get_mut(fd as usize).ok_or(EBADF)?;
     entrada.take().ok_or(EBADF)?;
-    p.fecha_no_exec &= !(1 << fd);
+    a.fecha_no_exec &= !(1 << fd);
     Ok(0)
 }
 
@@ -404,14 +412,14 @@ fn sys_dup2(antigo: u64, novo: u64, flags: u64) -> Resultado {
     if novo >= MAX_ARQUIVOS {
         return Err(EBADF);
     }
-    let p = processo::atual();
-    if p.arquivos.len() <= novo {
-        p.arquivos.resize(novo + 1, None);
+    let a = processo::atual().arquivos();
+    if a.lista.len() <= novo {
+        a.lista.resize(novo + 1, None);
     }
-    p.arquivos[novo] = Some(arq);
-    p.fecha_no_exec &= !(1 << novo);
+    a.lista[novo] = Some(arq);
+    a.fecha_no_exec &= !(1 << novo);
     if flags & O_CLOEXEC != 0 {
-        p.fecha_no_exec |= 1 << novo;
+        a.fecha_no_exec |= 1 << novo;
     }
     Ok(novo as u64)
 }
@@ -424,11 +432,11 @@ fn sys_fcntl(fd: u64, comando: u64, argumento: u64) -> Resultado {
     const F_SETFL: u64 = 4;
     const F_DUPFD_CLOEXEC: u64 = 1030;
     let arq = arquivo(fd)?;
-    let p = processo::atual();
+    let p = processo::atual().arquivos();
     match comando {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let livre = (argumento as usize..MAX_ARQUIVOS)
-                .find(|&i| p.arquivos.get(i).is_none_or(|a| a.is_none()))
+                .find(|&i| p.lista.get(i).is_none_or(|a| a.is_none()))
                 .ok_or(EMFILE)?;
             let flags = if comando == F_DUPFD_CLOEXEC { O_CLOEXEC } else { 0 };
             sys_dup2(fd, livre as u64, flags)
@@ -542,15 +550,16 @@ fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, desloca
         }
         endereco
     } else {
-        let inicio = p.mmap_topo - tamanho;
-        if inicio < p.brk + 0x1000_0000 {
+        let m = p.mem().ok_or(EINVAL)?;
+        let inicio = m.mmap_topo - tamanho;
+        if inicio < m.brk + 0x1000_0000 {
             return Err(ENOMEM); // encostaria no heap
         }
-        p.mmap_topo = inicio;
+        m.mmap_topo = inicio;
         inicio
     };
     let regiao = Regiao { inicio, fim: inicio + tamanho, prot: prot as u8 & 7, compartilhada, fonte };
-    let espaco = p.espaco.as_mut().ok_or(EINVAL)?;
+    let espaco = p.espaco().ok_or(EINVAL)?;
     if compartilhada {
         if !espaco.criar_regiao_ja_alocada(regiao) {
             espaco.remover_faixa(inicio, inicio + tamanho);
@@ -571,20 +580,20 @@ fn faixa_valida(endereco: u64, tamanho: u64) -> Result<(u64, u64), i64> {
 
 fn sys_munmap(endereco: u64, tamanho: u64) -> Resultado {
     let (inicio, fim) = faixa_valida(endereco, tamanho)?;
-    processo::atual().espaco.as_mut().ok_or(EINVAL)?.remover_faixa(inicio, fim);
+    processo::atual().espaco().ok_or(EINVAL)?.remover_faixa(inicio, fim);
     Ok(0)
 }
 
 fn sys_mprotect(endereco: u64, tamanho: u64, prot: u64) -> Resultado {
     let (inicio, fim) = faixa_valida(endereco, tamanho)?;
-    let espaco = processo::atual().espaco.as_mut().ok_or(EINVAL)?;
+    let espaco = processo::atual().espaco().ok_or(EINVAL)?;
     if espaco.proteger(inicio, fim, prot as u8 & 7) { Ok(0) } else { Err(ENOMEM) }
 }
 
 /// `msync`: grava agora, no arquivo, o que foi escrito num mapeamento MAP_SHARED.
 fn sys_msync(endereco: u64, tamanho: u64) -> Resultado {
     let (inicio, fim) = faixa_valida(endereco, tamanho)?;
-    processo::atual().espaco.as_ref().ok_or(EINVAL)?.sincronizar(inicio, fim);
+    processo::atual().espaco().ok_or(EINVAL)?.sincronizar(inicio, fim);
     Ok(0)
 }
 
@@ -745,12 +754,12 @@ fn sys_pipe(ptr: u64, flags: u64) -> Resultado {
     let fd_escrita = match novo_descritor(escrita) {
         Ok(fd) => fd,
         Err(e) => {
-            processo::atual().arquivos[fd_leitura as usize] = None;
+            processo::atual().arquivos().lista[fd_leitura as usize] = None;
             return Err(e);
         }
     };
     if flags & O_CLOEXEC != 0 {
-        processo::atual().fecha_no_exec |= (1 << fd_leitura) | (1 << fd_escrita);
+        processo::atual().arquivos().fecha_no_exec |= (1 << fd_leitura) | (1 << fd_escrita);
     }
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&(fd_leitura as i32).to_le_bytes());
@@ -884,7 +893,7 @@ fn sys_getdents64(fd: u64, buf: u64, tamanho: u64) -> Resultado {
 }
 
 fn sys_getcwd(buf: u64, tamanho: u64) -> Resultado {
-    let mut bytes = processo::atual().diretorio.clone().into_bytes();
+    let mut bytes = processo::atual().fs().diretorio.clone().into_bytes();
     bytes.push(0);
     if bytes.len() as u64 > tamanho {
         return Err(ERANGE);
@@ -900,7 +909,7 @@ fn sys_chdir(ptr: u64) -> Resultado {
         return Err(ENOTDIR);
     }
     no.permite(cred(), vfs::EXECUTAR)?;
-    processo::atual().diretorio = caminho;
+    processo::atual().fs().diretorio = caminho;
     Ok(0)
 }
 
@@ -942,15 +951,38 @@ fn sys_execve(ctx: &mut Contexto, ptr_caminho: u64, ptr_args: u64, ptr_ambiente:
     Ok(0)
 }
 
+/// `futex(endereço, operação, valor, prazo ou valor2, endereço2, valor3)`.
+fn sys_futex(endereco: u64, operacao: u64, valor: u64, prazo: u64, destino: u64, valor3: u64) -> Resultado {
+    const WAIT: u64 = 0;
+    const WAKE: u64 = 1;
+    const REQUEUE: u64 = 3;
+    const CMP_REQUEUE: u64 = 4;
+    const WAIT_BITSET: u64 = 9;
+    const WAKE_BITSET: u64 = 10;
+    match operacao & 0x7F {
+        // FUTEX_PRIVATE_FLAG (128) e FUTEX_CLOCK_REALTIME (256) não mudam nada aqui
+        WAIT => processo::futex_esperar(endereco, valor as u32, prazo_de_timespec(prazo)?),
+        WAIT_BITSET => {
+            // Aqui o prazo é absoluto (no relógio monotônico).
+            let prazo = prazo_de_timespec(prazo)?.map(|absoluto| absoluto.saturating_sub(pit::milissegundos()));
+            processo::futex_esperar(endereco, valor as u32, prazo)
+        }
+        WAKE | WAKE_BITSET => processo::futex_acordar(endereco, valor),
+        REQUEUE => processo::futex_mudar_fila(endereco, valor, prazo, destino, None),
+        CMP_REQUEUE => processo::futex_mudar_fila(endereco, valor, prazo, destino, Some(valor3 as u32)),
+        _ => Err(ENOSYS),
+    }
+}
+
 /// `clone` sem threads: um `fork` em que o filho começa noutra pilha (é
 /// assim que a libc implementa `posix_spawn`, `system` e `popen`). Com
 /// CLONE_VM a libc espera memória compartilhada, mas o único uso disso no
 /// caminho do spawn é a pilha do filho — que uma cópia (copy-on-write) atende.
-fn sys_clone(ctx: &mut Contexto, flags: u64, pilha: u64, tls: u64) -> Resultado {
+fn sys_clone(ctx: &mut Contexto, flags: u64, pilha: u64, ptid: u64, ctid: u64, tls: u64) -> Resultado {
     const CLONE_SETTLS: u64 = 0x0008_0000;
     const CLONE_THREAD: u64 = 0x0001_0000;
     if flags & CLONE_THREAD != 0 {
-        return Err(ENOSYS); // threads de verdade ainda não existem
+        return processo::criar_thread(ctx, flags, pilha, ptid, ctid, tls).map(|t| t as u64);
     }
     let mut ctx_filho = *ctx;
     if pilha != 0 {
@@ -1000,14 +1032,14 @@ fn sys_wait4(pid: u64, ptr_status: u64, opcoes: u64) -> Resultado {
 /// `brk`: move o fim do heap do programa. É o que o `malloc` usa por baixo.
 fn sys_brk(novo: u64) -> Resultado {
     let p = processo::atual();
-    if novo < p.brk_inicio || novo >= p.mmap_topo.saturating_sub(0x1000_0000) {
-        return Ok(p.brk);
+    let m = p.mem().ok_or(EINVAL)?;
+    if novo < m.brk_inicio || novo >= m.mmap_topo.saturating_sub(0x1000_0000) {
+        return Ok(m.brk);
     }
     // O heap é uma região como as outras: crescer não aloca nada (as páginas
     // vêm sob demanda); encolher devolve as páginas que sobraram.
-    let espaco = p.espaco.as_mut().ok_or(EINVAL)?;
-    espaco.redimensionar_regiao(p.brk_inicio, p.brk, novo);
-    p.brk = novo;
+    m.espaco.redimensionar_regiao(m.brk_inicio, m.brk, novo);
+    m.brk = novo;
     Ok(novo)
 }
 
@@ -1019,7 +1051,7 @@ fn sys_sigaction(numero: u64, nova: u64, antiga: u64) -> Resultado {
     }
     let p = processo::atual();
     if antiga != 0 {
-        let a = p.sinais.acoes[numero as usize];
+        let a = p.sinais.acoes()[numero as usize];
         let mut b = Vec::new();
         for valor in [a.tratador, a.flags, a.restaurador, a.mascara] {
             b.extend(valor.to_le_bytes());
@@ -1030,7 +1062,7 @@ fn sys_sigaction(numero: u64, nova: u64, antiga: u64) -> Resultado {
         let b = ler_usuario(nova, 32)?;
         let campo = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
         let acao = sinal::Acao { tratador: campo(0), flags: campo(1), restaurador: campo(2), mascara: campo(3) };
-        p.sinais.acoes[numero as usize] = acao;
+        p.sinais.acoes()[numero as usize] = acao;
         if acao.tratador == sinal::SIG_IGN || (acao.tratador == sinal::SIG_DFL && sinal::padrao_e_ignorar(numero as u32)) {
             p.sinais.pendentes &= !(1 << numero); // POSIX: ignorar descarta o pendente
         }

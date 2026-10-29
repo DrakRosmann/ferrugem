@@ -9,6 +9,7 @@ pub const EIO: i64 = 5;
 pub const ENOEXEC: i64 = 8;
 pub const EBADF: i64 = 9;
 pub const ECHILD: i64 = 10;
+pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EACCES: i64 = 13;
 pub const EFAULT: i64 = 14;
@@ -29,6 +30,7 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const ETIMEDOUT: i64 = 110;
 
 /// Interno do kernel (o programa nunca vê): "refaça esta chamada de sistema
 /// quando o processo voltar a rodar". Usado quando ele é parado no meio dela.

@@ -28,10 +28,53 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ptr::null_mut;
 
 pub type Pid = u32;
+
+/// Algo que as threads de um processo dividem (memória, arquivos abertos,
+/// diretório, tratadores de sinal). Não tem lock: pela regra de ouro, só o
+/// kernel mexe, com as interrupções desligadas, numa CPU só.
+pub struct Dividido<T>(UnsafeCell<T>);
+
+unsafe impl<T> Sync for Dividido<T> {}
+unsafe impl<T> Send for Dividido<T> {}
+
+impl<T> Dividido<T> {
+    pub fn novo(valor: T) -> Arc<Self> {
+        Arc::new(Dividido(UnsafeCell::new(valor)))
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    pub fn get(&self) -> &'static mut T {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// A memória de um processo: o espaço de endereçamento e onde estão o heap e o mmap.
+pub struct Memoria {
+    pub espaco: EspacoEnderecos,
+    pub brk_inicio: u64,
+    pub brk: u64,
+    /// Próximo endereço livre para o `mmap` (desce a cada mapeamento).
+    pub mmap_topo: u64,
+}
+
+/// A tabela de descritores de arquivo.
+#[derive(Default)]
+pub struct Arquivos {
+    pub lista: Vec<Option<Arc<Arquivo>>>,
+    /// Um bit por descritor: fechar no `execve` (FD_CLOEXEC / O_CLOEXEC).
+    pub fecha_no_exec: u64,
+}
+
+pub struct InfoFs {
+    pub diretorio: String,
+    /// Bits de permissão que arquivos novos *não* recebem (022: sem escrita para os outros).
+    pub umask: u32,
+}
 
 const TAMANHO_PILHA_KERNEL: usize = 64 * 1024;
 pub const MAX_ARQUIVOS: usize = 32;
@@ -67,8 +110,14 @@ pub enum Estado {
     Zumbi,
 }
 
+/// Uma tarefa: uma thread. Um processo de uma thread só é uma tarefa com
+/// `pid == tgid`; as threads extras de um processo têm o mesmo `tgid` e
+/// dividem com ele memória, arquivos, diretório e tratadores de sinal.
 pub struct Processo {
+    /// O número desta tarefa (o "tid"). Na primeira thread, é também o pid do processo.
     pub pid: Pid,
+    /// O processo (grupo de threads) a que ela pertence: é o que `getpid` devolve.
+    pub tgid: Pid,
     pub pai: Pid,
     /// Grupo de processos: um "job" do shell (todos os programas de um pipeline).
     pub pgid: Pid,
@@ -87,15 +136,18 @@ pub struct Processo {
     pub estado: Estado,
     rsp_salvo: u64,
     pilha_kernel: Vec<u8>,
-    pub espaco: Option<EspacoEnderecos>,
-    pub arquivos: Vec<Option<Arc<Arquivo>>>,
-    /// Um bit por descritor: fechar no `execve` (FD_CLOEXEC / O_CLOEXEC).
-    pub fecha_no_exec: u64,
-    /// Próximo endereço livre para o `mmap` (desce a cada mapeamento).
-    pub mmap_topo: u64,
-    pub diretorio: String,
-    pub brk_inicio: u64,
-    pub brk: u64,
+    memoria: Option<Arc<Dividido<Memoria>>>,
+    arquivos: Arc<Dividido<Arquivos>>,
+    fs: Arc<Dividido<InfoFs>>,
+    /// Ao sair, zerar este endereço e acordar quem espera nele (é como o
+    /// `pthread_join` sabe que a thread terminou: CLONE_CHILD_CLEARTID).
+    pub limpar_tid: u64,
+    /// Uma thread que terminou: some da tabela sozinha (ninguém faz `wait` nela).
+    thread_morta: bool,
+    /// O código de saída do processo, se alguma thread chamou `exit_group`.
+    saida_do_grupo: Arc<Dividido<Option<i32>>>,
+    /// Acordado por um FUTEX_WAKE (e não por prazo vencido ou sinal).
+    acordado_por_futex: bool,
     /// Formato do `wait` do Unix: (código << 8) se saiu, ou o número do sinal que o matou.
     pub status: i32,
     /// Identidade: o uid/gid *real* (quem é) e o *efetivo* (com que direitos
@@ -104,8 +156,6 @@ pub struct Processo {
     pub gid: u32,
     pub euid: u32,
     pub egid: u32,
-    /// Bits de permissão que arquivos novos *não* recebem (022: sem escrita para os outros).
-    pub umask: u32,
     /// Base do segmento FS (TLS da libc), trocada junto com o processo.
     pub fs_base: u64,
     /// Registradores x87/SSE (xmm0..15), salvos com `fxsave` na troca de processo.
@@ -123,6 +173,7 @@ impl Processo {
         t.proximo_pid += 1;
         Box::new(Processo {
             pid,
+            tgid: pid,
             pai,
             pgid: 0,
             sid: 0,
@@ -135,19 +186,18 @@ impl Processo {
             estado: Estado::Pronto,
             rsp_salvo: 0,
             pilha_kernel: vec![0; TAMANHO_PILHA_KERNEL],
-            espaco: None,
-            arquivos: Vec::new(),
-            fecha_no_exec: 0,
-            mmap_topo: 0,
-            diretorio: String::from("/"),
-            brk_inicio: 0,
-            brk: 0,
+            memoria: None,
+            arquivos: Dividido::novo(Arquivos::default()),
+            fs: Dividido::novo(InfoFs { diretorio: String::from("/"), umask: 0o022 }),
+            limpar_tid: 0,
+            thread_morta: false,
+            saida_do_grupo: Dividido::novo(None),
+            acordado_por_futex: false,
             status: 0,
             uid: 0,
             gid: 0,
             euid: 0,
             egid: 0,
-            umask: 0o022,
             fs_base: 0,
             fpu: Box::new(fpu_inicial()),
             sinais: Sinais::novo(),
@@ -158,6 +208,27 @@ impl Processo {
 
     pub fn cred(&self) -> vfs::Cred {
         vfs::Cred { uid: self.euid, gid: self.egid }
+    }
+
+    pub fn mem(&self) -> Option<&'static mut Memoria> {
+        self.memoria.as_ref().map(|m| m.get())
+    }
+
+    pub fn espaco(&self) -> Option<&'static mut EspacoEnderecos> {
+        self.mem().map(|m| &mut m.espaco)
+    }
+
+    pub fn arquivos(&self) -> &'static mut Arquivos {
+        self.arquivos.get()
+    }
+
+    pub fn fs(&self) -> &'static mut InfoFs {
+        self.fs.get()
+    }
+
+    /// A primeira thread do processo (a que o pai espera com `wait`).
+    fn eh_lider(&self) -> bool {
+        self.pid == self.tgid
     }
 
     fn topo_pilha(&self) -> u64 {
@@ -268,6 +339,8 @@ pub fn ocioso() -> ! {
 pub fn escalonar() {
     let t = tabela();
     let atual = t.atual;
+    // Threads que já terminaram (de outras pilhas: a atual ainda está em uso).
+    t.processos.retain(|p| !(p.thread_morta && p.estado == Estado::Zumbi && !core::ptr::eq(&**p, atual)));
     unsafe {
         if (*atual).estado == Estado::Rodando {
             (*atual).estado = Estado::Pronto;
@@ -293,7 +366,7 @@ pub fn escalonar() {
             gdt::definir_rsp0(topo);
             PILHA_KERNEL_ATUAL = topo;
         }
-        match &(*proximo).espaco {
+        match (*proximo).espaco() {
             Some(espaco) => espaco.ativar(),
             None => paginacao::ativar_kernel(),
         }
@@ -329,8 +402,8 @@ pub fn tique() {
     acordar(CANAL_TEMPO);
     let agora = pit::milissegundos();
     for p in tabela().processos.iter_mut() {
-        if p.estado == Estado::Dormindo(CANAL_POLL) && p.prazo_ms != 0 && agora >= p.prazo_ms {
-            p.estado = Estado::Pronto; // o prazo do poll venceu
+        if matches!(p.estado, Estado::Dormindo(_)) && p.prazo_ms != 0 && agora >= p.prazo_ms {
+            p.estado = Estado::Pronto; // o prazo (de um poll, futex...) venceu
         }
     }
     let vencidos: Vec<Pid> = tabela()
@@ -354,7 +427,7 @@ pub fn ao_voltar_para_usuario(ctx: &mut Contexto, foi_o_timer: bool) {
         escalonar(); // preempção: o programa perde a vez, mesmo que não queira
     }
     while let Some(numero) = atual().sinais.retirar() {
-        let acao = atual().sinais.acoes[numero as usize];
+        let acao = atual().sinais.acoes()[numero as usize];
         if numero == SIGKILL {
             sair(numero as i32);
         }
@@ -405,7 +478,7 @@ fn entregar(ctx: &mut Contexto, numero: u32, acao: sinal::Acao) -> bool {
     let mut fpu = EstadoFpu([0; 512]);
     salvar_fpu(&mut fpu);
     quadro.extend(fpu.0);
-    let Some(espaco) = &p.espaco else { return false };
+    let Some(espaco) = p.espaco() else { return false };
     if !espaco.copiar_para(base, &quadro) {
         return false;
     }
@@ -426,7 +499,7 @@ pub fn retornar_de_sinal(ctx: &mut Contexto) -> u64 {
     // O tratador fez `ret` (tirou o endereço de retorno) e o restaurador fez a
     // syscall: RSP aponta para o siginfo.
     let tamanho = size_of::<Contexto>() + 8 + 512;
-    let dados = p.espaco.as_ref().and_then(|e| e.copiar_de(ctx.rsp + 128, tamanho));
+    let dados = p.espaco().and_then(|e| e.copiar_de(ctx.rsp + 128, tamanho));
     let Some(dados) = dados else { sair(SIGSEGV as i32) };
     let mut salvo: Contexto = unsafe { core::ptr::read_unaligned(dados.as_ptr() as *const Contexto) };
     // Nada de deixar o programa voltar para o anel 0 ou mexer em flags do sistema.
@@ -452,7 +525,7 @@ pub fn reiniciar_syscall() -> bool {
     let s = &atual().sinais;
     let entregaveis = s.entregaveis();
     entregaveis != 0 && {
-        let acao = s.acoes[entregaveis.trailing_zeros() as usize];
+        let acao = s.acoes()[entregaveis.trailing_zeros() as usize];
         acao.tem_tratador() && acao.flags & sinal::SA_RESTART != 0
     }
 }
@@ -580,10 +653,12 @@ pub fn criar_init(caminho: &str) -> Result<(), i64> {
     p.argumentos = alloc::vec![caminho.to_string()];
     p.executavel = caminho.to_string();
     unsafe { *p.contexto() = Contexto::usuario(imagem.entrada, imagem.rsp) };
-    p.espaco = Some(imagem.espaco);
-    p.brk_inicio = imagem.brk;
-    p.brk = imagem.brk;
-    p.mmap_topo = imagem.mmap_topo;
+    p.memoria = Some(Dividido::novo(Memoria {
+        espaco: imagem.espaco,
+        brk_inicio: imagem.brk,
+        brk: imagem.brk,
+        mmap_topo: imagem.mmap_topo,
+    }));
     p.preparar_primeira_execucao();
     tabela().processos.push(p);
     Ok(())
@@ -592,24 +667,21 @@ pub fn criar_init(caminho: &str) -> Result<(), i64> {
 /// `fork`: um processo novo, cópia exata do atual. No filho, a syscall devolve 0.
 pub fn fork(ctx: &Contexto) -> Result<Pid, i64> {
     let pai = atual();
-    let espaco = pai.espaco.as_ref().ok_or(EINVAL)?.clonar().ok_or(ENOMEM)?;
-    let mut filho = Processo::novo(pai.pid, pai.nome.clone());
+    let m = pai.mem().ok_or(EINVAL)?;
+    let espaco = m.espaco.clonar().ok_or(ENOMEM)?;
+    let mut filho = Processo::novo(pai.tgid, pai.nome.clone());
     filho.argumentos = pai.argumentos.clone();
     filho.executavel = pai.executavel.clone();
     (filho.pgid, filho.sid) = (pai.pgid, pai.sid);
-    filho.espaco = Some(espaco);
-    filho.arquivos = pai.arquivos.clone();
-    filho.fecha_no_exec = pai.fecha_no_exec;
-    filho.mmap_topo = pai.mmap_topo;
-    filho.diretorio = pai.diretorio.clone();
-    filho.brk_inicio = pai.brk_inicio;
-    filho.brk = pai.brk;
+    filho.memoria =
+        Some(Dividido::novo(Memoria { espaco, brk_inicio: m.brk_inicio, brk: m.brk, mmap_topo: m.mmap_topo }));
+    let a = pai.arquivos();
+    filho.arquivos = Dividido::novo(Arquivos { lista: a.lista.clone(), fecha_no_exec: a.fecha_no_exec });
+    filho.fs = Dividido::novo(InfoFs { diretorio: pai.fs().diretorio.clone(), umask: pai.fs().umask });
     (filho.uid, filho.gid, filho.euid, filho.egid) = (pai.uid, pai.gid, pai.euid, pai.egid);
-    filho.umask = pai.umask;
     filho.fs_base = pai.fs_base;
     salvar_fpu(&mut filho.fpu); // os registradores do pai, como estão agora
-    filho.sinais = pai.sinais.clone();
-    filho.sinais.pendentes = 0;
+    filho.sinais = pai.sinais.duplicar();
     unsafe {
         *filho.contexto() = *ctx;
         (*filho.contexto()).rax = 0;
@@ -638,22 +710,29 @@ pub fn exec(ctx: &mut Contexto, caminho: &str, args: Vec<String>, ambiente: Vec<
     if imagem.meta.permissoes & vfs::SETGID != 0 {
         p.egid = imagem.meta.gid;
     }
+    // Um programa novo não leva as outras threads junto.
+    matar_outras_threads(p);
     imagem.espaco.ativar();
-    p.espaco = Some(imagem.espaco); // o espaço antigo é liberado aqui
-    p.brk_inicio = imagem.brk;
-    p.brk = imagem.brk;
+    // O espaço antigo é liberado aqui (se ninguém mais o usar).
+    p.memoria = Some(Dividido::novo(Memoria {
+        espaco: imagem.espaco,
+        brk_inicio: imagem.brk,
+        brk: imagem.brk,
+        mmap_topo: imagem.mmap_topo,
+    }));
     p.nome = caminho.rsplit('/').next().unwrap_or(caminho).to_string();
     p.executavel = caminho.to_string();
     p.argumentos = args;
     p.sinais.ao_executar();
-    p.mmap_topo = imagem.mmap_topo;
     // Descritores marcados com close-on-exec não passam para o programa novo.
-    for (fd, arquivo) in p.arquivos.iter_mut().enumerate() {
-        if p.fecha_no_exec & (1 << fd) != 0 {
+    let a = p.arquivos();
+    let fecha = a.fecha_no_exec;
+    for (fd, arquivo) in a.lista.iter_mut().enumerate() {
+        if fecha & (1 << fd) != 0 {
             *arquivo = None;
         }
     }
-    p.fecha_no_exec = 0;
+    a.fecha_no_exec = 0;
     // Programa novo: FPU limpa e sem TLS.
     *p.fpu = fpu_inicial();
     restaurar_fpu(&p.fpu);
@@ -663,15 +742,51 @@ pub fn exec(ctx: &mut Contexto, caminho: &str, args: Vec<String>, ambiente: Vec<
     Ok(())
 }
 
-/// Encerra o processo atual. Ele vira "zumbi" até o pai recolher o status com `wait`.
+/// As outras threads do processo de `p`, vivas.
+fn outras_threads(p: &Processo) -> Vec<Pid> {
+    tabela()
+        .processos
+        .iter()
+        .filter(|q| q.tgid == p.tgid && q.pid != p.pid && q.estado != Estado::Zumbi)
+        .map(|q| q.pid)
+        .collect()
+}
+
+/// Manda as outras threads embora (exit_group, execve): SIGKILL direto, sem volta.
+fn matar_outras_threads(p: &Processo) {
+    for tid in outras_threads(p) {
+        if let Some(q) = buscar(tid) {
+            q.sinais.pendentes |= 1 << SIGKILL;
+            if matches!(q.estado, Estado::Dormindo(_) | Estado::Parado) {
+                q.estado = Estado::Pronto;
+            }
+        }
+    }
+}
+
+/// Encerra o processo atual (todas as threads: é o `exit_group`). A primeira
+/// thread vira "zumbi" até o pai recolher o status com `wait`.
 pub fn sair(status: i32) -> ! {
     let p = atual();
     if p.pid == 1 {
         panic!("o init terminou (status {:#x})", status);
     }
-    p.arquivos.clear(); // fecha tudo (pipes avisam a outra ponta)
+    if !outras_threads(p).is_empty() {
+        let saida = p.saida_do_grupo.get();
+        if saida.is_none() {
+            *saida = Some(status);
+        }
+        matar_outras_threads(p);
+    }
+    if !p.eh_lider() {
+        sair_thread();
+    }
+    // Se uma thread chamou exit_group, o código é o dela (a líder morreu de SIGKILL).
+    let status = p.saida_do_grupo.get().unwrap_or(status);
+    limpar_tid(p);
+    p.arquivos = Dividido::novo(Arquivos::default()); // fecha tudo (pipes avisam a outra ponta)
     paginacao::ativar_kernel();
-    p.espaco = None; // devolve a memória
+    p.memoria = None; // devolve a memória (se for o último a usá-la)
     p.status = status;
     p.estado = Estado::Zumbi;
     let (pid, pai) = (p.pid, p.pai);
@@ -696,11 +811,42 @@ pub fn sair(status: i32) -> ! {
 pub const WNOHANG: u64 = 1;
 pub const WUNTRACED: u64 = 2;
 
+/// CLONE_CHILD_CLEARTID: zera o tid guardado na memória do programa e acorda
+/// quem espera nele com futex (o `pthread_join`).
+fn limpar_tid(p: &mut Processo) {
+    if p.limpar_tid != 0 {
+        if let Some(espaco) = p.espaco() {
+            if espaco.copiar_para(p.limpar_tid, &0u32.to_le_bytes()) {
+                let _ = futex_acordar(p.limpar_tid, 1);
+            }
+        }
+        p.limpar_tid = 0;
+    }
+}
+
+/// Uma thread (que não a primeira) termina: some sem deixar zumbi.
+fn sair_thread() -> ! {
+    let p = atual();
+    limpar_tid(p);
+    p.arquivos = Dividido::novo(Arquivos::default());
+    paginacao::ativar_kernel();
+    p.memoria = None;
+    p.thread_morta = true;
+    p.estado = Estado::Zumbi;
+    escalonar();
+    unreachable!("uma thread morta voltou a rodar");
+}
+
+/// `exit` (60): numa thread extra, termina só ela; na primeira, o processo todo.
+pub fn sair_da_thread(status: i32) -> ! {
+    if atual().eh_lider() { sair(status) } else { sair_thread() }
+}
+
 /// `wait`: espera um filho terminar (ou parar, com WUNTRACED) e devolve (pid, status).
 /// `pid` > 0: aquele filho; -1: qualquer um; 0: do meu grupo; < -1: do grupo -pid.
 pub fn esperar(pid: i64, opcoes: u64) -> Result<(Pid, i32), i64> {
     loop {
-        let (eu, meu_grupo) = (atual().pid, atual().pgid);
+        let (eu, meu_grupo) = (atual().tgid, atual().pgid);
         let t = tabela();
         let serve = |q: &Processo| match pid {
             -1 => true,
@@ -712,7 +858,7 @@ pub fn esperar(pid: i64, opcoes: u64) -> Result<(Pid, i32), i64> {
         let mut zumbi = None;
         let mut parado = None;
         for (i, q) in t.processos.iter().enumerate().skip(1) {
-            if q.pai == eu && serve(q) {
+            if q.pai == eu && q.eh_lider() && serve(q) {
                 tem_filho = true;
                 if q.estado == Estado::Zumbi {
                     zumbi = Some(i);
@@ -758,10 +904,33 @@ pub fn pode_sinalizar(pid: Pid) -> Result<(), i64> {
     if euid == 0 || euid == alvo.uid || uid == alvo.uid { Ok(()) } else { Err(EPERM) }
 }
 
+/// Manda um sinal para o processo `pid`. Parar, continuar e matar valem
+/// para todas as threads dele; os outros vão para uma thread só.
 pub fn enviar_sinal(pid: Pid, sinal: u32) -> Result<(), i64> {
     if sinal >= 64 {
         return Err(EINVAL);
     }
+    let tgid = buscar(pid).ok_or(ESRCH)?.tgid;
+    let todas = sinal::PARADAS & (1 << sinal) != 0 || sinal == sinal::SIGCONT || sinal == SIGKILL;
+    if todas {
+        let threads: Vec<Pid> = tabela().processos.iter().filter(|q| q.tgid == tgid).map(|q| q.pid).collect();
+        for tid in threads {
+            enviar_a_tarefa(tid, sinal)?;
+        }
+        return Ok(());
+    }
+    enviar_a_tarefa(pid, sinal)
+}
+
+/// Sinal para uma thread específica (`tgkill`).
+pub fn enviar_a_thread(tgid: Pid, tid: Pid, sinal: u32) -> Result<(), i64> {
+    match buscar(tid) {
+        Some(t) if t.tgid == tgid || tgid == 0 => enviar_a_tarefa(tid, sinal),
+        _ => Err(ESRCH),
+    }
+}
+
+fn enviar_a_tarefa(pid: Pid, sinal: u32) -> Result<(), i64> {
     let p = buscar(pid).ok_or(ESRCH)?;
     if p.pid == 0 {
         return Err(EPERM);
@@ -807,7 +976,7 @@ fn membros(pgid: Pid) -> Vec<Pid> {
         .processos
         .iter()
         .skip(1)
-        .filter(|p| p.pgid == pgid && p.estado != Estado::Zumbi)
+        .filter(|p| p.pgid == pgid && p.eh_lider() && p.estado != Estado::Zumbi)
         .map(|p| p.pid)
         .collect()
 }
@@ -815,7 +984,7 @@ fn membros(pgid: Pid) -> Vec<Pid> {
 /// Antes de alguém definir um grupo em primeiro plano: o sinal vai para todos
 /// (menos o ocioso). Quem ignora o sinal (o init) sobrevive.
 pub fn sinal_para_grupo_todos(sinal: u32) {
-    let pids: Vec<Pid> = tabela().processos.iter().skip(1).map(|p| p.pid).collect();
+    let pids: Vec<Pid> = tabela().processos.iter().skip(1).filter(|p| p.eh_lider()).map(|p| p.pid).collect();
     for pid in pids {
         let _ = enviar_sinal(pid, sinal);
     }
@@ -897,7 +1066,7 @@ pub fn tem_sinal_pendente() -> bool {
 /// Um page fault do programa: página ainda não materializada, copy-on-write
 /// ou acesso inválido?
 pub fn falha_de_pagina(endereco: u64, escrita: bool, execucao: bool) -> Falha {
-    match &atual().espaco {
+    match atual().espaco() {
         Some(espaco) => espaco.tratar_falha(endereco, escrita, execucao),
         None => Falha::Invalida,
     }
@@ -915,7 +1084,7 @@ pub fn sem_memoria() -> ! {
 /// o sinal, ele é chamado; senão, o programa morre (e o kernel segue em pé).
 pub fn falha_do_programa(descricao: core::fmt::Arguments, numero: u32) {
     let p = atual();
-    let acao = p.sinais.acoes[numero as usize];
+    let acao = p.sinais.acoes()[numero as usize];
     if acao.tem_tratador() && p.sinais.bloqueados & (1 << numero) == 0 {
         p.sinais.pendentes |= 1 << numero;
         return;
@@ -951,10 +1120,11 @@ pub struct Resumo {
 }
 
 fn resumir(p: &Processo) -> Resumo {
-    let paginas = p.espaco.as_ref().map_or(0, |e| e.paginas() as u64);
+    let paginas = p.espaco().map_or(0, |e| e.paginas() as u64);
+    let threads = tabela().processos.iter().filter(|q| q.tgid == p.tgid && !q.thread_morta).count();
     Resumo {
         pid: p.pid,
-        tgid: p.pid,
+        tgid: p.tgid,
         pai: p.pai,
         pgid: p.pgid,
         sid: p.sid,
@@ -962,7 +1132,7 @@ fn resumir(p: &Processo) -> Resumo {
         gid: p.gid,
         euid: p.euid,
         egid: p.egid,
-        threads: 1,
+        threads: threads as u32,
         estado: match p.estado {
             Estado::Pronto => 0,
             Estado::Rodando => 1,
@@ -976,15 +1146,164 @@ fn resumir(p: &Processo) -> Resumo {
         inicio_ms: p.inicio_ms,
         nome: p.nome.clone(),
         argumentos: p.argumentos.clone(),
-        diretorio: p.diretorio.clone(),
+        diretorio: p.fs().diretorio.clone(),
         executavel: p.executavel.clone(),
     }
 }
 
+/// Os processos (só a primeira thread de cada um).
 pub fn listar() -> Vec<Resumo> {
-    tabela().processos.iter().map(|p| resumir(p)).collect()
+    tabela().processos.iter().filter(|p| p.eh_lider()).map(|p| resumir(p)).collect()
 }
 
 pub fn resumo(pid: Pid) -> Option<Resumo> {
-    tabela().processos.iter().find(|p| p.pid == pid).map(|p| resumir(p))
+    tabela().processos.iter().find(|p| p.pid == pid && p.eh_lider()).map(|p| resumir(p))
+}
+
+// -----------------------------------------------------------------------------
+// Threads e futex
+// -----------------------------------------------------------------------------
+
+pub const CLONE_VM: u64 = 0x100;
+const CLONE_FS: u64 = 0x200;
+const CLONE_FILES: u64 = 0x400;
+const CLONE_SIGHAND: u64 = 0x800;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+/// `clone` com CLONE_THREAD: uma tarefa nova no mesmo processo, começando
+/// em `pilha`, dividindo o que as flags pedirem (o `pthread_create` pede tudo).
+pub fn criar_thread(ctx: &Contexto, flags: u64, pilha: u64, ptid: u64, ctid: u64, tls: u64) -> Result<Pid, i64> {
+    if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
+        return Err(EINVAL); // uma thread sem a memória e os tratadores do processo não faz sentido
+    }
+    let pai = atual();
+    let mut t = Processo::novo(pai.pai, pai.nome.clone());
+    t.tgid = pai.tgid;
+    (t.pgid, t.sid) = (pai.pgid, pai.sid);
+    (t.uid, t.gid, t.euid, t.egid) = (pai.uid, pai.gid, pai.euid, pai.egid);
+    t.argumentos = pai.argumentos.clone();
+    t.executavel = pai.executavel.clone();
+    t.memoria = pai.memoria.clone();
+    t.arquivos = if flags & CLONE_FILES != 0 {
+        pai.arquivos.clone()
+    } else {
+        let a = pai.arquivos();
+        Dividido::novo(Arquivos { lista: a.lista.clone(), fecha_no_exec: a.fecha_no_exec })
+    };
+    t.fs = if flags & CLONE_FS != 0 {
+        pai.fs.clone()
+    } else {
+        Dividido::novo(InfoFs { diretorio: pai.fs().diretorio.clone(), umask: pai.fs().umask })
+    };
+    t.saida_do_grupo = pai.saida_do_grupo.clone();
+    t.sinais = pai.sinais.para_thread();
+    t.fs_base = if flags & CLONE_SETTLS != 0 { tls } else { pai.fs_base };
+    salvar_fpu(&mut t.fpu);
+    unsafe {
+        *t.contexto() = *ctx;
+        (*t.contexto()).rax = 0;
+        if pilha != 0 {
+            (*t.contexto()).rsp = pilha;
+        }
+    }
+    let tid = t.pid;
+    let espaco = pai.espaco().ok_or(EINVAL)?;
+    if flags & CLONE_PARENT_SETTID != 0 {
+        espaco.copiar_para(ptid, &tid.to_le_bytes());
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        espaco.copiar_para(ctid, &tid.to_le_bytes()); // a memória é a mesma
+    }
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        t.limpar_tid = ctid;
+    }
+    t.preparar_primeira_execucao();
+    tabela().processos.push(t);
+    Ok(tid)
+}
+
+/// A chave de um futex é o endereço *físico* da palavra: duas threads (ou
+/// dois processos com memória compartilhada) que olham a mesma palavra
+/// caem no mesmo canal, mesmo vendo-a em endereços virtuais diferentes.
+fn canal_do_futex(endereco: u64) -> Result<usize, i64> {
+    if endereco & 3 != 0 {
+        return Err(EINVAL);
+    }
+    let espaco = atual().espaco().ok_or(EFAULT)?;
+    let fisico = espaco.traduzir(endereco).ok_or(EFAULT)?;
+    Ok((1usize << 63) | fisico as usize)
+}
+
+/// FUTEX_WAIT: se a palavra ainda vale `esperado`, dorme até um FUTEX_WAKE
+/// (ou até o prazo, ou um sinal). É a base dos mutexes e variáveis de
+/// condição da libc: na maior parte do tempo eles nem chamam o kernel.
+pub fn futex_esperar(endereco: u64, esperado: u32, prazo_ms: Option<u64>) -> Result<u64, i64> {
+    let canal = canal_do_futex(endereco)?;
+    let palavra = atual().espaco().and_then(|e| e.copiar_de(endereco, 4)).ok_or(EFAULT)?;
+    if u32::from_le_bytes(palavra.try_into().unwrap()) != esperado {
+        return Err(EAGAIN);
+    }
+    if tem_sinal_pendente() {
+        return Err(EINTR);
+    }
+    let limite = prazo_ms.map(|ms| pit::milissegundos() + ms.max(1));
+    let p = atual();
+    p.acordado_por_futex = false;
+    p.prazo_ms = limite.unwrap_or(0);
+    dormir(canal);
+    let p = atual();
+    p.prazo_ms = 0;
+    if p.acordado_por_futex {
+        Ok(0)
+    } else if tem_sinal_pendente() {
+        Err(EINTR)
+    } else if limite.is_some_and(|l| pit::milissegundos() >= l) {
+        Err(ETIMEDOUT)
+    } else {
+        Ok(0) // acordou por outro motivo: a libc confere a palavra e tenta de novo
+    }
+}
+
+/// FUTEX_WAKE: acorda até `quantos` que esperam nesta palavra. Devolve quantos acordou.
+pub fn futex_acordar(endereco: u64, quantos: u64) -> Result<u64, i64> {
+    let canal = canal_do_futex(endereco)?;
+    let mut acordados = 0;
+    for p in tabela().processos.iter_mut() {
+        if acordados >= quantos {
+            break;
+        }
+        if p.estado == Estado::Dormindo(canal) {
+            p.estado = Estado::Pronto;
+            p.acordado_por_futex = true;
+            acordados += 1;
+        }
+    }
+    Ok(acordados)
+}
+
+/// FUTEX_REQUEUE: acorda até `acordar` e muda até `mover` dos outros para
+/// esperar noutra palavra (evita acordar todo mundo num broadcast).
+pub fn futex_mudar_fila(endereco: u64, acordar: u64, mover: u64, destino: u64, esperado: Option<u32>) -> Result<u64, i64> {
+    if let Some(v) = esperado {
+        let palavra = atual().espaco().and_then(|e| e.copiar_de(endereco, 4)).ok_or(EFAULT)?;
+        if u32::from_le_bytes(palavra.try_into().unwrap()) != v {
+            return Err(EAGAIN);
+        }
+    }
+    let (origem, novo) = (canal_do_futex(endereco)?, canal_do_futex(destino)?);
+    let acordados = futex_acordar(endereco, acordar)?;
+    let mut movidos = 0;
+    for p in tabela().processos.iter_mut() {
+        if movidos >= mover {
+            break;
+        }
+        if p.estado == Estado::Dormindo(origem) {
+            p.estado = Estado::Dormindo(novo);
+            movidos += 1;
+        }
+    }
+    Ok(acordados + movidos)
 }

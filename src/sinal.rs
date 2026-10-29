@@ -25,6 +25,9 @@
 //! `rt_sigreturn`: o kernel lê o Contexto salvo e o programa continua
 //! exatamente de onde estava. O formato é o mesmo do Linux (para a libc).
 
+use crate::processo::Dividido;
+use alloc::sync::Arc;
+
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGILL: u32 = 4;
@@ -80,23 +83,38 @@ pub fn padrao_e_parar(sinal: u32) -> bool {
     PARADAS & (1 << sinal) != 0
 }
 
-#[derive(Clone)]
+/// Pendentes e bloqueados são de cada thread; as ações (os tratadores) são
+/// do processo todo, divididas entre as threads.
 pub struct Sinais {
     pub pendentes: u64,
     pub bloqueados: u64,
-    pub acoes: [Acao; 64],
+    acoes: Arc<Dividido<[Acao; 64]>>,
 }
 
 impl Sinais {
     pub fn novo() -> Self {
-        Self { pendentes: 0, bloqueados: 0, acoes: [Acao::default(); 64] }
+        Self { pendentes: 0, bloqueados: 0, acoes: Dividido::novo([Acao::default(); 64]) }
+    }
+
+    pub fn acoes(&self) -> &mut [Acao; 64] {
+        self.acoes.get()
+    }
+
+    /// Para um `fork`: as mesmas ações, mas uma cópia só do filho.
+    pub fn duplicar(&self) -> Self {
+        Self { pendentes: 0, bloqueados: self.bloqueados, acoes: Dividido::novo(*self.acoes.get()) }
+    }
+
+    /// Para uma thread nova: as ações são as mesmas (divididas).
+    pub fn para_thread(&self) -> Self {
+        Self { pendentes: 0, bloqueados: self.bloqueados, acoes: self.acoes.clone() }
     }
 
     fn ignorado(&self, sinal: u32) -> bool {
         if sinal == SIGKILL {
             return false;
         }
-        match self.acoes[sinal as usize].tratador {
+        match self.acoes()[sinal as usize].tratador {
             SIG_IGN => true,
             SIG_DFL => padrao_e_ignorar(sinal),
             _ => false,
@@ -118,7 +136,7 @@ impl Sinais {
     pub fn pararia(&self, sinal: u32) -> bool {
         sinal == SIGSTOP
             || padrao_e_parar(sinal)
-                && self.acoes[sinal as usize].tratador == SIG_DFL
+                && self.acoes()[sinal as usize].tratador == SIG_DFL
                 && self.bloqueados & (1 << sinal) == 0
     }
 
@@ -145,19 +163,19 @@ impl Sinais {
     /// Antes de chamar o tratador: bloqueia o próprio sinal (para ele não se
     /// interromper) e os da máscara pedida.
     pub fn ao_entregar(&mut self, sinal: u32) {
-        let acao = self.acoes[sinal as usize];
+        let acao = self.acoes()[sinal as usize];
         if acao.flags & SA_NODEFER == 0 {
             self.bloqueados |= 1 << sinal;
         }
         self.bloqueados = (self.bloqueados | acao.mascara) & !INBLOQUEAVEIS;
         if acao.flags & SA_RESETHAND != 0 {
-            self.acoes[sinal as usize] = Acao::default();
+            self.acoes()[sinal as usize] = Acao::default();
         }
     }
 
     /// `execve` apaga o programa, e com ele os tratadores. Ignorados continuam ignorados.
     pub fn ao_executar(&mut self) {
-        for acao in self.acoes.iter_mut() {
+        for acao in self.acoes().iter_mut() {
             if acao.tem_tratador() {
                 *acao = Acao::default();
             }

@@ -530,6 +530,11 @@ impl EspacoEnderecos {
         Some((e & ENDERECO) + (virt & (TAMANHO_PAGINA - 1)))
     }
 
+    /// O endereço físico de `virt` (materializando a página se preciso).
+    pub fn traduzir(&self, virt: u64) -> Option<u64> {
+        self.fisico(virt, false)
+    }
+
     /// Copia de/para a memória do processo página por página, pelo endereço
     /// físico. Funciona com qualquer CR3 ativo e nunca causa page fault no
     /// kernel: um ponteiro inválido de um programa vira só `false` (EFAULT).

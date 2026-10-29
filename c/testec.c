@@ -4,6 +4,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sys/syscall.h>
 #include <sys/select.h>
 #include <fcntl.h>
 #include <math.h>
@@ -77,6 +79,105 @@ static void testar_poll_e_select(void) {
     CONFERIR(r == 1 && ms >= 50 && ms < 500, "poll acorda quando outro processo escreve");
     close(p[0]);
     close(p[1]);
+}
+
+/* ------------------------------------------------------------- threads */
+
+#define THREADS 8
+#define VOLTAS 20000
+static pthread_mutex_t trava = PTHREAD_MUTEX_INITIALIZER;
+static long contador = 0;
+static __thread int meu_numero = -1; /* cada thread tem o seu */
+
+static void *somar(void *arg) {
+    meu_numero = (int)(long)arg;
+    for (int i = 0; i < VOLTAS; i++) {
+        pthread_mutex_lock(&trava);
+        contador++;
+        pthread_mutex_unlock(&trava);
+        if (i % 1000 == 0) sched_yield();
+    }
+    /* devolve o próprio número, lido da variável por thread */
+    return (void *)(long)(meu_numero * 10);
+}
+
+static pthread_mutex_t fila_trava = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fila_tem_item = PTHREAD_COND_INITIALIZER;
+static int fila[64], fila_tamanho = 0, produzidos = 0;
+
+static void *produzir(void *arg) {
+    (void)arg;
+    for (int i = 1; i <= 50; i++) {
+        pthread_mutex_lock(&fila_trava);
+        fila[fila_tamanho++ % 64] = i;
+        produzidos++;
+        pthread_cond_signal(&fila_tem_item);
+        pthread_mutex_unlock(&fila_trava);
+        if (i % 10 == 0) usleep(1000);
+    }
+    return NULL;
+}
+
+static void *so_sair(void *arg) {
+    (void)arg;
+    pthread_exit((void *)7);
+}
+
+static void *sair_com_5(void *arg) {
+    (void)arg;
+    usleep(20000);
+    exit(5); /* exit_group: leva o processo inteiro, inclusive a thread principal */
+}
+
+static void testar_threads(void) {
+    pthread_t t[THREADS];
+    for (long i = 0; i < THREADS; i++) pthread_create(&t[i], NULL, somar, (void *)i);
+
+    char linha[64];
+    int threads_vistas = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    while (f && fgets(linha, sizeof linha, f))
+        if (sscanf(linha, "Threads:\t%d", &threads_vistas) == 1) break;
+    if (f) fclose(f);
+
+    long soma_retornos = 0;
+    for (int i = 0; i < THREADS; i++) {
+        void *r;
+        pthread_join(t[i], &r);
+        soma_retornos += (long)r;
+    }
+    CONFERIR(contador == THREADS * VOLTAS, "8 threads somando com mutex (160000)");
+    CONFERIR(soma_retornos == 280 && meu_numero == -1, "pthread_join e variáveis __thread separadas");
+    CONFERIR(threads_vistas >= 2, "/proc/self/status conta as threads");
+
+    pthread_t produtor;
+    pthread_create(&produtor, NULL, produzir, NULL);
+    int consumidos = 0, soma = 0;
+    while (consumidos < 50) {
+        pthread_mutex_lock(&fila_trava);
+        while (consumidos == produzidos) pthread_cond_wait(&fila_tem_item, &fila_trava);
+        soma += fila[consumidos++ % 64];
+        pthread_mutex_unlock(&fila_trava);
+    }
+    pthread_join(produtor, NULL);
+    CONFERIR(soma == 1275, "produtor e consumidor com variável de condição");
+
+    pthread_t saiu;
+    void *r = NULL;
+    pthread_create(&saiu, NULL, so_sair, NULL);
+    pthread_join(saiu, &r);
+    long tid = syscall(SYS_gettid);
+    CONFERIR(r == (void *)7 && tid == getpid(), "pthread_exit não derruba o processo; gettid");
+
+    pid_t filho = fork();
+    if (filho == 0) {
+        pthread_t th;
+        pthread_create(&th, NULL, sair_com_5, NULL);
+        for (;;) pause(); /* a thread principal fica esperando para sempre */
+    }
+    int status = 0;
+    waitpid(filho, &status, 0);
+    CONFERIR(WIFEXITED(status) && WEXITSTATUS(status) == 5, "exit() numa thread encerra o processo todo");
 }
 
 static void testar_proc_e_aleatorio(void) {
@@ -211,6 +312,7 @@ int main(void) {
 
     testar_poll_e_select();
     testar_proc_e_aleatorio();
+    testar_threads();
 
     char data[32];
     strftime(data, sizeof data, "%Y-%m-%d %H:%M", tm);

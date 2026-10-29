@@ -67,6 +67,11 @@ interrompe o programa que está rodando.
   argumentos, ambiente e vetor auxiliar como no Linux), `exit`, `wait`, órfãos
   adotados pelo init, escalonador round-robin **preemptivo**. Registradores
   SSE/FPU e TLS (FS) salvos por processo.
+- **Threads:** `clone` com `CLONE_THREAD` (memória, arquivos, diretório e
+  tratadores divididos), `futex` (WAIT, WAKE, REQUEUE, com prazo; a chave é o
+  endereço físico), `set_tid_address`/`CLONE_CHILD_CLEARTID`, `gettid`,
+  `tgkill`, `exit_group`. As pthreads da musl funcionam: mutex, variável de
+  condição, `__thread`, `pthread_join`.
 - **Sinais:** tratadores próprios (`sigaction`, `rt_sigreturn`), máscara
   (`sigprocmask`), `SA_RESTART`, `alarm`, `pause`, `kill`, SIGCHLD, SIGPIPE.
 - **Controle de jobs:** grupos de processos e sessões (`setpgid`, `setsid`),
@@ -169,11 +174,10 @@ versões do Linux.
 1. **Portar mais programas de verdade:** o Lua 5.4 já roda sem modificações
    (`make lua`); depois, `dash` e `busybox`. O kernel avisa quando falta uma
    syscall: `chamada de sistema N não implementada`.
-2. **Threads** (`clone` com `CLONE_THREAD`, futex) — exigem trocar o "big kernel
-   lock" por locks de verdade, o mesmo trabalho que o SMP.
-3. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs), boot UEFI, framebuffer.
-4. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-5. **Interface gráfica:** mouse, servidor de janelas.
+2. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs — exige trocar o
+   "big kernel lock" por locks de verdade), boot UEFI, framebuffer.
+3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
+4. **Interface gráfica:** mouse, servidor de janelas.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)
