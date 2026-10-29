@@ -210,13 +210,14 @@ fn stat(r: &Resumo) -> String {
     let (letra, _) = letra_do_estado(r.estado);
     let inicio = r.inicio_ms / 10; // em tiques de 1/100 s
     format!(
-        "{} ({}) {} {} {} {} 0 {} 0 0 0 0 0 {} 0 0 0 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 0 0 20 0 {} 0 {} {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         r.pid,
         r.nome,
         letra,
         r.pai,
         r.pgid,
         r.sid,
+        r.terminal,
         r.pgid,
         r.tiques,
         r.threads,

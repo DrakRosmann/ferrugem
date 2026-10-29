@@ -13,10 +13,13 @@
 //! O scancode diz *qual tecla física* foi apertada, não qual letra. Transformar
 //! em letra depende do layout; aqui é o ABNT2, com acentos por teclas mortas
 //! (´ ` ~ ^ ¨): a tecla de acento não escreve nada sozinha, ela espera a próxima.
+//!
+//! O que se digita vai para o console que está na tela; Alt+F1..F4 troca de
+//! console (cada um com o seu login).
 
 use crate::porta::inb;
 use crate::spin::Mutex;
-use crate::tty;
+use crate::{tty, vga};
 
 const PORTA_DADOS: u16 = 0x60;
 const PORTA_STATUS: u16 = 0x64;
@@ -25,9 +28,15 @@ struct Estado {
     shift_esquerdo: bool,
     shift_direito: bool,
     ctrl: bool,
+    alt: bool,
     caps_lock: bool,
     estendido: bool,
     acento: Option<char>,
+}
+
+/// Entrega o caractere ao console visível.
+fn receber(c: char) {
+    tty::receber(vga::ativa() as tty::IdTerminal, c);
 }
 
 // Só o tratador da IRQ 1 mexe nisto, e ele nunca é interrompido: o lock nunca disputa.
@@ -35,6 +44,7 @@ static ESTADO: Mutex<Estado> = Mutex::new(Estado {
     shift_esquerdo: false,
     shift_direito: false,
     ctrl: false,
+    alt: false,
     caps_lock: false,
     estendido: false,
     acento: None,
@@ -78,6 +88,9 @@ impl Estado {
 
         match codigo {
             0x1D => self.ctrl = !solta,
+            0x38 => self.alt = !solta,
+            // Alt+F1..F4: troca de console
+            0x3B..=0x3E if !solta && self.alt => vga::ativar((codigo - 0x3B) as usize),
             0x2A => self.shift_esquerdo = !solta,
             0x36 => self.shift_direito = !solta,
             0x3A if !solta => self.caps_lock = !self.caps_lock,
@@ -86,7 +99,7 @@ impl Estado {
                 if let Some((normal, com_shift)) = mapa_abnt2(codigo) {
                     // Ctrl+letra vira um caractere de controle: Ctrl+C = 3, Ctrl+D = 4...
                     if self.ctrl && normal.is_ascii_lowercase() {
-                        tty::receber(((normal as u8) & 0x1F) as char);
+                        receber(((normal as u8) & 0x1F) as char);
                         return;
                     }
                     let shift = self.shift_esquerdo || self.shift_direito;
@@ -101,11 +114,11 @@ impl Estado {
     fn digitar(&mut self, c: char) {
         if let Some(acento) = self.acento.take() {
             if let Some(composto) = compor(acento, c) {
-                tty::receber(composto);
+                receber(composto);
                 return;
             }
             // Não combina: sai o acento sozinho. Acento + espaço = só o acento.
-            tty::receber(acento);
+            receber(acento);
             if c == ' ' {
                 return;
             }
@@ -113,7 +126,7 @@ impl Estado {
         if matches!(c, '´' | '`' | '~' | '^' | '¨') {
             self.acento = Some(c);
         } else {
-            tty::receber(c);
+            receber(c);
         }
     }
 }

@@ -28,6 +28,7 @@
 use crate::processo::Dividido;
 use alloc::sync::Arc;
 
+pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGILL: u32 = 4;
@@ -44,7 +45,7 @@ pub const SIGTSTP: u32 = 20;
 pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
 const SIGURG: u32 = 23;
-const SIGWINCH: u32 = 28;
+pub const SIGWINCH: u32 = 28;
 
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;

@@ -8,6 +8,12 @@
 //!
 //! Escrever na tela é literalmente escrever nesse array.
 //!
+//! ## Consoles virtuais
+//!
+//! Há quatro telas (`tty1` a `tty4`, trocadas com Alt+F1..F4). Cada uma
+//! guarda o próprio conteúdo na memória; só a ativa é copiada também para a
+//! placa de vídeo. Trocar de console é copiar outra tela inteira para lá.
+//!
 //! Também entendemos um pedaço das sequências de escape ANSI (as mesmas que
 //! um terminal Linux entende), para que os programas usem cores e limpem a
 //! tela do mesmo jeito na VGA e na serial:
@@ -23,7 +29,8 @@ use crate::interrupcoes;
 use crate::porta::outb;
 use crate::spin::Mutex;
 use core::fmt;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::write_volatile;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const LARGURA: usize = 80;
 const ALTURA: usize = 25;
@@ -64,7 +71,18 @@ enum Escape {
     Csi,      // veio ESC [
 }
 
+pub const CONSOLES: usize = 4;
+
+/// Qual console está na placa de vídeo agora.
+static ATIVA: AtomicUsize = AtomicUsize::new(0);
+
+pub fn ativa() -> usize {
+    ATIVA.load(Ordering::Relaxed)
+}
+
 pub struct Tela {
+    numero: usize,
+    celulas: [u16; LARGURA * ALTURA],
     coluna: usize,
     cor: u8,
     escape: Escape,
@@ -73,8 +91,20 @@ pub struct Tela {
 }
 
 impl Tela {
-    const fn new() -> Self {
-        Self { coluna: 0, cor: COR_PADRAO, escape: Escape::Nenhum, parametros: [0; 4], quantos: 0 }
+    const fn new(numero: usize) -> Self {
+        Self {
+            numero,
+            celulas: [((COR_PADRAO as u16) << 8) | b' ' as u16; LARGURA * ALTURA],
+            coluna: 0,
+            cor: COR_PADRAO,
+            escape: Escape::Nenhum,
+            parametros: [0; 4],
+            quantos: 0,
+        }
+    }
+
+    fn visivel(&self) -> bool {
+        ativa() == self.numero
     }
 
     /// Consome um caractere de uma sequência de escape. Devolve `false` se
@@ -130,14 +160,25 @@ impl Tela {
         ((self.cor as u16) << 8) | byte as u16
     }
 
-    fn por(&self, linha: usize, coluna: usize, valor: u16) {
-        // `write_volatile` impede o compilador de "otimizar fora" a escrita:
-        // para ele, ninguém lê essa memória — mas a placa de vídeo lê!
-        unsafe { write_volatile(BUFFER.add(linha * LARGURA + coluna), valor) }
+    fn por(&mut self, linha: usize, coluna: usize, valor: u16) {
+        self.celulas[linha * LARGURA + coluna] = valor;
+        if self.visivel() {
+            // `write_volatile` impede o compilador de "otimizar fora" a escrita:
+            // para ele, ninguém lê essa memória — mas a placa de vídeo lê!
+            unsafe { write_volatile(BUFFER.add(linha * LARGURA + coluna), valor) }
+        }
     }
 
     fn ler(&self, linha: usize, coluna: usize) -> u16 {
-        unsafe { read_volatile(BUFFER.add(linha * LARGURA + coluna)) }
+        self.celulas[linha * LARGURA + coluna]
+    }
+
+    /// Copia esta tela inteira para a placa de vídeo (ao trocar de console).
+    fn mostrar(&self) {
+        for (i, &c) in self.celulas.iter().enumerate() {
+            unsafe { write_volatile(BUFFER.add(i), c) };
+        }
+        self.atualizar_cursor();
     }
 
     pub fn definir_cor(&mut self, frente: Cor, fundo: Cor) {
@@ -187,6 +228,9 @@ impl Tela {
 
     /// Move o cursor piscante (desenhado pela própria placa) para onde vai o próximo caractere.
     fn atualizar_cursor(&self) {
+        if !self.visivel() {
+            return;
+        }
         let posicao = ((ALTURA - 1) * LARGURA + self.coluna.min(LARGURA - 1)) as u16;
         unsafe {
             // Registradores do controlador CRT: índice em 0x3D4, valor em 0x3D5.
@@ -214,7 +258,7 @@ fn para_cp437(c: char) -> u8 {
         'ñ' => 0xA4, 'Ñ' => 0xA5, 'Ü' => 0x9A, '´' => b'\'', '¨' => b'"',
         '░' => 0xB0, '▒' => 0xB1, '▓' => 0xB2, '│' => 0xB3, '║' => 0xBA,
         '╗' => 0xBB, '╝' => 0xBC, '╚' => 0xC8, '╔' => 0xC9, '═' => 0xCD,
-        '█' => 0xDB, '·' => 0xFA, '■' => 0xFE, '→' => 0x1A, '•' => 0x07,
+        '█' => 0xDB, '·' => 0xFA, '—' | '–' => b'-', '■' => 0xFE, '→' => 0x1A, '•' => 0x07,
         _ => 0xFE, // caractere desconhecido: um quadradinho
     }
 }
@@ -231,7 +275,30 @@ impl fmt::Write for Tela {
     }
 }
 
-pub static TELA: Mutex<Tela> = Mutex::new(Tela::new());
+pub static TELAS: [Mutex<Tela>; CONSOLES] =
+    [Mutex::new(Tela::new(0)), Mutex::new(Tela::new(1)), Mutex::new(Tela::new(2)), Mutex::new(Tela::new(3))];
+
+/// O console das mensagens do kernel (o tty1).
+pub static TELA: &Mutex<Tela> = &TELAS[0];
+
+/// Escreve texto num console (visível ou não).
+pub fn escrever(console: usize, texto: &str) {
+    use core::fmt::Write;
+    interrupcoes::sem_interrupcoes(|| {
+        let _ = TELAS[console].lock().write_str(texto);
+    });
+}
+
+/// Troca o console que aparece na tela (Alt+F1..F4).
+pub fn ativar(console: usize) {
+    if console >= CONSOLES || console == ativa() {
+        return;
+    }
+    interrupcoes::sem_interrupcoes(|| {
+        ATIVA.store(console, Ordering::Relaxed);
+        TELAS[console].lock().mostrar();
+    });
+}
 
 /// Limpa a tela e deixa o cursor como uma linha fina (linhas 13 a 15 da célula).
 pub fn limpar() {

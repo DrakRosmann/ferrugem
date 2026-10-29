@@ -29,6 +29,7 @@ pub struct Erro(pub i64);
 pub const ENOENT: Erro = Erro(2);
 pub const EPERM: Erro = Erro(1);
 pub const EINTR: Erro = Erro(4);
+pub const EIO: Erro = Erro(5);
 pub const EACCES: Erro = Erro(13);
 pub const ECHILD: Erro = Erro(10);
 pub const EEXIST: Erro = Erro(17);
@@ -101,6 +102,8 @@ pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0o100;
 pub const O_TRUNC: u64 = 0o1000;
 pub const O_APPEND: u64 = 0o2000;
+/// Abrir um terminal sem que ele vire o terminal de controle da sessão.
+pub const O_NOCTTY: u64 = 0o400;
 pub const O_DIRECTORY: u64 = 0o200000;
 
 pub fn ler(fd: i32, buf: &mut [u8]) -> Resultado<usize> {
@@ -446,6 +449,34 @@ pub fn dar_terminal(fd: i32, pgid: i32) -> Resultado<()> {
     conferir(unsafe { syscall(16, fd as u64, 0x5410, &raw const grupo as u64, 0) }).map(|_| ())
 }
 
+/// O número do terminal (st_rdev) e o nome dele: /dev/tty1..4 ou /dev/pts/N.
+pub fn nome_do_terminal(fd: i32) -> Option<String> {
+    if !eh_terminal(fd) {
+        return None;
+    }
+    let mut buf = [0u8; 144];
+    conferir(unsafe { syscall(5, fd as u64, buf.as_mut_ptr() as u64, 0, 0) }).ok()?;
+    let rdev = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+    match (rdev >> 8, rdev & 0xFF) {
+        (4, n) => Some(alloc::format!("/dev/tty{}", n)),
+        (136, n) => Some(alloc::format!("/dev/pts/{}", n)),
+        _ => Some(String::from("/dev/tty")),
+    }
+}
+
+/// Abre um pseudo-terminal: (descritor do mestre, caminho do escravo).
+pub fn abrir_pty() -> Resultado<(i32, String)> {
+    let mestre = abrir("/dev/ptmx", O_RDWR | O_NOCTTY)?;
+    let mut numero = 0u32;
+    conferir(unsafe { syscall(16, mestre as u64, 0x8004_5430, &raw mut numero as u64, 0) })?;
+    Ok((mestre, alloc::format!("/dev/pts/{}", numero)))
+}
+
+/// Adota `fd` como terminal de controle (TIOCSCTTY; para o líder de uma sessão).
+pub fn adotar_terminal(fd: i32) -> Resultado<()> {
+    conferir(unsafe { syscall(16, fd as u64, 0x540E, 0, 0) }).map(|_| ())
+}
+
 /// `Some(código)` se o processo terminou chamando `exit`.
 pub fn codigo_de_saida(status: i32) -> Option<i32> {
     if status & 0x7F == 0 { Some((status >> 8) & 0xFF) } else { None }
@@ -457,6 +488,7 @@ pub fn sinal_que_matou(status: i32) -> Option<i32> {
     if status & 0x7F != 0 && status & 0xFF != 0x7F { Some(status & 0x7F) } else { None }
 }
 
+pub const SIGHUP: i32 = 1;
 pub const SIGINT: i32 = 2;
 pub const SIGKILL: i32 = 9;
 pub const SIGUSR1: i32 = 10;

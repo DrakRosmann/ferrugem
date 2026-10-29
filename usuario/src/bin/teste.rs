@@ -1120,6 +1120,117 @@ fn fifos() -> R {
     fifo_em("/disco")
 }
 
+/// Lê o que houver no descritor (uma chamada só) como texto.
+fn ler_texto(fd: i32) -> Result<String, String> {
+    let mut buf = [0u8; 128];
+    let n = sys::ler(fd, &mut buf).map_err(erro)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Num processo filho: vira líder de uma sessão nova cujo terminal de
+/// controle é o pseudo-terminal `caminho`.
+fn sessao_no_pty(caminho: &str, fechar: &[i32]) -> i32 {
+    for &fd in fechar {
+        let _ = sys::fechar(fd);
+    }
+    let _ = sys::nova_sessao();
+    sys::abrir(caminho, sys::O_RDWR).unwrap_or(-1)
+}
+
+fn pseudo_terminais() -> R {
+    let (m, caminho) = sys::abrir_pty().map_err(erro)?;
+    let s = sys::abrir(&caminho, sys::O_RDWR | sys::O_NOCTTY).map_err(erro)?;
+    if sys::nome_do_terminal(s).as_deref() != Some(caminho.as_str()) {
+        return Err(format!("o escravo diz ser {:?}, não {}", sys::nome_do_terminal(s), caminho));
+    }
+    // Escrever no mestre é digitar: a linha chega ao escravo e o eco volta ao mestre.
+    sys::escrever_tudo(m, b"oi\n").map_err(erro)?;
+    if ler_texto(s)? != "oi\n" {
+        return Err(String::from("o escravo não recebeu a linha"));
+    }
+    if ler_texto(m)? != "oi\r\n" {
+        return Err(String::from("o eco não voltou ao mestre (com CR LF)"));
+    }
+    sys::escrever_tudo(s, b"tela\n").map_err(erro)?;
+    if ler_texto(m)? != "tela\r\n" {
+        return Err(String::from("o que o escravo escreveu não chegou ao mestre"));
+    }
+
+    // Ctrl+C digitado no mestre: SIGINT para quem está lendo no escravo.
+    let filho = match sys::fork().map_err(erro)? {
+        0 => {
+            let fd = sessao_no_pty(&caminho, &[m, s]);
+            let mut buf = [0u8; 8];
+            let _ = sys::ler(fd, &mut buf);
+            sys::sair(0);
+        }
+        pid => pid,
+    };
+    let _ = sys::dormir_ms(100);
+    sys::escrever_tudo(m, b"\x03").map_err(erro)?;
+    let (_, status) = sys::esperar(filho).map_err(erro)?;
+    morto_por(status, sys::SIGINT).map_err(|e| format!("Ctrl+C: {}", e))?;
+    let _ = ler_texto(m); // o eco "^C"
+
+    // O líder da sessão sai: o grupo em primeiro plano recebe SIGHUP.
+    let (leitura, escrita) = sys::pipe().map_err(erro)?;
+    let inicio = sys::tempo_ms();
+    match sys::fork().map_err(erro)? {
+        0 => {
+            let fd = sessao_no_pty(&caminho, &[m, s, leitura]);
+            match sys::fork() {
+                Ok(0) => {
+                    // O neto, num grupo próprio, em primeiro plano; segura a
+                    // ponta de escrita do pipe até morrer.
+                    let _ = sys::mudar_grupo(0, 0);
+                    let _ = sys::dormir_ms(3000);
+                    sys::sair(0);
+                }
+                Ok(neto) => {
+                    let _ = sys::mudar_grupo(neto, neto);
+                    let _ = sys::dar_terminal(fd, neto);
+                    sys::sair(0);
+                }
+                Err(_) => sys::sair(1),
+            }
+        }
+        pid => {
+            let _ = sys::esperar(pid);
+        }
+    }
+    let _ = sys::fechar(escrita);
+    let _ = ler_tudo(leitura); // fim de arquivo quando o neto morrer
+    let _ = sys::fechar(leitura);
+    let demorou = sys::tempo_ms() - inicio;
+    if demorou > 2000 {
+        return Err(format!("o grupo em primeiro plano não recebeu SIGHUP ({} ms)", demorou));
+    }
+
+    // Fechar o mestre "derruba a linha": SIGHUP para o primeiro plano.
+    let filho = match sys::fork().map_err(erro)? {
+        0 => {
+            let fd = sessao_no_pty(&caminho, &[m, s]);
+            let mut buf = [0u8; 8];
+            let _ = sys::ler(fd, &mut buf);
+            sys::sair(0);
+        }
+        pid => pid,
+    };
+    let _ = sys::dormir_ms(100);
+    let _ = sys::fechar(m);
+    let (_, status) = sys::esperar(filho).map_err(erro)?;
+    morto_por(status, sys::SIGHUP).map_err(|e| format!("mestre fechado: {}", e))?;
+    let mut buf = [0u8; 8];
+    if sys::ler(s, &mut buf) != Err(sys::EIO) {
+        return Err(String::from("ler o escravo sem mestre deveria dar EIO"));
+    }
+    let _ = sys::fechar(s);
+    if sys::abrir(&caminho, sys::O_RDWR).is_ok() {
+        return Err(format!("{} deveria ter sumido", caminho));
+    }
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1130,7 +1241,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 53] = [
+    let testes: [(&str, fn() -> R); 54] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1184,6 +1295,7 @@ fn principal(args: &[&str]) -> i32 {
         ("disco cru (/dev/hdb): tabela de partições; só o root lê", disco_cru),
         ("truncate: encolher (400 KB → 5 KB) e crescer com zeros", truncar),
         ("FIFOs: open espera a outra ponta (memória e ext2)", fifos),
+        ("pseudo-terminais: eco, Ctrl+C e SIGHUP", pseudo_terminais),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

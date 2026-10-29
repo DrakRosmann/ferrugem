@@ -107,6 +107,12 @@ interrompe o programa que está rodando.
 - **Terminal:** edição de linha no kernel, `termios` (eco e modo canônico
   ligáveis), Ctrl+C (SIGINT) e Ctrl+Z (SIGTSTP) só para o job em primeiro
   plano, Ctrl+D vira fim de arquivo, cores ANSI tanto na VGA quanto na serial.
+- **Consoles virtuais:** quatro (`/dev/tty1` a `tty4`), cada um com o seu
+  login; **Alt+F1..F4** troca. A serial é o tty1.
+- **Pseudo-terminais:** `/dev/ptmx` e `/dev/pts/N` (como no Linux), a base
+  para terminais gráficos e acesso remoto. Terminal de controle por sessão:
+  `/dev/tty`, `TIOCSCTTY`, `O_NOCTTY`; quando o líder da sessão sai (ou o
+  mestre do pseudo-terminal fecha), o primeiro plano recebe **SIGHUP**.
 
 **Modo usuário** (`usuario/`)
 - `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com

@@ -29,6 +29,7 @@ pub const O_CREAT: u64 = 0o100;
 pub const O_EXCL: u64 = 0o200;
 pub const O_TRUNC: u64 = 0o1000;
 pub const O_APPEND: u64 = 0o2000;
+pub const O_NOCTTY: u64 = 0o400;
 pub const O_NONBLOCK: u64 = 0o4000;
 pub const O_DIRECTORY: u64 = 0o200000;
 
@@ -36,6 +37,10 @@ pub enum Tipo {
     No(Vnode),
     LeituraPipe(Arc<Pipe>),
     EscritaPipe(Arc<Pipe>),
+    /// Um terminal aberto (console ou escravo de pseudo-terminal), pelo id em `tty`.
+    Terminal(Vnode, tty::IdTerminal),
+    /// O lado mestre de um pseudo-terminal (o que /dev/ptmx devolve).
+    PtyMestre(Vnode, tty::IdTerminal),
 }
 
 pub struct Arquivo {
@@ -68,8 +73,25 @@ impl Arquivo {
             }
             Err(e) => return Err(e),
         };
-        if no.tipo()? == vfs::Tipo::Fifo {
+        let tipo = no.tipo()?;
+        if tipo == vfs::Tipo::Fifo {
             return Pipe::abrir_fifo(vfs::pipe_do_fifo(&no), flags);
+        }
+        if let vfs::Tipo::Dispositivo(d) = tipo {
+            let terminal = match d {
+                // /dev/tty é sempre o terminal de controle de quem abre.
+                Dispositivo::Terminal => processo::atual().terminal.ok_or(ENXIO)?,
+                Dispositivo::Console(n) => n as tty::IdTerminal,
+                Dispositivo::PtyEscravo(id) => id,
+                Dispositivo::Ptmx => {
+                    let id = tty::abrir_mestre(cred.uid, cred.gid)?;
+                    let tipo = Tipo::PtyMestre(no, id);
+                    return Ok(Arc::new(Arquivo { tipo, posicao: Mutex::new(0), flags }));
+                }
+                _ => return Ok(Arc::new(Arquivo { tipo: Tipo::No(no), posicao: Mutex::new(0), flags })),
+            };
+            tty::abrir(terminal, flags & O_NOCTTY != 0)?;
+            return Ok(Arc::new(Arquivo { tipo: Tipo::Terminal(no, terminal), posicao: Mutex::new(0), flags }));
         }
         match no.tipo()? {
             vfs::Tipo::Diretorio if escrita => return Err(EISDIR),
@@ -88,6 +110,9 @@ impl Arquivo {
         let no = match &self.tipo {
             Tipo::LeituraPipe(pipe) => return pipe.ler(buf),
             Tipo::EscritaPipe(_) => return Err(EBADF),
+            // Ler um terminal pode dormir até alguém digitar.
+            Tipo::Terminal(_, id) => return tty::ler(*id, buf),
+            Tipo::PtyMestre(_, id) => return tty::ler_mestre(*id, buf),
             Tipo::No(no) => no,
         };
         match no.tipo()? {
@@ -99,8 +124,6 @@ impl Arquivo {
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
             vfs::Tipo::Link | vfs::Tipo::Fifo => Err(EINVAL), // o open segue links e abre FIFOs como pipe
-            // Ler o terminal pode dormir até alguém digitar.
-            vfs::Tipo::Dispositivo(Dispositivo::Terminal) => tty::ler(buf),
             vfs::Tipo::Dispositivo(Dispositivo::Nulo) => Ok(0),
             vfs::Tipo::Dispositivo(Dispositivo::Zero) => {
                 buf.fill(0);
@@ -117,6 +140,7 @@ impl Arquivo {
                 *posicao += n as u64;
                 Ok(n)
             }
+            vfs::Tipo::Dispositivo(_) => Err(ENXIO),
         }
     }
 
@@ -127,6 +151,8 @@ impl Arquivo {
         let no = match &self.tipo {
             Tipo::EscritaPipe(pipe) => return pipe.escrever(dados),
             Tipo::LeituraPipe(_) => return Err(EBADF),
+            Tipo::Terminal(_, id) => return tty::escrever(*id, dados),
+            Tipo::PtyMestre(_, id) => return tty::escrever_mestre(*id, dados),
             Tipo::No(no) => no,
         };
         match no.tipo()? {
@@ -141,10 +167,6 @@ impl Arquivo {
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
             vfs::Tipo::Link | vfs::Tipo::Fifo => Err(EINVAL),
-            vfs::Tipo::Dispositivo(Dispositivo::Terminal) => {
-                tty::escrever(dados);
-                Ok(dados.len())
-            }
             vfs::Tipo::Dispositivo(Dispositivo::Bloco(i)) => {
                 let bloco = crate::blocos::listar().get(i as usize).cloned().ok_or(EIO)?;
                 let mut posicao = self.posicao.lock();
@@ -160,15 +182,31 @@ impl Arquivo {
         self.flags
     }
 
+    /// O nó do sistema de arquivos por trás (não existe para os pipes).
+    pub fn vnode(&self) -> Option<&Vnode> {
+        match &self.tipo {
+            Tipo::No(no) | Tipo::Terminal(no, _) | Tipo::PtyMestre(no, _) => Some(no),
+            _ => None,
+        }
+    }
+
+    /// O terminal, se for um: (id, é o lado mestre?).
+    pub fn terminal(&self) -> Option<(tty::IdTerminal, bool)> {
+        match self.tipo {
+            Tipo::Terminal(_, id) => Some((id, false)),
+            Tipo::PtyMestre(_, id) => Some((id, true)),
+            _ => None,
+        }
+    }
+
     /// Para o `poll`: o que dá para fazer agora sem bloquear (POLLIN, POLLOUT...).
     pub fn prontidao(&self) -> u16 {
         match &self.tipo {
             Tipo::LeituraPipe(pipe) => pipe.prontidao(false),
             Tipo::EscritaPipe(pipe) => pipe.prontidao(true),
+            Tipo::Terminal(_, id) => if tty::pode_ler(*id) { POLLIN | POLLOUT } else { POLLOUT },
+            Tipo::PtyMestre(_, id) => if tty::pode_ler_mestre(*id) { POLLIN | POLLOUT } else { POLLOUT },
             Tipo::No(no) => match no.tipo() {
-                Ok(vfs::Tipo::Dispositivo(Dispositivo::Terminal)) => {
-                    if tty::pode_ler() { POLLIN | POLLOUT } else { POLLOUT }
-                }
                 Ok(_) => POLLIN | POLLOUT, // arquivos comuns nunca bloqueiam
                 Err(_) => POLLERR,
             },
@@ -215,6 +253,8 @@ impl Drop for Arquivo {
                 pipe.esvaziar_se_ninguem_usa();
                 processo::acordar(pipe.canal());
             }
+            Tipo::Terminal(_, id) => tty::fechou(*id),
+            Tipo::PtyMestre(_, id) => tty::fechar_mestre(*id),
             Tipo::No(_) => {}
         }
     }
@@ -292,7 +332,6 @@ impl Pipe {
     /// Abrir um FIFO: quem abre para ler espera alguém abrir para escrever, e
     /// vice-versa (com O_NONBLOCK, ler não espera e escrever sem leitor dá ENXIO).
     pub fn abrir_fifo(pipe: Arc<Pipe>, flags: u64) -> Result<Arc<Arquivo>, i64> {
-        const ENXIO: i64 = 6;
         let escrita = match flags & O_ACESSO {
             O_RDONLY => false,
             O_WRONLY => true,

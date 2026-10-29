@@ -110,6 +110,7 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     rtc::init();
     aleatorio::init();
     let discos = blocos::init();
+    tty::init();
     vfs::init();
     // Com `raiz=/dev/hdX` na linha de comando, o sistema inteiro vem do disco;
     // senão, do initrd (copiado para a memória) e o disco fica em /disco.

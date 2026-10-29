@@ -88,10 +88,8 @@ fn paginas_aleatorias(maximo: u64) -> u64 {
     (crate::aleatorio::proximo() % maximo) * 4096
 }
 
-pub use crate::sinal::{SIGFPE, SIGILL, SIGINT, SIGKILL, SIGPIPE, SIGSEGV};
+pub use crate::sinal::{SIGFPE, SIGILL, SIGKILL, SIGPIPE, SIGSEGV};
 
-/// "Canais" onde processos dormem esperando um evento.
-pub const CANAL_TERMINAL: usize = 1;
 pub const CANAL_TEMPO: usize = 2;
 pub const CANAL_PAUSA: usize = 3;
 /// Quem está num `poll`/`select` dorme aqui; qualquer evento de E/S acorda.
@@ -138,6 +136,8 @@ pub struct Processo {
     pub pgid: Pid,
     /// Sessão: tudo o que nasceu de um login.
     pub sid: Pid,
+    /// O terminal de controle da sessão (o que `/dev/tty` abre).
+    pub terminal: Option<u32>,
     /// Parou e o pai ainda não soube (o `wait` com WUNTRACED conta para ele).
     parada_a_relatar: Option<u32>,
     pub nome: String,
@@ -194,6 +194,7 @@ impl Processo {
             pai,
             pgid: 0,
             sid: 0,
+            terminal: None,
             parada_a_relatar: None,
             argumentos: Vec::new(),
             executavel: String::new(),
@@ -746,6 +747,7 @@ pub fn fork(ctx: &Contexto) -> Result<Pid, i64> {
     filho.argumentos = pai.argumentos.clone();
     filho.executavel = pai.executavel.clone();
     (filho.pgid, filho.sid) = (pai.pgid, pai.sid);
+    filho.terminal = pai.terminal;
     filho.memoria =
         Some(Dividido::novo(Memoria { espaco, brk_inicio: m.brk_inicio, brk: m.brk, mmap_topo: m.mmap_topo }));
     let a = pai.arquivos();
@@ -859,6 +861,19 @@ pub fn sair(status: i32) -> ! {
     }
     // Se uma thread chamou exit_group, o código é o dela (a líder morreu de SIGKILL).
     let status = p.saida_do_grupo.get().unwrap_or(status);
+    // O líder da sessão saiu: o terminal dela "desliga" (SIGHUP para quem
+    // ficou em primeiro plano), e ninguém da sessão o tem mais como controle.
+    if p.sid == p.pid {
+        if let Some(id) = p.terminal {
+            let sessao = p.sid;
+            for q in tabela().processos.iter_mut() {
+                if q.sid == sessao {
+                    q.terminal = None;
+                }
+            }
+            crate::tty::sessao_terminou(id);
+        }
+    }
     limpar_tid(p);
     p.arquivos = Dividido::novo(Arquivos::default()); // fecha tudo (pipes avisam a outra ponta)
     paginacao::ativar_kernel();
@@ -1074,15 +1089,6 @@ fn membros(pgid: Pid) -> Vec<Pid> {
         .collect()
 }
 
-/// Antes de alguém definir um grupo em primeiro plano: o sinal vai para todos
-/// (menos o ocioso). Quem ignora o sinal (o init) sobrevive.
-pub fn sinal_para_grupo_todos(sinal: u32) {
-    let pids: Vec<Pid> = tabela().processos.iter().skip(1).filter(|p| p.eh_lider()).map(|p| p.pid).collect();
-    for pid in pids {
-        let _ = enviar_sinal(pid, sinal);
-    }
-}
-
 /// Sinal para um grupo inteiro, sem conferir permissão (é o terminal mandando).
 pub fn sinal_para_grupo(pgid: Pid, sinal: u32) {
     for pid in membros(pgid) {
@@ -1143,6 +1149,7 @@ pub fn nova_sessao() -> Result<Pid, i64> {
         return Err(EPERM);
     }
     (p.sid, p.pgid) = (p.pid, p.pid);
+    p.terminal = None; // uma sessão nova começa sem terminal de controle
     Ok(p.pid)
 }
 
@@ -1196,6 +1203,8 @@ pub struct Resumo {
     pub pai: Pid,
     pub pgid: Pid,
     pub sid: Pid,
+    /// O terminal de controle (st_rdev), ou 0.
+    pub terminal: u64,
     pub uid: u32,
     pub gid: u32,
     pub euid: u32,
@@ -1221,6 +1230,7 @@ fn resumir(p: &Processo) -> Resumo {
         pai: p.pai,
         pgid: p.pgid,
         sid: p.sid,
+        terminal: p.terminal.map_or(0, crate::tty::dispositivo),
         uid: p.uid,
         gid: p.gid,
         euid: p.euid,
@@ -1276,6 +1286,7 @@ pub fn criar_thread(ctx: &Contexto, flags: u64, pilha: u64, ptid: u64, ctid: u64
     let mut t = Processo::novo(pai.pai, pai.nome.clone());
     t.tgid = pai.tgid;
     (t.pgid, t.sid) = (pai.pgid, pai.sid);
+    t.terminal = pai.terminal;
     (t.uid, t.gid, t.euid, t.egid) = (pai.uid, pai.gid, pai.euid, pai.egid);
     t.argumentos = pai.argumentos.clone();
     t.executavel = pai.executavel.clone();

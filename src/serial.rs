@@ -141,7 +141,7 @@ pub fn tratar_irq() {
     while unsafe { inb(COM1 + 5) } & 1 != 0 {
         let byte = unsafe { inb(COM1) };
         if let Some(c) = decodificador.receber(byte) {
-            tty::receber(c);
+            tty::receber(0, c); // a serial é o tty1
         }
     }
 }

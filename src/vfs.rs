@@ -51,6 +51,12 @@ pub enum Dispositivo {
     Aleatorio,
     /// Um disco ou partição (/dev/hda, /dev/hda1...), pelo índice em blocos::listar().
     Bloco(u8),
+    /// Um console (/dev/tty1..tty4).
+    Console(u8),
+    /// /dev/ptmx: abrir cria um pseudo-terminal.
+    Ptmx,
+    /// /dev/pts/N: o lado escravo de um pseudo-terminal (pelo id do terminal).
+    PtyEscravo(u32),
 }
 
 /// Um nó da árvore em memória.
@@ -442,6 +448,12 @@ pub fn init() {
     // Todo mundo escreve no /tmp, mas cada um só apaga o que é seu (sticky).
     let _ = criar_na_memoria("/tmp", diretorio_vazio(), Some(Meta::de_root(0o1777)));
     let _ = criar_na_memoria("/dev/tty", Conteudo::Dispositivo(Dispositivo::Terminal), None);
+    for i in 0..crate::tty::CONSOLES {
+        let meta = Meta::de_root(0o620);
+        let _ = criar_na_memoria(&format!("/dev/tty{}", i + 1), Conteudo::Dispositivo(Dispositivo::Console(i as u8)), Some(meta));
+    }
+    let _ = criar_na_memoria("/dev/ptmx", Conteudo::Dispositivo(Dispositivo::Ptmx), None);
+    let _ = criar_na_memoria("/dev/pts", diretorio_vazio(), None);
     let _ = criar_na_memoria("/dev/null", Conteudo::Dispositivo(Dispositivo::Nulo), None);
     let _ = criar_na_memoria("/dev/zero", Conteudo::Dispositivo(Dispositivo::Zero), None);
     let _ = criar_na_memoria("/dev/random", Conteudo::Dispositivo(Dispositivo::Aleatorio), None);

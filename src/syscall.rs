@@ -402,19 +402,12 @@ fn sys_setgid(gid: u32) -> Resultado {
 /// `ioctl`: só existem os de terminal (termios, tamanho da janela).
 fn sys_ioctl(fd: u64, pedido: u64, ptr: u64) -> Resultado {
     let arq = arquivo(fd)?;
-    let eh_terminal = match &arq.tipo {
-        Tipo::No(no) => no.tipo()? == vfs::Tipo::Dispositivo(vfs::Dispositivo::Terminal),
-        _ => false,
+    let Some((terminal, mestre)) = arq.terminal() else { return Err(ENOTTY) };
+    let dados = match tty::bytes_de_entrada(pedido) {
+        0 => None,
+        n => Some(ler_usuario(ptr, n)?),
     };
-    if !eh_terminal {
-        return Err(ENOTTY);
-    }
-    let dados = match pedido {
-        0x5402..=0x5404 => Some(ler_usuario(ptr, 36)?), // TCSETS*: a struct termios
-        0x5410 => Some(ler_usuario(ptr, 4)?),           // TIOCSPGRP: o grupo
-        _ => None,
-    };
-    let resposta = tty::ioctl(pedido, dados.as_deref(), processo::atual().pid)?;
+    let resposta = tty::ioctl(terminal, pedido, dados.as_deref(), mestre)?;
     if !resposta.is_empty() {
         escrever_usuario(ptr, &resposta)?;
     }
@@ -841,7 +834,17 @@ fn stat_do_no(no: &Vnode) -> Result<[u8; 144], i64> {
         vfs::Tipo::Fifo => S_IFIFO,
     };
     let m = no.meta()?;
-    Ok(montar_stat(no.id(), tipo | m.permissoes, no.tamanho()?, m.modificado, m.uid, m.gid))
+    let mut stat = montar_stat(no.id(), tipo | m.permissoes, no.tamanho()?, m.modificado, m.uid, m.gid);
+    // st_rdev: qual terminal é (o `tty` descobre o nome do seu terminal por aqui).
+    let rdev = match no.tipo()? {
+        vfs::Tipo::Dispositivo(vfs::Dispositivo::Console(n)) => tty::dispositivo(n as u32),
+        vfs::Tipo::Dispositivo(vfs::Dispositivo::PtyEscravo(id)) => tty::dispositivo(id),
+        vfs::Tipo::Dispositivo(vfs::Dispositivo::Terminal) => 5 << 8,
+        vfs::Tipo::Dispositivo(vfs::Dispositivo::Ptmx) => 5 << 8 | 2,
+        _ => 0,
+    };
+    stat[40..48].copy_from_slice(&rdev.to_le_bytes());
+    Ok(stat)
 }
 
 fn sys_stat(ptr: u64, buf: u64) -> Resultado {
@@ -886,9 +889,9 @@ fn sys_link(existente: Result<String, i64>, novo: Result<String, i64>) -> Result
 }
 
 fn sys_fstat(fd: u64, buf: u64) -> Resultado {
-    let stat = match &arquivo(fd)?.tipo {
-        Tipo::No(no) => stat_do_no(no)?,
-        _ => montar_stat(0, S_IFIFO | 0o600, 0, 0, 0, 0),
+    let stat = match arquivo(fd)?.vnode() {
+        Some(no) => stat_do_no(no)?,
+        None => montar_stat(0, S_IFIFO | 0o600, 0, 0, 0, 0),
     };
     escrever_usuario(buf, &stat)?;
     Ok(0)
