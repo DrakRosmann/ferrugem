@@ -11,6 +11,7 @@ extern crate alloc;
 mod aleatorio;
 mod arquivo;
 mod ata;
+mod blocos;
 mod elf;
 mod erro;
 mod ext2;
@@ -108,6 +109,7 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
 
     rtc::init();
     aleatorio::init();
+    let discos = blocos::init();
     vfs::init();
     let Some(modulo) = info.modulos().next() else {
         panic!("nenhum initrd: rode com `make run` (que passa -initrd ao QEMU)");
@@ -117,15 +119,11 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     };
     ok(format_args!("initrd: {} arquivos carregados em / (sistema de arquivos em memória)", initrd::carregar(dados)));
 
-    match ata::init() {
-        None => println!("  [ -- ] nenhum disco ATA: /disco não vai existir"),
-        Some(setores) => match ext2::Ext2::montar() {
-            Ok(fs) => {
-                let _ = vfs::montar("/disco", vfs::Vnode::Disco(fs, ext2::RAIZ), "/dev/hda", "ext2");
-                ok(format_args!("disco ATA de {} MiB com ext2 montado em /disco", setores / 2048));
-            }
-            Err(motivo) => println!("  [ -- ] disco ATA de {} MiB, mas {}", setores / 2048, motivo),
-        },
+    if discos.is_empty() {
+        println!("  [ -- ] nenhum disco ATA: /disco não vai existir");
+    } else {
+        ok(format_args!("discos: {}", discos.join("; ")));
+        montar_primeiro_ext2();
     }
 
     pic::init();
@@ -142,6 +140,21 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
 
     // Daqui em diante, este fluxo é o processo 0: o ocioso.
     processo::ocioso()
+}
+
+/// Monta em /disco o primeiro disco (ou partição) com ext2.
+fn montar_primeiro_ext2() {
+    for bloco in blocos::listar() {
+        if let Ok(fs) = ext2::Ext2::montar(bloco.clone()) {
+            let dispositivo = alloc::format!("/dev/{}", bloco.nome);
+            let _ = vfs::criar_na_memoria("/disco", vfs::Conteudo::Diretorio(Default::default()), None);
+            if vfs::montar("/disco", vfs::Vnode::Disco(fs, ext2::RAIZ), &dispositivo, "ext2").is_ok() {
+                ok(format_args!("{} (ext2) montado em /disco", dispositivo));
+            }
+            return;
+        }
+    }
+    println!("  [ -- ] nenhum disco com ext2: /disco não vai existir");
 }
 
 fn ok(mensagem: impl fmt::Display) {

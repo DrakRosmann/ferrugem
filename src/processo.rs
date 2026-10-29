@@ -345,8 +345,15 @@ pub fn init() {
 /// O que o processo 0 faz para sempre: escalonar e, se não houver ninguém
 /// para rodar, dormir até a próxima interrupção.
 pub fn ocioso() -> ! {
+    let mut ultima_gravacao = 0;
     loop {
         escalonar();
+        // Sem ninguém para rodar: boa hora de mandar o cache sujo para o disco.
+        let agora = pit::milissegundos();
+        if agora - ultima_gravacao >= 3000 {
+            vfs::sincronizar_tudo();
+            ultima_gravacao = agora;
+        }
         // `sti; hlt` é atômico (o sti só vale depois da instrução seguinte):
         // nenhuma interrupção se perde entre os dois.
         unsafe { asm!("sti", "hlt", "cli", options(nostack)) };

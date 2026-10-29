@@ -991,6 +991,70 @@ fn ptrace_permissao() -> R {
     if sys::codigo_de_saida(status) == Some(0) { Ok(()) } else { Err(format!("status {:#x}", status)) }
 }
 
+// ---------------------------------------------------------- disco e montagens
+
+/// O `make teste` liga um segundo disco (hdb) com uma tabela de partições e
+/// um ext2 na partição 1.
+fn montar_particao() -> R {
+    if sys::stat("/dev/hdb1").is_err() {
+        return Err(String::from("sem /dev/hdb1 (rode pelo `make teste`)"));
+    }
+    let _ = sys::criar_diretorio("/mnt/teste");
+    sys::montar("/dev/hdb1", "/mnt/teste", "ext2").map_err(|e| format!("mount: {}", e))?;
+    if sys::montar("/dev/hdb1", "/mnt", "ext2").is_ok() {
+        return Err(String::from("montou o mesmo disco duas vezes"));
+    }
+    let fd = sys::abrir("/mnt/teste/nota", sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC).map_err(erro)?;
+    sys::escrever_tudo(fd, b"na particao").map_err(erro)?;
+    let _ = sys::fechar(fd);
+    let livres = sys::statfs("/mnt/teste").map_err(erro)?.livres;
+    // Ocupado: não dá para apagar o ponto de montagem.
+    if sys::remover_diretorio("/mnt/teste").is_ok() {
+        return Err(String::from("apagou um ponto de montagem"));
+    }
+    sys::desmontar("/mnt/teste").map_err(|e| format!("umount: {}", e))?;
+    if sys::stat("/mnt/teste/nota").is_ok() {
+        return Err(String::from("o arquivo continuou visível depois do umount"));
+    }
+    sys::montar("/dev/hdb1", "/mnt/teste", "ext2").map_err(|e| format!("mount de novo: {}", e))?;
+    let lido = sys::ler_arquivo("/mnt/teste/nota").map_err(erro)?;
+    let livres_de_novo = sys::statfs("/mnt/teste").map_err(erro)?.livres;
+    sys::desmontar("/mnt/teste").map_err(erro)?;
+    sys::remover_diretorio("/mnt/teste").map_err(erro)?;
+    if lido == b"na particao" && livres == livres_de_novo { Ok(()) } else { Err(String::from("conteúdo errado")) }
+}
+
+fn tmpfs_e_proc() -> R {
+    let _ = sys::criar_diretorio("/mnt/t");
+    sys::montar("tmpfs", "/mnt/t", "tmpfs").map_err(erro)?;
+    let fd = sys::abrir("/mnt/t/a", sys::O_WRONLY | sys::O_CREAT).map_err(erro)?;
+    let _ = sys::fechar(fd);
+    let montagens = String::from_utf8(sys::ler_arquivo("/proc/mounts").map_err(erro)?).unwrap_or_default();
+    sys::desmontar("/mnt/t").map_err(erro)?;
+    let sumiu = sys::stat("/mnt/t/a").is_err();
+    sys::remover_diretorio("/mnt/t").map_err(erro)?;
+    if montagens.contains("tmpfs /mnt/t tmpfs") && sumiu { Ok(()) } else { Err(montagens) }
+}
+
+fn disco_cru() -> R {
+    // /dev/hdb é o disco inteiro: o setor 0 tem a tabela de partições (0x55 0xAA no fim).
+    let fd = sys::abrir("/dev/hdb", sys::O_RDONLY).map_err(erro)?;
+    let mut mbr = [0u8; 512];
+    let n = sys::ler(fd, &mut mbr).map_err(erro)?;
+    let _ = sys::fechar(fd);
+    let usuario_nao_le = em_filho(|| {
+        if !virar_usuario_comum() {
+            return 100;
+        }
+        (sys::abrir("/dev/hdb", sys::O_RDONLY) == Err(sys::EACCES)) as i32
+    })?;
+    if n == 512 && mbr[510] == 0x55 && mbr[511] == 0xAA && sys::codigo_de_saida(usuario_nao_le) == Some(1) {
+        Ok(())
+    } else {
+        Err(format!("lidos {}, assinatura {:x} {:x}", n, mbr[510], mbr[511]))
+    }
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1001,7 +1065,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 48] = [
+    let testes: [(&str, fn() -> R); 51] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1050,6 +1114,9 @@ fn principal(args: &[&str]) -> i32 {
         ("ptrace: breakpoint com int3", breakpoint),
         ("ptrace: passo a passo (200 instruções)", passo_a_passo),
         ("ptrace: usuário comum não rastreia o init", ptrace_permissao),
+        ("mount/umount de uma partição (hdb1) e statfs", montar_particao),
+        ("tmpfs e /proc/mounts", tmpfs_e_proc),
+        ("disco cru (/dev/hdb): tabela de partições; só o root lê", disco_cru),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

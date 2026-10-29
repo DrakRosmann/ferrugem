@@ -52,6 +52,7 @@ impl Erro {
             16 => "recurso ocupado",
             17 => "já existe",
             18 => "não dá para mover entre sistemas de arquivos diferentes",
+            19 => "dispositivo não existe (ou tipo desconhecido)",
             20 => "não é um diretório",
             21 => "é um diretório",
             22 => "argumento inválido",
@@ -782,4 +783,41 @@ pub fn ptrace_registradores(pid: i32) -> Resultado<Registradores> {
 
 pub fn ptrace_definir_registradores(pid: i32, r: &Registradores) -> Resultado<()> {
     ptrace(PTRACE_SETREGS, pid, 0, r.0.as_ptr() as u64).map(|_| ())
+}
+
+// -----------------------------------------------------------------------------
+// Montagens
+// -----------------------------------------------------------------------------
+
+/// Monta `fonte` (ex.: "/dev/hdb1") em `alvo`, com o tipo dado ("ext2", "proc", "tmpfs").
+pub fn montar(fonte: &str, alvo: &str, tipo: &str) -> Resultado<()> {
+    let (f, a, t) = (string_c(fonte), string_c(alvo), string_c(tipo));
+    conferir(unsafe { syscall(165, f.as_ptr() as u64, a.as_ptr() as u64, t.as_ptr() as u64, 0) }).map(|_| ())
+}
+
+pub fn desmontar(alvo: &str) -> Resultado<()> {
+    let a = string_c(alvo);
+    conferir(unsafe { syscall(166, a.as_ptr() as u64, 0, 0, 0) }).map(|_| ())
+}
+
+/// Grava no disco tudo o que estiver pendente no cache.
+pub fn sincronizar() {
+    unsafe { syscall(162, 0, 0, 0, 0) };
+}
+
+pub struct InfoSistema {
+    pub tipo: u64,
+    pub tamanho_bloco: u64,
+    pub blocos: u64,
+    pub livres: u64,
+    pub inodes: u64,
+    pub inodes_livres: u64,
+}
+
+/// O `statfs`: o espaço do sistema de arquivos onde `caminho` está.
+pub fn statfs(caminho: &str) -> Resultado<InfoSistema> {
+    let c = string_c(caminho);
+    let mut b = [0u64; 15];
+    conferir(unsafe { syscall(137, c.as_ptr() as u64, b.as_mut_ptr() as u64, 0, 0) })?;
+    Ok(InfoSistema { tipo: b[0], tamanho_bloco: b[1], blocos: b[2], livres: b[3], inodes: b[5], inodes_livres: b[6] })
 }

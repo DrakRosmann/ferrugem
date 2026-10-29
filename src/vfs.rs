@@ -36,6 +36,7 @@ use crate::procfs::NoProc;
 use crate::rtc;
 use crate::spin::Mutex;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -48,6 +49,8 @@ pub enum Dispositivo {
     Zero,
     /// /dev/random e /dev/urandom
     Aleatorio,
+    /// Um disco ou partição (/dev/hda, /dev/hda1...), pelo índice em blocos::listar().
+    Bloco(u8),
 }
 
 /// Um nó da árvore em memória.
@@ -57,9 +60,6 @@ pub enum Conteudo {
     Dispositivo(Dispositivo),
     /// Link simbólico: o caminho para onde aponta.
     Link(String),
-    /// Ponto de montagem: daqui para baixo, quem responde é outro sistema de
-    /// arquivos (o disco ext2, o /proc...), a partir desta raiz.
-    Montagem(Vnode),
 }
 
 pub struct No {
@@ -132,9 +132,29 @@ pub enum Vnode {
 
 static PROXIMO_ID: AtomicU64 = AtomicU64::new(1);
 static RAIZ: Mutex<Option<Arc<No>>> = Mutex::new(None);
-static DISCO: Mutex<Option<Arc<Ext2>>> = Mutex::new(None);
-/// (dispositivo, ponto de montagem, tipo) — o que o /proc/mounts mostra.
-static MONTAGENS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+
+/// Um sistema de arquivos pendurado num diretório: quem chega a `ponto`
+/// (pelo id do diretório) continua a partir de `raiz`.
+struct Montagem {
+    ponto: u64,
+    raiz: Vnode,
+    caminho: String,
+    dispositivo: String,
+    tipo: String,
+}
+
+static MONTAGENS: Mutex<Vec<Montagem>> = Mutex::new(Vec::new());
+
+/// Se há algo montado sobre este diretório, devolve a raiz do que está
+/// montado (a última montagem por cima vale).
+fn atravessar(no: Vnode) -> Vnode {
+    let id = no.id();
+    let montado = MONTAGENS.lock().iter().rev().find(|m| m.ponto == id).map(|m| m.raiz.clone());
+    match montado {
+        Some(raiz) if raiz.id() != id => atravessar(raiz),
+        _ => no,
+    }
+}
 
 impl No {
     fn novo(conteudo: Conteudo, meta: Meta) -> Arc<No> {
@@ -159,20 +179,13 @@ fn diretorio_vazio() -> Conteudo {
     Conteudo::Diretorio(BTreeMap::new())
 }
 
-/// Um nó em memória, ou a raiz do que estiver montado nele.
-fn entrar(no: Arc<No>) -> Vnode {
-    if let Conteudo::Montagem(raiz) = &*no.conteudo.lock() {
-        return raiz.clone();
-    }
-    Vnode::Memoria(no)
-}
 
 impl Vnode {
     pub fn tipo(&self) -> Result<Tipo, i64> {
         match self {
             Vnode::Memoria(no) => Ok(match &*no.conteudo.lock() {
                 Conteudo::Arquivo(_) => Tipo::Arquivo,
-                Conteudo::Diretorio(_) | Conteudo::Montagem(_) => Tipo::Diretorio,
+                Conteudo::Diretorio(_) => Tipo::Diretorio,
                 Conteudo::Dispositivo(d) => Tipo::Dispositivo(*d),
                 Conteudo::Link(_) => Tipo::Link,
             }),
@@ -194,7 +207,9 @@ impl Vnode {
     pub fn id(&self) -> u64 {
         match self {
             Vnode::Memoria(no) => no.id,
-            Vnode::Disco(_, inode) => 0x1_0000_0000 + *inode as u64,
+            // O número do sistema de arquivos vai nos bits de cima: dois discos
+            // podem ter o mesmo número de inode.
+            Vnode::Disco(fs, inode) => (fs.id as u64) << 32 | *inode as u64,
             Vnode::Proc(no) => no.id(),
         }
     }
@@ -270,7 +285,7 @@ impl Vnode {
                     Conteudo::Diretorio(filhos) => filhos.get(nome).cloned().ok_or(ENOENT)?,
                     _ => return Err(ENOTDIR),
                 };
-                Ok(entrar(filho))
+                Ok(Vnode::Memoria(filho))
             }
             Vnode::Disco(fs, inode) => Ok(Vnode::Disco(fs.clone(), fs.buscar(*inode, nome)?)),
             Vnode::Proc(no) => Ok(Vnode::Proc(no.filho(nome)?)),
@@ -352,7 +367,7 @@ impl Vnode {
                 filhos
                     .into_iter()
                     .map(|(nome, no)| {
-                        let v = entrar(no);
+                        let v = Vnode::Memoria(no);
                         Ok((nome, v.id(), v.tipo()?))
                     })
                     .collect()
@@ -366,7 +381,7 @@ impl Vnode {
                         ext2::TIPO_ENTRADA_LINK => Tipo::Link,
                         _ => Tipo::Arquivo,
                     };
-                    (nome, 0x1_0000_0000 + i as u64, tipo)
+                    (nome, (fs.id as u64) << 32 | i as u64, tipo)
                 })
                 .collect()),
             Vnode::Proc(no) => no.listar(),
@@ -389,8 +404,7 @@ impl Vnode {
 
 pub fn init() {
     *RAIZ.lock() = Some(No::novo(diretorio_vazio(), Meta::de_root(0o755)));
-    MONTAGENS.lock().push((String::from("rootfs"), String::from("/"), String::from("ramfs")));
-    for caminho in ["/dev", "/home", "/etc", "/bin"] {
+    for caminho in ["/dev", "/home", "/etc", "/bin", "/proc", "/mnt"] {
         let _ = criar_na_memoria(caminho, diretorio_vazio(), None);
     }
     // Todo mundo escreve no /tmp, mas cada um só apaga o que é seu (sticky).
@@ -401,26 +415,108 @@ pub fn init() {
     let _ = criar_na_memoria("/dev/random", Conteudo::Dispositivo(Dispositivo::Aleatorio), None);
     let _ = criar_na_memoria("/dev/urandom", Conteudo::Dispositivo(Dispositivo::Aleatorio), None);
     let _ = montar("/proc", Vnode::Proc(NoProc::Raiz), "proc", "proc");
+    for (i, bloco) in crate::blocos::listar().iter().enumerate() {
+        let caminho = format!("/dev/{}", bloco.nome);
+        let meta = Meta::de_root(0o600); // só o root lê e grava o disco cru
+        let _ = criar_na_memoria(&caminho, Conteudo::Dispositivo(Dispositivo::Bloco(i as u8)), Some(meta));
+    }
 }
 
-/// Pendura um sistema de arquivos (a partir da sua raiz) num diretório novo,
-/// como o `mount` do Unix.
+/// Um sistema de arquivos em memória novo e vazio (o `tmpfs`), para montar.
+pub fn novo_tmpfs() -> Vnode {
+    Vnode::Memoria(No::novo(diretorio_vazio(), Meta::de_root(0o1777)))
+}
+
+/// Pendura um sistema de arquivos (a partir da sua raiz) num diretório que
+/// já existe, como o `mount` do Unix. O que havia dentro dele fica escondido
+/// até a desmontagem.
 pub fn montar(caminho: &str, raiz: Vnode, dispositivo: &str, tipo: &str) -> Result<(), i64> {
-    if let Vnode::Disco(fs, _) = &raiz {
-        *DISCO.lock() = Some(fs.clone());
+    let alvo = buscar(caminho)?;
+    if alvo.tipo()? != Tipo::Diretorio {
+        return Err(ENOTDIR);
     }
-    criar_na_memoria(caminho, Conteudo::Montagem(raiz), None)?;
-    MONTAGENS.lock().push((String::from(dispositivo), String::from(caminho), String::from(tipo)));
+    // O mesmo disco montado duas vezes teria dois caches gravando nele: corrompe.
+    if matches!(raiz, Vnode::Disco(..)) && MONTAGENS.lock().iter().any(|m| m.dispositivo == dispositivo) {
+        return Err(EBUSY);
+    }
+    MONTAGENS.lock().push(Montagem {
+        ponto: alvo.id(),
+        raiz,
+        caminho: String::from(caminho),
+        dispositivo: String::from(dispositivo),
+        tipo: String::from(tipo),
+    });
     Ok(())
 }
 
-pub fn montagens() -> Vec<(String, String, String)> {
-    MONTAGENS.lock().clone()
+/// O `umount`: grava o que estiver pendente e tira a montagem.
+pub fn desmontar(caminho: &str) -> Result<(), i64> {
+    let mut m = MONTAGENS.lock();
+    let i = m.iter().rposition(|x| x.caminho == caminho).ok_or(EINVAL)?;
+    let dentro = format!("{}/", caminho.trim_end_matches('/'));
+    if caminho == "/" || m.iter().any(|x| x.caminho.starts_with(&dentro)) {
+        return Err(EBUSY); // há outra montagem lá dentro
+    }
+    let montagem = m.remove(i);
+    drop(m);
+    if let Vnode::Disco(fs, _) = &montagem.raiz {
+        fs.sincronizar()?;
+    }
+    Ok(())
 }
 
-/// O disco montado, se houver.
+/// (dispositivo, ponto de montagem, tipo) — o que o /proc/mounts mostra.
+pub fn montagens() -> Vec<(String, String, String)> {
+    let mut lista = alloc::vec![(String::from("rootfs"), String::from("/"), String::from("ramfs"))];
+    lista.extend(MONTAGENS.lock().iter().map(|m| (m.dispositivo.clone(), m.caminho.clone(), m.tipo.clone())));
+    lista
+}
+
+fn sistemas_ext2() -> Vec<Arc<Ext2>> {
+    MONTAGENS
+        .lock()
+        .iter()
+        .filter_map(|m| match &m.raiz {
+            Vnode::Disco(fs, _) => Some(fs.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// O primeiro disco montado (para o `df` antigo).
 pub fn disco() -> Option<Arc<Ext2>> {
-    DISCO.lock().clone()
+    sistemas_ext2().into_iter().next()
+}
+
+/// O `sync`: grava tudo o que os discos montados têm pendente.
+pub fn sincronizar_tudo() {
+    for fs in sistemas_ext2() {
+        if fs.tem_pendencias() {
+            let _ = fs.sincronizar();
+        }
+    }
+}
+
+/// O que o `statfs` devolve: (tipo, tamanho do bloco, blocos, livres, inodes, inodes livres).
+pub fn info_do_sistema(no: &Vnode) -> (u64, u64, u64, u64, u64, u64) {
+    match no {
+        Vnode::Disco(fs, _) => {
+            let (blocos, livres, tamanho) = fs.estatisticas();
+            let (inodes, inodes_livres) = fs.inodes();
+            (0xEF53, tamanho, blocos, livres, inodes, inodes_livres)
+        }
+        Vnode::Proc(_) => (0x9FA0, 4096, 0, 0, 0, 0),
+        Vnode::Memoria(_) => {
+            let (total, livres) = crate::quadros::estatisticas();
+            (0x0102_1994, 4096, total as u64, livres as u64, 0, 0)
+        }
+    }
+}
+
+/// Há algo montado neste caminho? (Pelo caminho: buscar o diretório já
+/// devolveria a raiz do que está montado nele.)
+fn eh_ponto_de_montagem(caminho: &str) -> bool {
+    MONTAGENS.lock().iter().any(|m| m.caminho == caminho)
 }
 
 /// Como `buscar`, mas exigindo permissão de atravessar (`x`) cada diretório do caminho.
@@ -460,7 +556,7 @@ fn resolver(caminho: &str, cred: Option<Cred>, seguir_ultimo: bool) -> Result<Vn
         if let Some(c) = cred {
             atual.permite(c, EXECUTAR)?;
         }
-        let filho = atual.filho(&parte)?;
+        let filho = atravessar(atual.filho(&parte)?);
         let e_o_ultimo = pendentes.is_empty();
         if filho.tipo()? == Tipo::Link && (!e_o_ultimo || seguir_ultimo) {
             saltos += 1;
@@ -482,7 +578,7 @@ fn resolver(caminho: &str, cred: Option<Cred>, seguir_ultimo: bool) -> Result<Vn
 }
 
 fn raiz() -> Vnode {
-    Vnode::Memoria(RAIZ.lock().clone().expect("o VFS ainda não foi iniciado"))
+    atravessar(Vnode::Memoria(RAIZ.lock().clone().expect("o VFS ainda não foi iniciado")))
 }
 
 /// Junta `caminho` ao diretório `base` e resolve `.` e `..`, sem consultar o disco.
@@ -612,6 +708,9 @@ pub fn criar(caminho: &str, diretorio: bool, meta: Meta) -> Result<Vnode, i64> {
 /// Apaga um arquivo (`unlink`) ou um diretório vazio (`rmdir`).
 pub fn remover(caminho: &str, diretorio: bool) -> Result<(), i64> {
     let (pai, nome) = separar(caminho)?;
+    if eh_ponto_de_montagem(caminho) {
+        return Err(EBUSY);
+    }
     match buscar(pai)? {
         Vnode::Proc(_) => Err(EACCES),
         Vnode::Disco(fs, dir) => fs.remover(dir, nome, diretorio),
@@ -619,7 +718,6 @@ pub fn remover(caminho: &str, diretorio: bool) -> Result<(), i64> {
             let mut c = pai.conteudo.lock();
             let Conteudo::Diretorio(filhos) = &mut *c else { return Err(ENOTDIR) };
             let problema = match (&*filhos.get(nome).ok_or(ENOENT)?.conteudo.lock(), diretorio) {
-                (Conteudo::Montagem(_), _) => Some(EBUSY),
                 (Conteudo::Diretorio(f), true) if !f.is_empty() => Some(ENOTEMPTY),
                 (Conteudo::Diretorio(_), true) => None,
                 (Conteudo::Diretorio(_), false) => Some(EISDIR),
@@ -639,6 +737,9 @@ pub fn remover(caminho: &str, diretorio: bool) -> Result<(), i64> {
 pub fn renomear(de: &str, para: &str) -> Result<(), i64> {
     if para.starts_with(de) && para.as_bytes().get(de.len()) == Some(&b'/') {
         return Err(EINVAL); // mover um diretório para dentro dele mesmo
+    }
+    if eh_ponto_de_montagem(de) || eh_ponto_de_montagem(para) {
+        return Err(EBUSY);
     }
     let (pai_de, nome_de) = separar(de)?;
     let (pai_para, nome_para) = separar(para)?;

@@ -23,6 +23,12 @@ if [ -f build/raiz/bin/lua ]; then
 fi
 
 mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E root_owner=1000:1000 -d disco-inicial "$disco" 32M >/dev/null 2>&1
+# Um segundo disco (hdb) com tabela de partições MBR e um ext2 na partição 1
+# (que começa no setor 2048, a 1 MiB do início).
+particionado="$temporario/particionado.img"
+truncate -s 24M "$particionado"
+echo 'start=2048, size=30720, type=83' | sfdisk -q "$particionado" >/dev/null 2>&1
+mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E offset=1048576 "$particionado" 15M >/dev/null 2>&1
 
 {
     sleep 2
@@ -39,6 +45,7 @@ mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E root_owner=100
     done
 } | timeout 70 qemu-system-x86_64 -cpu max -kernel build/ferrugem.bin -initrd build/initrd.tar -m 256M \
         -drive file="$disco",format=raw,if=ide,index=0 \
+        -drive file="$particionado",format=raw,if=ide,index=1 \
         -display none -chardev stdio,id=s0,signal=off -serial chardev:s0 -no-reboot > "$saida" 2>&1
 
 sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida" | sed -n '/Rodando/,/testes /p;/Testando a libc/,/testes da libc/p'
@@ -59,8 +66,9 @@ if ! grep -q "testes passaram" "$saida" || [ $libc_ok = false ]; then
     sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida" | tail -40
     falhou=1
 fi
-if e2fsck -fn "$disco" > "$temporario/fsck.txt" 2>&1; then
-    echo "==> e2fsck: o ext2 gravado pelo kernel está consistente"
+dd if="$particionado" of="$temporario/particao.img" bs=1M skip=1 count=15 status=none
+if e2fsck -fn "$disco" > "$temporario/fsck.txt" 2>&1 && e2fsck -fn "$temporario/particao.img" >> "$temporario/fsck.txt" 2>&1; then
+    echo "==> e2fsck: os dois ext2 gravados pelo kernel (hda e hdb1) estão consistentes"
 else
     echo "==> e2fsck encontrou erros no disco:"
     cat "$temporario/fsck.txt"

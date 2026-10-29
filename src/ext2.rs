@@ -21,9 +21,19 @@
 //!
 //! Como o formato é o mesmo do Linux, dá para criar o disco com `mkfs.ext2`,
 //! conferir com `e2fsck` e montar no Linux para ver o que o FerrugemOS gravou.
+//!
+//! ## Cache com escrita adiada
+//!
+//! Os blocos lidos ficam num cache; os gravados ficam lá também, marcados
+//! como *sujos*, e só vão para o disco no `sync`, ao desmontar, ao desligar,
+//! quando o cache enche — ou a cada poucos segundos, pelo processo ocioso.
+//! É bem mais rápido (gravar 1 KiB num arquivo mexe em bitmap, inode, bloco
+//! de dados...), com o mesmo risco do Linux: puxar a tomada perde os
+//! últimos segundos.
 
-use crate::ata;
+use crate::blocos::Bloco;
 use crate::rtc;
+use core::sync::atomic::{AtomicU32, Ordering};
 use crate::erro::*;
 use crate::spin::Mutex;
 use alloc::collections::BTreeMap;
@@ -40,7 +50,11 @@ const MODO_LINK: u16 = 0xA000;
 pub const TIPO_ENTRADA_ARQUIVO: u8 = 1;
 pub const TIPO_ENTRADA_DIRETORIO: u8 = 2;
 pub const TIPO_ENTRADA_LINK: u8 = 7;
-const MAX_CACHE: usize = 512;
+const MAX_CACHE: usize = 2048;
+
+/// Cada sistema de arquivos montado recebe um número (para os ids dos inodes
+/// não se misturarem entre discos).
+static PROXIMO_ID: AtomicU32 = AtomicU32::new(1);
 
 fn rd16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
@@ -159,10 +173,13 @@ struct Estado {
     superbloco: Vec<u8>,
     superbloco_sujo: bool,
     grupos: Vec<Grupo>,
-    cache: BTreeMap<u32, Vec<u8>>,
+    /// bloco → (conteúdo, sujo?)
+    cache: BTreeMap<u32, (Vec<u8>, bool)>,
+    dispositivo: Arc<Bloco>,
 }
 
 pub struct Ext2 {
+    pub id: u32,
     estado: Mutex<Estado>,
 }
 
@@ -174,10 +191,10 @@ struct Entrada {
 }
 
 impl Ext2 {
-    /// Lê o superbloco e a tabela de grupos do disco ATA.
-    pub fn montar() -> Result<Arc<Ext2>, &'static str> {
+    /// Lê o superbloco e a tabela de grupos de um disco (ou partição).
+    pub fn montar(dispositivo: Arc<Bloco>) -> Result<Arc<Ext2>, &'static str> {
         let mut superbloco = vec![0u8; 1024];
-        ata::ler(2, &mut superbloco).map_err(|_| "erro lendo o superbloco")?;
+        dispositivo.ler(2, &mut superbloco).map_err(|_| "erro lendo o superbloco")?;
         if rd16(&superbloco, 56) != 0xEF53 {
             return Err("o disco não tem um sistema ext2");
         }
@@ -199,6 +216,7 @@ impl Ext2 {
             superbloco_sujo: false,
             grupos: Vec::new(),
             cache: BTreeMap::new(),
+            dispositivo,
         };
         let quantos = (e.total_blocos - e.primeiro_bloco).div_ceil(e.blocos_por_grupo);
         for g in 0..quantos as usize {
@@ -215,16 +233,25 @@ impl Ext2 {
                 sujo: false,
             });
         }
-        Ok(Arc::new(Ext2 { estado: Mutex::new(e) }))
+        let id = PROXIMO_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(Ext2 { id, estado: Mutex::new(e) }))
     }
 
-    /// Roda uma operação e grava no disco os metadados que ela mudou.
     fn operar<T>(&self, f: impl FnOnce(&mut Estado) -> Result<T, i64>) -> Result<T, i64> {
-        let mut e = self.estado.lock();
-        let resultado = f(&mut e);
-        e.sincronizar()?;
-        resultado
+        f(&mut self.estado.lock())
     }
+
+    /// Grava no disco tudo o que está pendente (o `sync`).
+    pub fn sincronizar(&self) -> Result<(), i64> {
+        self.estado.lock().sincronizar()
+    }
+
+    /// Há blocos ou metadados esperando para ir para o disco?
+    pub fn tem_pendencias(&self) -> bool {
+        let e = self.estado.lock();
+        e.superbloco_sujo || e.grupos.iter().any(|g| g.sujo) || e.cache.values().any(|(_, sujo)| *sujo)
+    }
+
 
     pub fn buscar(&self, dir: u32, nome: &str) -> Result<u32, i64> {
         self.operar(|e| e.buscar(dir, nome))
@@ -369,6 +396,12 @@ impl Ext2 {
         let e = self.estado.lock();
         (e.total_blocos as u64, rd32(&e.superbloco, 12) as u64, e.tamanho_bloco as u64)
     }
+
+    /// (inodes no total, inodes livres)
+    pub fn inodes(&self) -> (u64, u64) {
+        let e = self.estado.lock();
+        (rd32(&e.superbloco, 0) as u64, rd32(&e.superbloco, 16) as u64)
+    }
 }
 
 impl Estado {
@@ -379,25 +412,47 @@ impl Estado {
     }
 
     fn ler_bloco(&mut self, bloco: u32) -> Result<Vec<u8>, i64> {
-        if let Some(dados) = self.cache.get(&bloco) {
+        if let Some((dados, _)) = self.cache.get(&bloco) {
             return Ok(dados.clone());
         }
         let mut dados = vec![0u8; self.tamanho_bloco];
-        ata::ler(bloco * self.setores_por_bloco(), &mut dados)?;
-        if self.cache.len() >= MAX_CACHE {
-            self.cache.pop_first();
-        }
-        self.cache.insert(bloco, dados.clone());
+        self.dispositivo.ler(bloco as u64 * self.setores_por_bloco() as u64, &mut dados)?;
+        self.abrir_espaco_no_cache()?;
+        self.cache.insert(bloco, (dados.clone(), false));
         Ok(dados)
     }
 
-    /// Grava direto no disco ("write-through"): o cache nunca tem nada pendente.
+    /// Só no cache, marcado como sujo: vai para o disco depois (veja o topo do arquivo).
     fn escrever_bloco(&mut self, bloco: u32, dados: &[u8]) -> Result<(), i64> {
-        ata::gravar(bloco * self.setores_por_bloco(), dados)?;
-        if self.cache.len() >= MAX_CACHE {
-            self.cache.pop_first();
+        if !self.cache.contains_key(&bloco) {
+            self.abrir_espaco_no_cache()?;
         }
-        self.cache.insert(bloco, dados.to_vec());
+        self.cache.insert(bloco, (dados.to_vec(), true));
+        Ok(())
+    }
+
+    /// Cache cheio: sai um bloco limpo; se todos estiverem sujos, grava tudo antes.
+    fn abrir_espaco_no_cache(&mut self) -> Result<(), i64> {
+        if self.cache.len() < MAX_CACHE {
+            return Ok(());
+        }
+        if let Some(&limpo) = self.cache.iter().find(|(_, (_, sujo))| !sujo).map(|(b, _)| b) {
+            self.cache.remove(&limpo);
+            return Ok(());
+        }
+        self.gravar_sujos()?;
+        self.cache.pop_first();
+        Ok(())
+    }
+
+    fn gravar_sujos(&mut self) -> Result<(), i64> {
+        let por_bloco = self.setores_por_bloco() as u64;
+        for (bloco, (dados, sujo)) in self.cache.iter_mut() {
+            if *sujo {
+                self.dispositivo.gravar(*bloco as u64 * por_bloco, dados)?;
+                *sujo = false;
+            }
+        }
         Ok(())
     }
 
@@ -421,10 +476,11 @@ impl Estado {
             self.grupos[g].sujo = false;
         }
         if self.superbloco_sujo {
-            ata::gravar(2, &self.superbloco)?;
+            self.dispositivo.gravar(2, &self.superbloco)?;
             self.superbloco_sujo = false;
         }
-        ata::sincronizar()
+        self.gravar_sujos()?;
+        self.dispositivo.sincronizar()
     }
 
     fn somar_superbloco(&mut self, deslocamento: usize, n: i32) {

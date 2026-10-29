@@ -80,7 +80,7 @@ impl NoProc {
     }
 
     pub fn id(&self) -> u64 {
-        let base = 0x2_0000_0000;
+        let base = 0xFF_0000_0000_0000; // longe dos ids dos discos (número do disco << 32)
         match self {
             NoProc::Raiz => base + 1,
             NoProc::Eu => base + 2,

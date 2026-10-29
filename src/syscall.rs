@@ -109,7 +109,7 @@ pub fn tratar(ctx: &mut Contexto) {
         62 => processo::sinalizar(a1 as i32 as i64, a2 as u32).map(|_| 0),
         63 => sys_uname(a1),
         72 => sys_fcntl(a1, a2, a3),
-        74 | 75 => arquivo(a1).map(|_| 0), // fsync/fdatasync: o ext2 já grava direto
+        74 | 75 => sys_fsync(a1), // fsync/fdatasync
         77 => sys_ftruncate(a1, a2),
         86 => sys_link(caminho(a1), caminho(a2)),
         88 => sys_symlink(a1, caminho(a2)),
@@ -136,7 +136,18 @@ pub fn tratar(ctx: &mut Contexto) {
         112 => processo::nova_sessao().map(|s| s as u64),
         121 => processo::grupo_e_sessao(a1 as u32).map(|(g, _)| g as u64),
         124 => processo::grupo_e_sessao(a1 as u32).map(|(_, s)| s as u64),
+        137 => caminho(a1).and_then(|c| vfs::buscar_como(&c, cred())).and_then(|no| sys_statfs(&no, a2)),
+        138 => arquivo(a1).and_then(|arq| match &arq.tipo {
+            Tipo::No(no) => sys_statfs(no, a2),
+            _ => Err(EINVAL),
+        }),
         158 => sys_arch_prctl(a1, a2),
+        162 | 306 => {
+            vfs::sincronizar_tudo(); // sync, syncfs
+            Ok(0)
+        }
+        165 => sys_mount(a1, a2, a3),
+        166 => sys_umount(a1),
         186 => Ok(processo::atual().pid as u64), // gettid
         200 => processo::enviar_a_thread(0, a1 as u32, a2 as u32).map(|_| 0), // tkill
         101 => processo::ptrace(a1, a2 as u32, a3, a4),
@@ -532,8 +543,7 @@ fn sys_mmap(endereco: u64, tamanho: u64, prot: u64, flags: u64, fd: u64, desloca
     const MAP_SHARED: u64 = 0x01;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    const ENODEV: i64 = 19;
-    if tamanho == 0 || tamanho > 1 << 34 || deslocamento & 0xFFF != 0 {
+        if tamanho == 0 || tamanho > 1 << 34 || deslocamento & 0xFFF != 0 {
         return Err(EINVAL);
     }
     let tamanho = (tamanho + 0xFFF) & !0xFFF;
@@ -1159,6 +1169,11 @@ fn sys_uname(ptr: u64) -> Resultado {
 }
 
 fn sys_reboot(comando: u64) -> Resultado {
+    if processo::atual().euid != 0 {
+        return Err(EPERM);
+    }
+    // Antes de desligar, o que está no cache de disco vai para o disco.
+    vfs::sincronizar_tudo();
     match comando {
         0x4321_FEDC => {
             println!("Desligando...");
@@ -1219,6 +1234,65 @@ fn sys_disco(buf: u64) -> Resultado {
     let mut b = Vec::new();
     for valor in [total, livres, bloco] {
         b.extend(valor.to_le_bytes());
+    }
+    escrever_usuario(buf, &b)?;
+    Ok(0)
+}
+
+// -----------------------------------------------------------------------------
+// Montagens e sincronização
+// -----------------------------------------------------------------------------
+
+fn texto_do_usuario(ptr: u64) -> Result<String, i64> {
+    if ptr == 0 {
+        return Ok(String::new());
+    }
+    espaco().ler_string(ptr, 256).ok_or(EFAULT)
+}
+
+/// `mount(fonte, alvo, tipo, flags, dados)`: só o root. Tipos: ext2 (de um
+/// /dev/hdX), proc e tmpfs.
+fn sys_mount(fonte: u64, alvo: u64, tipo: u64) -> Resultado {
+    if processo::atual().euid != 0 {
+        return Err(EPERM);
+    }
+    let (fonte, alvo, tipo) = (texto_do_usuario(fonte)?, caminho(alvo)?, texto_do_usuario(tipo)?);
+    let raiz = match tipo.as_str() {
+        "ext2" => {
+            let nome = fonte.strip_prefix("/dev/").ok_or(ENODEV)?;
+            let bloco = crate::blocos::buscar(nome).ok_or(ENODEV)?;
+            let fs = crate::ext2::Ext2::montar(bloco).map_err(|_| EINVAL)?;
+            Vnode::Disco(fs, crate::ext2::RAIZ)
+        }
+        "proc" => Vnode::Proc(crate::procfs::NoProc::Raiz),
+        "tmpfs" => vfs::novo_tmpfs(),
+        _ => return Err(ENODEV),
+    };
+    vfs::montar(&alvo, raiz, &fonte, &tipo).map(|_| 0)
+}
+
+fn sys_umount(alvo: u64) -> Resultado {
+    if processo::atual().euid != 0 {
+        return Err(EPERM);
+    }
+    vfs::desmontar(&caminho(alvo)?).map(|_| 0)
+}
+
+fn sys_fsync(fd: u64) -> Resultado {
+    let arq = arquivo(fd)?;
+    if let Tipo::No(Vnode::Disco(fs, _)) = &arq.tipo {
+        fs.sincronizar()?;
+    }
+    Ok(0)
+}
+
+/// `statfs`: a `struct statfs` do Linux (120 bytes): tipo, tamanho do bloco,
+/// blocos, livres, disponíveis, inodes, inodes livres...
+fn sys_statfs(no: &Vnode, buf: u64) -> Resultado {
+    let (tipo, bloco, blocos, livres, inodes, inodes_livres) = vfs::info_do_sistema(no);
+    let mut b = [0u8; 120];
+    for (i, v) in [tipo, bloco, blocos, livres, livres, inodes, inodes_livres, 0, 255, bloco].iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
     escrever_usuario(buf, &b)?;
     Ok(0)

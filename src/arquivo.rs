@@ -106,6 +106,13 @@ impl Arquivo {
                 crate::aleatorio::preencher(buf);
                 Ok(buf.len())
             }
+            vfs::Tipo::Dispositivo(Dispositivo::Bloco(i)) => {
+                let bloco = crate::blocos::listar().get(i as usize).cloned().ok_or(EIO)?;
+                let mut posicao = self.posicao.lock();
+                let n = bloco.ler_bytes(*posicao, buf)?;
+                *posicao += n as u64;
+                Ok(n)
+            }
         }
     }
 
@@ -133,6 +140,13 @@ impl Arquivo {
             vfs::Tipo::Dispositivo(Dispositivo::Terminal) => {
                 tty::escrever(dados);
                 Ok(dados.len())
+            }
+            vfs::Tipo::Dispositivo(Dispositivo::Bloco(i)) => {
+                let bloco = crate::blocos::listar().get(i as usize).cloned().ok_or(EIO)?;
+                let mut posicao = self.posicao.lock();
+                let n = bloco.gravar_bytes(*posicao, dados)?;
+                *posicao += n as u64;
+                Ok(n)
             }
             vfs::Tipo::Dispositivo(_) => Ok(dados.len()),
         }
@@ -163,6 +177,9 @@ impl Arquivo {
         let tamanho = match no.tipo()? {
             vfs::Tipo::Arquivo => no.tamanho()? as i64,
             vfs::Tipo::Diretorio | vfs::Tipo::Link => 0,
+            vfs::Tipo::Dispositivo(Dispositivo::Bloco(i)) => {
+                crate::blocos::listar().get(i as usize).map_or(0, |b| b.tamanho() as i64)
+            }
             vfs::Tipo::Dispositivo(_) => return Err(ESPIPE),
         };
         let mut posicao = self.posicao.lock();
