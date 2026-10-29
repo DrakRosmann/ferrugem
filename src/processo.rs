@@ -56,12 +56,20 @@ pub enum Estado {
     Pronto,
     Rodando,
     Dormindo(usize),
+    /// Parado por um sinal (Ctrl+Z, SIGSTOP...) até alguém mandar SIGCONT.
+    Parado,
     Zumbi,
 }
 
 pub struct Processo {
     pub pid: Pid,
     pub pai: Pid,
+    /// Grupo de processos: um "job" do shell (todos os programas de um pipeline).
+    pub pgid: Pid,
+    /// Sessão: tudo o que nasceu de um login.
+    pub sid: Pid,
+    /// Parou e o pai ainda não soube (o `wait` com WUNTRACED conta para ele).
+    parada_a_relatar: Option<u32>,
     pub nome: String,
     pub estado: Estado,
     rsp_salvo: u64,
@@ -103,6 +111,9 @@ impl Processo {
         Box::new(Processo {
             pid,
             pai,
+            pgid: 0,
+            sid: 0,
+            parada_a_relatar: None,
             nome,
             estado: Estado::Pronto,
             rsp_salvo: 0,
@@ -319,16 +330,35 @@ pub fn ao_voltar_para_usuario(ctx: &mut Contexto, foi_o_timer: bool) {
     }
     while let Some(numero) = atual().sinais.retirar() {
         let acao = atual().sinais.acoes[numero as usize];
-        if acao.tem_tratador() {
+        if numero == SIGKILL {
+            sair(numero as i32);
+        }
+        if acao.tem_tratador() && numero != sinal::SIGSTOP {
             if !entregar(ctx, numero, acao) {
                 sair(SIGSEGV as i32); // a pilha do programa está estragada
             }
             return; // um por vez: os outros saem depois do rt_sigreturn
         }
-        if acao.tratador == sinal::SIG_DFL && !sinal::padrao_e_ignorar(numero) || numero == SIGKILL {
-            sair(numero as i32);
+        if acao.tratador == sinal::SIG_IGN && numero != sinal::SIGSTOP || sinal::padrao_e_ignorar(numero) {
+            continue;
         }
+        if sinal::padrao_e_parar(numero) {
+            // Para aqui mesmo; quando vier um SIGCONT, segue deste ponto.
+            parar(atual(), numero);
+            escalonar();
+            continue;
+        }
+        sair(numero as i32);
     }
+}
+
+/// Coloca o processo em estado Parado e avisa o pai (que pode estar num `wait`).
+fn parar(p: &mut Processo, numero: u32) {
+    p.estado = Estado::Parado;
+    p.parada_a_relatar = Some(numero);
+    let pai = p.pai;
+    acordar(canal_filhos(pai));
+    let _ = enviar_sinal(pai, sinal::SIGCHLD);
 }
 
 const TAMANHO_QUADRO_SINAL: u64 = 8 + 128 + size_of::<Contexto>() as u64 + 8 + 512;
@@ -421,8 +451,7 @@ fn carregar_programa(caminho: &str, args: &[String], ambiente: &[String], cred: 
             no.permite(cred, vfs::EXECUTAR)?;
             no.ler_tudo()?
         }
-        vfs::Tipo::Diretorio => return Err(EACCES),
-        vfs::Tipo::Dispositivo(_) => return Err(EACCES),
+        vfs::Tipo::Diretorio | vfs::Tipo::Dispositivo(_) | vfs::Tipo::Link => return Err(EACCES),
     };
     let mut espaco = EspacoEnderecos::novo().ok_or(ENOMEM)?;
     let programa = elf::carregar(&dados, &mut espaco)?;
@@ -510,6 +539,7 @@ pub fn criar_init(caminho: &str) -> Result<(), i64> {
     let ambiente = ["PATH=/bin".to_string(), "HOME=/".to_string(), "TERM=linux".to_string()];
     let imagem = carregar_programa(caminho, &[caminho.to_string()], &ambiente, vfs::Cred { uid: 0, gid: 0 })?;
     let mut p = Processo::novo(0, "init".to_string());
+    (p.pgid, p.sid) = (p.pid, p.pid);
     unsafe { *p.contexto() = Contexto::usuario(imagem.entrada, imagem.rsp) };
     p.espaco = Some(imagem.espaco);
     p.brk_inicio = imagem.brk;
@@ -524,6 +554,7 @@ pub fn fork(ctx: &Contexto) -> Result<Pid, i64> {
     let pai = atual();
     let espaco = pai.espaco.as_ref().ok_or(EINVAL)?.clonar().ok_or(ENOMEM)?;
     let mut filho = Processo::novo(pai.pid, pai.nome.clone());
+    (filho.pgid, filho.sid) = (pai.pgid, pai.sid);
     filho.espaco = Some(espaco);
     filho.arquivos = pai.arquivos.clone();
     filho.fecha_no_exec = pai.fecha_no_exec;
@@ -619,26 +650,44 @@ pub fn sair(status: i32) -> ! {
 }
 
 pub const WNOHANG: u64 = 1;
+pub const WUNTRACED: u64 = 2;
 
-/// `wait`: espera um filho terminar e devolve (pid, status).
+/// `wait`: espera um filho terminar (ou parar, com WUNTRACED) e devolve (pid, status).
+/// `pid` > 0: aquele filho; -1: qualquer um; 0: do meu grupo; < -1: do grupo -pid.
 pub fn esperar(pid: i64, opcoes: u64) -> Result<(Pid, i32), i64> {
     loop {
-        let eu = atual().pid;
+        let (eu, meu_grupo) = (atual().pid, atual().pgid);
         let t = tabela();
+        let serve = |q: &Processo| match pid {
+            -1 => true,
+            0 => q.pgid == meu_grupo,
+            p if p < 0 => q.pgid as i64 == -p,
+            p => q.pid as i64 == p,
+        };
         let mut tem_filho = false;
         let mut zumbi = None;
+        let mut parado = None;
         for (i, q) in t.processos.iter().enumerate().skip(1) {
-            if q.pai == eu && (pid == -1 || q.pid as i64 == pid) {
+            if q.pai == eu && serve(q) {
                 tem_filho = true;
                 if q.estado == Estado::Zumbi {
                     zumbi = Some(i);
                     break;
+                }
+                if opcoes & WUNTRACED != 0 && q.parada_a_relatar.is_some() {
+                    parado = Some(i);
                 }
             }
         }
         if let Some(i) = zumbi {
             let q = t.processos.remove(i); // aqui a pilha de kernel dele é liberada
             return Ok((q.pid, q.status));
+        }
+        if let Some(i) = parado {
+            // No formato do Unix: 0x7f no byte baixo = "parado", e o sinal no de cima.
+            let q = &mut t.processos[i];
+            let numero = q.parada_a_relatar.take().unwrap_or(0);
+            return Ok((q.pid, 0x7f | (numero as i32) << 8));
         }
         if !tem_filho {
             return Err(ECHILD);
@@ -676,6 +725,28 @@ pub fn enviar_sinal(pid: Pid, sinal: u32) -> Result<(), i64> {
     if sinal == 0 || p.estado == Estado::Zumbi {
         return Ok(());
     }
+    let bit = 1u64 << sinal;
+    if sinal == sinal::SIGCONT {
+        p.sinais.pendentes &= !sinal::PARADAS;
+        if p.estado == Estado::Parado {
+            p.estado = Estado::Pronto; // as chamadas em que ele dormia conferem tudo de novo
+            p.parada_a_relatar = None;
+        }
+    } else if sinal::PARADAS & bit != 0 {
+        p.sinais.pendentes &= !(1 << sinal::SIGCONT);
+    }
+    if sinal == SIGKILL && p.estado == Estado::Parado {
+        p.estado = Estado::Pronto; // acorda só para morrer
+    }
+    // Parar outro processo é imediato, mesmo que ele esteja dormindo numa
+    // chamada de sistema: ao continuar, ela segue de onde estava (sem EINTR).
+    // O processo atual para na volta para o modo usuário.
+    if !core::ptr::eq(p, atual()) && p.sinais.pararia(sinal) {
+        if p.estado != Estado::Parado {
+            parar(p, sinal);
+        }
+        return Ok(());
+    }
     // Se ele estiver dormindo (num read, wait, sleep...), acorda: a chamada
     // devolve EINTR e o sinal é entregue na volta para o modo usuário.
     if p.sinais.postar(sinal) && p.sinais.entregaveis() != 0 {
@@ -686,13 +757,93 @@ pub fn enviar_sinal(pid: Pid, sinal: u32) -> Result<(), i64> {
     Ok(())
 }
 
-/// Ctrl+C: manda o sinal para todos os processos (menos o ocioso). Quem
-/// ignora o sinal (o init e o shell) sobrevive.
-pub fn sinal_para_o_terminal(sinal: u32) {
+/// Os processos (vivos) de um grupo.
+fn membros(pgid: Pid) -> Vec<Pid> {
+    tabela()
+        .processos
+        .iter()
+        .skip(1)
+        .filter(|p| p.pgid == pgid && p.estado != Estado::Zumbi)
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// Antes de alguém definir um grupo em primeiro plano: o sinal vai para todos
+/// (menos o ocioso). Quem ignora o sinal (o init) sobrevive.
+pub fn sinal_para_grupo_todos(sinal: u32) {
     let pids: Vec<Pid> = tabela().processos.iter().skip(1).map(|p| p.pid).collect();
     for pid in pids {
         let _ = enviar_sinal(pid, sinal);
     }
+}
+
+/// Sinal para um grupo inteiro, sem conferir permissão (é o terminal mandando).
+pub fn sinal_para_grupo(pgid: Pid, sinal: u32) {
+    for pid in membros(pgid) {
+        let _ = enviar_sinal(pid, sinal);
+    }
+}
+
+/// O `kill` do Unix: `pid` > 0 é um processo; 0, o meu grupo; -1, todos
+/// (menos o init); < -1, o grupo -pid. Confere permissão em cada um.
+pub fn sinalizar(pid: i64, sinal: u32) -> Result<(), i64> {
+    if pid > 0 {
+        pode_sinalizar(pid as Pid)?;
+        return enviar_sinal(pid as Pid, sinal);
+    }
+    let alvos: Vec<Pid> = match pid {
+        0 => membros(atual().pgid),
+        -1 => tabela().processos.iter().skip(1).filter(|p| p.pid != 1).map(|p| p.pid).collect(),
+        p => membros((-p) as Pid),
+    };
+    let mut algum = false;
+    let mut erro = ESRCH;
+    for alvo in alvos {
+        match pode_sinalizar(alvo) {
+            Ok(()) => {
+                let _ = enviar_sinal(alvo, sinal);
+                algum = true;
+            }
+            Err(e) => erro = e,
+        }
+    }
+    if algum { Ok(()) } else { Err(erro) }
+}
+
+/// `setpgid`: põe um processo (eu ou um filho) num grupo. 0 = "o próprio pid".
+pub fn definir_grupo(pid: Pid, pgid: Pid) -> Result<(), i64> {
+    let (eu, minha_sessao) = (atual().pid, atual().sid);
+    let pid = if pid == 0 { eu } else { pid };
+    let pgid = if pgid == 0 { pid } else { pgid };
+    let grupo_existe = tabela().processos.iter().any(|q| q.pgid == pgid && q.sid == minha_sessao);
+    let alvo = buscar(pid).ok_or(ESRCH)?;
+    if alvo.pid != eu && alvo.pai != eu {
+        return Err(ESRCH);
+    }
+    if alvo.sid == alvo.pid || alvo.sid != minha_sessao {
+        return Err(EPERM); // líder de sessão não muda de grupo
+    }
+    if pgid != pid && !grupo_existe {
+        return Err(EPERM);
+    }
+    alvo.pgid = pgid;
+    Ok(())
+}
+
+/// `setsid`: começa uma sessão nova (e um grupo novo), com este processo como líder.
+pub fn nova_sessao() -> Result<Pid, i64> {
+    let p = atual();
+    if p.pgid == p.pid {
+        return Err(EPERM);
+    }
+    (p.sid, p.pgid) = (p.pid, p.pid);
+    Ok(p.pid)
+}
+
+/// (pgid, sid) de um processo (0 = o atual).
+pub fn grupo_e_sessao(pid: Pid) -> Result<(Pid, Pid), i64> {
+    let p = if pid == 0 { atual() } else { buscar(pid).ok_or(ESRCH)? };
+    Ok((p.pgid, p.sid))
 }
 
 pub fn tem_sinal_pendente() -> bool {
@@ -719,6 +870,7 @@ pub fn falha_do_programa(descricao: core::fmt::Arguments, numero: u32) {
 pub struct Resumo {
     pub pid: Pid,
     pub pai: Pid,
+    pub pgid: Pid,
     pub uid: u32,
     pub estado: u32,
     pub memoria_kib: u64,
@@ -733,12 +885,14 @@ pub fn listar() -> Vec<Resumo> {
         .map(|p| Resumo {
             pid: p.pid,
             pai: p.pai,
+            pgid: p.pgid,
             uid: p.uid,
             estado: match p.estado {
                 Estado::Pronto => 0,
                 Estado::Rodando => 1,
                 Estado::Dormindo(_) => 2,
                 Estado::Zumbi => 3,
+                Estado::Parado => 4,
             },
             memoria_kib: p.espaco.as_ref().map_or(0, |e| e.paginas() as u64 * 4)
                 + p.pilha_kernel.len() as u64 / 1024,

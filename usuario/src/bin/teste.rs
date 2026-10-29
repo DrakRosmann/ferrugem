@@ -522,12 +522,173 @@ fn programa_setuid() -> R {
     if saida == "euid=0 uid=1000" { Ok(()) } else { Err(format!("o programa disse {:?}", saida)) }
 }
 
+// ------------------------------------------------------- controle de jobs
+
+fn parar_e_continuar() -> R {
+    let pid = match sys::fork() {
+        Ok(0) => loop {
+            core::hint::spin_loop();
+        },
+        Ok(pid) => pid,
+        Err(e) => return Err(erro(e)),
+    };
+    sys::matar(pid, sys::SIGSTOP).map_err(erro)?;
+    let parou = sys::esperar_com(pid, sys::WUNTRACED).map_err(erro)?;
+    let parado_certo = matches!(parou, Some((p, s)) if p == pid && sys::sinal_que_parou(s) == Some(sys::SIGSTOP));
+    let estado = sys::processos().into_iter().find(|p| p.pid == pid as u32).map(|p| p.estado);
+    sys::matar(pid, sys::SIGCONT).map_err(erro)?;
+    sys::matar(pid, sys::SIGTERM).map_err(erro)?;
+    let (_, status) = sys::esperar(pid).map_err(erro)?;
+    if !parado_certo || estado != Some(4) {
+        return Err(format!("wait devolveu {:?}, estado {:?}", parou, estado));
+    }
+    morto_por(status, sys::SIGTERM)
+}
+
+/// Um processo parado no meio de um sleep continua o sleep depois do SIGCONT
+/// (não acorda antes da hora com EINTR).
+fn sleep_sobrevive_a_parada() -> R {
+    let antes = sys::tempo_ms();
+    let pid = match sys::fork() {
+        Ok(0) => sys::sair(if sys::dormir_ms(300).is_ok() { 7 } else { 1 }),
+        Ok(pid) => pid,
+        Err(e) => return Err(erro(e)),
+    };
+    sys::dormir_ms(50).map_err(erro)?;
+    sys::matar(pid, sys::SIGTSTP).map_err(erro)?;
+    match sys::esperar_com(pid, sys::WUNTRACED).map_err(erro)? {
+        Some((_, s)) if sys::sinal_que_parou(s) == Some(sys::SIGTSTP) => {}
+        outro => return Err(format!("não parou: {:?}", outro)),
+    }
+    sys::dormir_ms(50).map_err(erro)?;
+    sys::matar(pid, sys::SIGCONT).map_err(erro)?;
+    let (_, status) = sys::esperar(pid).map_err(erro)?;
+    let passou = sys::tempo_ms() - antes;
+    match sys::codigo_de_saida(status) {
+        Some(7) if passou >= 300 => Ok(()),
+        c => Err(format!("código {:?} depois de {} ms", c, passou)),
+    }
+}
+
+/// `kill(-grupo)` atinge todos do grupo e só eles.
+fn sinal_para_grupo() -> R {
+    let mut filhos = Vec::new();
+    for i in 0..3 {
+        match sys::fork() {
+            Ok(0) => {
+                // Os dois primeiros num grupo novo: o do primeiro filho.
+                match i {
+                    0 => drop(sys::mudar_grupo(0, 0)),
+                    1 => drop(sys::mudar_grupo(0, filhos[0])),
+                    _ => {}
+                }
+                let _ = sys::dormir_ms(2000);
+                sys::sair(0);
+            }
+            Ok(pid) => filhos.push(pid),
+            Err(e) => return Err(erro(e)),
+        }
+    }
+    // Ajusta também daqui (o filho pode não ter rodado ainda), como faz um shell.
+    let _ = sys::mudar_grupo(filhos[0], filhos[0]);
+    let _ = sys::mudar_grupo(filhos[1], filhos[0]);
+    sys::dormir_ms(20).map_err(erro)?;
+    sys::matar(-filhos[0], sys::SIGTERM).map_err(erro)?;
+    let mut mortos = 0;
+    for &pid in &filhos[..2] {
+        let (_, s) = sys::esperar(pid).map_err(erro)?;
+        mortos += (sys::sinal_que_matou(s) == Some(sys::SIGTERM)) as i32;
+    }
+    let (_, terceiro) = sys::esperar(filhos[2]).map_err(erro)?; // este dorme até o fim
+    if mortos == 2 && sys::codigo_de_saida(terceiro) == Some(0) {
+        Ok(())
+    } else {
+        Err(format!("{} do grupo morreram; o de fora: {:#x}", mortos, terceiro))
+    }
+}
+
+// ----------------------------------------------------------------- links
+
+/// Links simbólicos e físicos, num diretório (`/tmp` na memória ou `/disco`).
+fn links_em(base: &str) -> R {
+    let d = format!("{}/teste-links", base);
+    let _ = sys::criar_diretorio(&d);
+    let arquivo = format!("{}/original", d);
+    let fd = sys::abrir(&arquivo, sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC).map_err(erro)?;
+    sys::escrever_tudo(fd, b"conteudo").map_err(erro)?;
+    let _ = sys::fechar(fd);
+
+    // simbólico, relativo e com "..": sub/atalho -> ../original
+    sys::criar_diretorio(&format!("{}/sub", d)).map_err(erro)?;
+    let atalho = format!("{}/sub/atalho", d);
+    sys::criar_link_simbolico("../original", &atalho).map_err(erro)?;
+    if sys::ler_arquivo(&atalho).map_err(erro)? != b"conteudo" {
+        return Err(String::from("ler pelo link simbólico"));
+    }
+    if sys::ler_link(&atalho).map_err(erro)? != "../original" || !sys::lstat(&atalho).map_err(erro)?.eh_link() {
+        return Err(String::from("readlink/lstat"));
+    }
+    // um link longo (mais de 60 bytes: no ext2 vai para um bloco de dados)
+    let longo = format!("{}/longo", d);
+    let alvo_longo = format!("{}/{}", d, "././././././././././././././././././././././././././original");
+    sys::criar_link_simbolico(&alvo_longo, &longo).map_err(erro)?;
+    if sys::ler_arquivo(&longo).map_err(erro)? != b"conteudo" {
+        return Err(String::from("link longo"));
+    }
+    // laço e link quebrado
+    let laco = format!("{}/laco", d);
+    sys::criar_link_simbolico(&laco, &laco).map_err(erro)?;
+    if sys::abrir(&laco, sys::O_RDONLY) != Err(sys::ELOOP) {
+        return Err(String::from("laço de links não deu ELOOP"));
+    }
+    let quebrado = format!("{}/quebrado", d);
+    sys::criar_link_simbolico("nao-existe", &quebrado).map_err(erro)?;
+    if sys::abrir(&quebrado, sys::O_RDONLY) != Err(sys::ENOENT) {
+        return Err(String::from("link quebrado não deu ENOENT"));
+    }
+
+    // físico: dois nomes, um arquivo
+    let outro = format!("{}/outro-nome", d);
+    sys::criar_link(&arquivo, &outro).map_err(erro)?;
+    let fd = sys::abrir(&outro, sys::O_WRONLY | sys::O_APPEND).map_err(erro)?;
+    sys::escrever_tudo(fd, b"!").map_err(erro)?;
+    let _ = sys::fechar(fd);
+    if sys::stat(&arquivo).map_err(erro)?.inode != sys::stat(&outro).map_err(erro)?.inode {
+        return Err(String::from("os dois nomes têm inodes diferentes"));
+    }
+    sys::remover(&arquivo).map_err(erro)?;
+    if sys::ler_arquivo(&outro).map_err(erro)? != b"conteudo!" {
+        return Err(String::from("apagar um nome levou o arquivo junto"));
+    }
+
+    // apagar um link não apaga o alvo; e limpa tudo
+    for nome in ["sub/atalho", "longo", "laco", "quebrado", "outro-nome"] {
+        sys::remover(&format!("{}/{}", d, nome)).map_err(|e| format!("rm {}: {}", nome, e))?;
+    }
+    sys::remover_diretorio(&format!("{}/sub", d)).map_err(erro)?;
+    sys::remover_diretorio(&d).map_err(erro)
+}
+
+fn links_na_memoria() -> R {
+    links_em("/tmp")
+}
+
+fn links_no_disco() -> R {
+    if sys::stat("/disco").is_err() {
+        return Err(String::from("sem disco em /disco"));
+    }
+    let livres = sys::disco().blocos_livres;
+    links_em("/disco")?;
+    let depois = sys::disco().blocos_livres;
+    if livres == depois { Ok(()) } else { Err(format!("blocos livres: {} antes, {} depois", livres, depois)) }
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--identidade") {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 29] = [
+    let testes: [(&str, fn() -> R); 34] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -557,6 +718,11 @@ fn principal(args: &[&str]) -> i32 {
         ("fork com copy-on-write (4 MiB só copiados ao escrever)", copia_na_escrita),
         ("permissões: usuário comum barrado onde deve", permissoes),
         ("programa setuid roda com o dono do arquivo", programa_setuid),
+        ("SIGSTOP para, wait(WUNTRACED) vê, SIGCONT continua", parar_e_continuar),
+        ("parado no meio de um sleep, continua o sleep", sleep_sobrevive_a_parada),
+        ("kill(-grupo) atinge só o grupo", sinal_para_grupo),
+        ("links simbólicos e físicos na memória", links_na_memoria),
+        ("links simbólicos e físicos no ext2", links_no_disco),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

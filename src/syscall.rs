@@ -61,7 +61,7 @@ pub fn tratar(ctx: &mut Contexto) {
         0 => sys_read(a1, a2, a3),
         1 => sys_write(a1, a2, a3),
         2 => sys_open(a1, a2, a3),
-        6 => sys_stat(a1, a2), // lstat: ainda não há links simbólicos
+        6 => caminho(a1).and_then(|c| stat_caminho(&c, a2, false)), // lstat: não segue o link
         9 => sys_mmap(a1, a2, ctx.r10, ctx.r8),
         10 => Ok(0), // mprotect: todas as páginas ficam leitura+escrita (simplificação)
         11 => sys_munmap(a1, a2),
@@ -94,12 +94,14 @@ pub fn tratar(ctx: &mut Contexto) {
         59 => sys_execve(ctx, a1, a2, a3),
         60 | 231 => processo::sair(((a1 & 0xFF) << 8) as i32),
         61 => sys_wait4(a1, a2, a3),
-        62 => processo::pode_sinalizar(a1 as u32).and_then(|_| processo::enviar_sinal(a1 as u32, a2 as u32)).map(|_| 0),
+        62 => processo::sinalizar(a1 as i32 as i64, a2 as u32).map(|_| 0),
         63 => sys_uname(a1),
         72 => sys_fcntl(a1, a2, a3),
         74 | 75 => arquivo(a1).map(|_| 0), // fsync/fdatasync: o ext2 já grava direto
         77 => sys_ftruncate(a1, a2),
-        89 => Err(EINVAL), // readlink: não há links simbólicos
+        86 => sys_link(caminho(a1), caminho(a2)),
+        88 => sys_symlink(a1, caminho(a2)),
+        89 => sys_readlink(caminho(a1), a2, a3),
         96 => sys_gettimeofday(a1),
         79 => sys_getcwd(a1, a2),
         80 => sys_chdir(a1),
@@ -116,7 +118,12 @@ pub fn tratar(ctx: &mut Contexto) {
         106 => sys_setgid(a1 as u32),
         107 => Ok(processo::atual().euid as u64),
         108 => Ok(processo::atual().egid as u64),
+        109 => processo::definir_grupo(a1 as u32, a2 as u32).map(|_| 0),
         110 => Ok(processo::atual().pai as u64),
+        111 => Ok(processo::atual().pgid as u64),
+        112 => processo::nova_sessao().map(|s| s as u64),
+        121 => processo::grupo_e_sessao(a1 as u32).map(|(g, _)| g as u64),
+        124 => processo::grupo_e_sessao(a1 as u32).map(|(_, s)| s as u64),
         158 => sys_arch_prctl(a1, a2),
         200 => processo::enviar_sinal(a1 as u32, a2 as u32).map(|_| 0), // tkill: thread = processo
         201 => sys_time(a1),
@@ -126,6 +133,9 @@ pub fn tratar(ctx: &mut Contexto) {
         258 => caminho_at(a1, a2).and_then(|c| mkdir_caminho(c, a3)),
         234 => processo::pode_sinalizar(a2 as u32).and_then(|_| processo::enviar_sinal(a2 as u32, a3 as u32)).map(|_| 0), // tgkill
         262 => sys_newfstatat(a1, a2, a3, ctx.r10),
+        265 => sys_link(caminho_at(a1, a2), caminho_at(a3, ctx.r10)),
+        266 => sys_symlink(a1, caminho_at(a2, a3)),
+        267 => sys_readlink(caminho_at(a1, a2), a3, ctx.r10),
         263 => caminho_at(a1, a2).and_then(|c| remover_caminho(c, a3 & 0x200 != 0)),
         264 => sys_renameat(a1, a2, a3, ctx.r10),
         269 | 439 => sys_access(caminho_at(a1, a2), a3),
@@ -147,7 +157,7 @@ pub fn tratar(ctx: &mut Contexto) {
     };
     // Interrompida por um sinal cujo tratador pediu SA_RESTART: volta o RIP
     // para a instrução `syscall` (2 bytes), e ela roda de novo depois do tratador.
-    if resultado == Err(EINTR) && processo::reiniciar_syscall() {
+    if resultado == Err(ERESTARTSYS) || resultado == Err(EINTR) && processo::reiniciar_syscall() {
         ctx.rax = numero;
         ctx.rip -= 2;
         return;
@@ -271,7 +281,7 @@ fn pai_gravavel(caminho: &str) -> Result<Vnode, i64> {
 /// se ele tiver o sticky bit (o /tmp), ser dono do arquivo ou do diretório.
 fn pode_apagar(caminho: &str) -> Result<(), i64> {
     let pai = pai_gravavel(caminho)?;
-    let alvo = vfs::buscar(caminho)?;
+    let alvo = vfs::buscar_sem_seguir(caminho)?; // apagar um link apaga o link, não o alvo
     let (c, mp, ma) = (cred(), pai.meta()?, alvo.meta()?);
     if mp.permissoes & vfs::STICKY != 0 && c.uid != 0 && c.uid != ma.uid && c.uid != mp.uid {
         return Err(EPERM);
@@ -355,10 +365,10 @@ fn sys_ioctl(fd: u64, pedido: u64, ptr: u64) -> Resultado {
     if !eh_terminal {
         return Err(ENOTTY);
     }
-    let dados = if pedido & 0xFF00 == 0x5400 && (0x5402..=0x5404).contains(&pedido) {
-        Some(ler_usuario(ptr, 36)?)
-    } else {
-        None
+    let dados = match pedido {
+        0x5402..=0x5404 => Some(ler_usuario(ptr, 36)?), // TCSETS*: a struct termios
+        0x5410 => Some(ler_usuario(ptr, 4)?),           // TIOCSPGRP: o grupo
+        _ => None,
     };
     let resposta = tty::ioctl(pedido, dados.as_deref(), processo::atual().pid)?;
     if !resposta.is_empty() {
@@ -458,14 +468,13 @@ fn sys_access(caminho: Result<String, i64>, modo: u64) -> Resultado {
 }
 
 fn sys_newfstatat(dirfd: u64, ptr: u64, buf: u64, flags: u64) -> Resultado {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     const AT_EMPTY_PATH: u64 = 0x1000;
     let vazio = espaco().ler_string(ptr, 1).is_some_and(|s| s.is_empty());
     if flags & AT_EMPTY_PATH != 0 && vazio {
         return sys_fstat(dirfd, buf);
     }
-    let no = vfs::buscar_como(&caminho_at(dirfd, ptr)?, cred())?;
-    escrever_usuario(buf, &stat_do_no(&no)?)?;
-    Ok(0)
+    stat_caminho(&caminho_at(dirfd, ptr)?, buf, flags & AT_SYMLINK_NOFOLLOW == 0)
 }
 
 fn sys_renameat(dir_de: u64, de: u64, dir_para: u64, para: u64) -> Resultado {
@@ -592,6 +601,7 @@ const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFLNK: u32 = 0o120000;
 
 /// A `struct stat` do Linux x86_64 (144 bytes); preenchemos os campos principais.
 fn montar_stat(id: u64, modo: u32, tamanho: u64, modificado: u64, uid: u32, gid: u32) -> [u8; 144] {
@@ -616,15 +626,51 @@ fn stat_do_no(no: &Vnode) -> Result<[u8; 144], i64> {
         vfs::Tipo::Arquivo => S_IFREG,
         vfs::Tipo::Diretorio => S_IFDIR,
         vfs::Tipo::Dispositivo(_) => S_IFCHR,
+        vfs::Tipo::Link => S_IFLNK,
     };
     let m = no.meta()?;
     Ok(montar_stat(no.id(), tipo | m.permissoes, no.tamanho()?, m.modificado, m.uid, m.gid))
 }
 
 fn sys_stat(ptr: u64, buf: u64) -> Resultado {
-    let no = vfs::buscar_como(&caminho(ptr)?, cred())?;
+    stat_caminho(&caminho(ptr)?, buf, true)
+}
+
+/// `seguir`: stat (do alvo) ou lstat (do próprio link).
+fn stat_caminho(caminho: &str, buf: u64, seguir: bool) -> Resultado {
+    let no = if seguir { vfs::buscar_como(caminho, cred())? } else { vfs::buscar_como_sem_seguir(caminho, cred())? };
     escrever_usuario(buf, &stat_do_no(&no)?)?;
     Ok(0)
+}
+
+/// `symlink(alvo, caminho)`: o alvo é guardado como texto, sem ser conferido
+/// (um link pode apontar para algo que ainda não existe).
+fn sys_symlink(ptr_alvo: u64, caminho: Result<String, i64>) -> Resultado {
+    let caminho = caminho?;
+    let alvo = espaco().ler_string(ptr_alvo, 4096).ok_or(EFAULT)?;
+    if alvo.is_empty() {
+        return Err(ENOENT);
+    }
+    pai_gravavel(&caminho)?;
+    let c = cred();
+    let meta = vfs::Meta { permissoes: 0o777, uid: c.uid, gid: c.gid, modificado: rtc::agora() };
+    vfs::criar_link_simbolico(&caminho, &alvo, meta).map(|_| 0)
+}
+
+/// `readlink`: copia o alvo (sem o zero do fim, como no Linux) e devolve o tamanho.
+fn sys_readlink(caminho: Result<String, i64>, buf: u64, tamanho: u64) -> Resultado {
+    let alvo = vfs::buscar_como_sem_seguir(&caminho?, cred())?.ler_link()?;
+    let n = alvo.len().min(tamanho as usize);
+    escrever_usuario(buf, &alvo.as_bytes()[..n])?;
+    Ok(n as u64)
+}
+
+/// `link(existente, novo)`: mais um nome para o mesmo arquivo.
+fn sys_link(existente: Result<String, i64>, novo: Result<String, i64>) -> Resultado {
+    let (existente, novo) = (existente?, novo?);
+    vfs::buscar_como_sem_seguir(&existente, cred())?;
+    pai_gravavel(&novo)?;
+    vfs::criar_link(&existente, &novo).map(|_| 0)
 }
 
 fn sys_fstat(fd: u64, buf: u64) -> Resultado {
@@ -647,6 +693,7 @@ fn sys_getdents64(fd: u64, buf: u64, tamanho: u64) -> Resultado {
             vfs::Tipo::Diretorio => 4,       // DT_DIR
             vfs::Tipo::Arquivo => 8,         // DT_REG
             vfs::Tipo::Dispositivo(_) => 2,  // DT_CHR
+            vfs::Tipo::Link => 10,           // DT_LNK
         };
         entradas.push((nome, id, tipo));
     }
@@ -929,7 +976,7 @@ fn sys_reboot(comando: u64) -> Resultado {
 }
 
 /// Registro de 64 bytes por processo:
-/// pid (4) | pai (4) | estado (4) | uid (4) | memória KiB (8) | tiques (8) | nome (32)
+/// pid (4) | pai (4) | estado (4) | uid (4) | memória KiB (8) | tiques (8) | nome (28) | pgid (4)
 fn sys_processos(buf: u64, maximo: u64) -> Resultado {
     let lista = processo::listar();
     let mut saida = Vec::new();
@@ -940,10 +987,11 @@ fn sys_processos(buf: u64, maximo: u64) -> Resultado {
         saida.extend(p.uid.to_le_bytes());
         saida.extend(p.memoria_kib.to_le_bytes());
         saida.extend(p.tiques.to_le_bytes());
-        let mut nome = [0u8; 32];
-        let n = p.nome.len().min(31);
+        let mut nome = [0u8; 28];
+        let n = p.nome.len().min(27);
         nome[..n].copy_from_slice(&p.nome.as_bytes()[..n]);
         saida.extend(nome);
+        saida.extend(p.pgid.to_le_bytes());
     }
     escrever_usuario(buf, &saida)?;
     Ok(lista.len().min(maximo as usize) as u64)

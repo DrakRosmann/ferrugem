@@ -11,6 +11,10 @@
 //!   i_block[13]     um bloco de blocos de números de blocos   (duplo indireto)
 //! ```
 //!
+//! Um **link simbólico** guarda o caminho para onde aponta. Se ele tiver menos
+//! de 60 bytes, mora dentro do próprio inode, no espaço de `i_block` (um
+//! "fast symlink"); senão, num bloco de dados, como um arquivo.
+//!
 //! Um **diretório** é um arquivo cujo conteúdo é uma lista de entradas
 //! `[inode | tamanho do registro | tamanho do nome | tipo | nome]`.
 //! O inode 2 é sempre a raiz.
@@ -32,8 +36,10 @@ pub const RAIZ: u32 = 2;
 
 const MODO_DIRETORIO: u16 = 0x4000;
 const MODO_ARQUIVO: u16 = 0x8000;
-const TIPO_ENTRADA_ARQUIVO: u8 = 1;
-const TIPO_ENTRADA_DIRETORIO: u8 = 2;
+const MODO_LINK: u16 = 0xA000;
+pub const TIPO_ENTRADA_ARQUIVO: u8 = 1;
+pub const TIPO_ENTRADA_DIRETORIO: u8 = 2;
+pub const TIPO_ENTRADA_LINK: u8 = 7;
 const MAX_CACHE: usize = 512;
 
 fn rd16(b: &[u8], o: usize) -> u16 {
@@ -59,6 +65,22 @@ impl Inode {
     }
     fn eh_diretorio(&self) -> bool {
         self.modo() & 0xF000 == MODO_DIRETORIO
+    }
+    fn eh_link(&self) -> bool {
+        self.modo() & 0xF000 == MODO_LINK
+    }
+    /// Link curto, com o caminho dentro do próprio inode (sem blocos de dados).
+    fn eh_link_rapido(&self) -> bool {
+        self.eh_link() && rd32(&self.0, 28) == 0
+    }
+    fn tipo_entrada(&self) -> u8 {
+        if self.eh_diretorio() {
+            TIPO_ENTRADA_DIRETORIO
+        } else if self.eh_link() {
+            TIPO_ENTRADA_LINK
+        } else {
+            TIPO_ENTRADA_ARQUIVO
+        }
     }
     fn tamanho(&self) -> u64 {
         rd32(&self.0, 4) as u64
@@ -90,6 +112,7 @@ impl Inode {
     fn info(&self) -> InfoInode {
         InfoInode {
             diretorio: self.eh_diretorio(),
+            link: self.eh_link(),
             tamanho: self.tamanho(),
             modificado: self.modificado_em(),
             permissoes: (self.modo() & 0o7777) as u32,
@@ -108,6 +131,7 @@ impl Inode {
 /// O que o VFS precisa saber de um inode.
 pub struct InfoInode {
     pub diretorio: bool,
+    pub link: bool,
     pub tamanho: u64,
     pub modificado: u64,
     pub permissoes: u32,
@@ -246,14 +270,76 @@ impl Ext2 {
         })
     }
 
-    /// (nome, inode, é diretório?) de cada entrada, sem `.` e `..`.
-    pub fn listar(&self, dir: u32) -> Result<Vec<(String, u32, bool)>, i64> {
+    /// (nome, inode, tipo da entrada) de cada entrada, sem `.` e `..`.
+    pub fn listar(&self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
         self.operar(|e| {
             Ok(e.entradas(dir)?
                 .into_iter()
                 .filter(|x| x.nome != "." && x.nome != "..")
-                .map(|x| (x.nome, x.inode, x.tipo == TIPO_ENTRADA_DIRETORIO))
+                .map(|x| (x.nome, x.inode, x.tipo))
                 .collect())
+        })
+    }
+
+    /// Cria um link simbólico `nome` em `dir`, apontando para `alvo`.
+    pub fn criar_link_simbolico(&self, dir: u32, nome: &str, alvo: &str, uid: u32, gid: u32) -> Result<u32, i64> {
+        self.operar(|e| {
+            if e.buscar(dir, nome).is_ok() {
+                return Err(EEXIST);
+            }
+            let numero = e.alocar_inode(false)?;
+            let mut inode = Inode([0; 128]);
+            inode.tocar();
+            wr16(&mut inode.0, 0, MODO_LINK | 0o777);
+            wr16(&mut inode.0, 2, uid as u16);
+            wr16(&mut inode.0, 24, gid as u16);
+            inode.definir_links(1);
+            if alvo.len() < 60 {
+                inode.0[40..40 + alvo.len()].copy_from_slice(alvo.as_bytes());
+                inode.definir_tamanho(alvo.len() as u64);
+                e.escrever_inode(numero, &inode)?;
+            } else {
+                e.escrever_inode(numero, &inode)?;
+                e.escrever_dados(numero, 0, alvo.as_bytes())?;
+            }
+            e.adicionar_entrada(dir, nome, numero, TIPO_ENTRADA_LINK)?;
+            Ok(numero)
+        })
+    }
+
+    /// Para onde o link aponta.
+    pub fn ler_link(&self, numero: u32) -> Result<String, i64> {
+        self.operar(|e| {
+            let inode = e.ler_inode(numero)?;
+            if !inode.eh_link() {
+                return Err(EINVAL);
+            }
+            let tamanho = inode.tamanho() as usize;
+            let bytes = if inode.eh_link_rapido() {
+                inode.0[40..40 + tamanho.min(60)].to_vec()
+            } else {
+                let mut buf = vec![0u8; tamanho];
+                let n = e.ler_dados(numero, 0, &mut buf)?;
+                buf.truncate(n);
+                buf
+            };
+            String::from_utf8(bytes).map_err(|_| EIO)
+        })
+    }
+
+    /// Link físico: mais um nome para o mesmo inode (não vale para diretórios).
+    pub fn criar_link(&self, dir: u32, nome: &str, numero: u32) -> Result<(), i64> {
+        self.operar(|e| {
+            if e.buscar(dir, nome).is_ok() {
+                return Err(EEXIST);
+            }
+            let mut inode = e.ler_inode(numero)?;
+            if inode.eh_diretorio() {
+                return Err(EPERM);
+            }
+            e.adicionar_entrada(dir, nome, numero, inode.tipo_entrada())?;
+            inode.definir_links(inode.links() + 1);
+            e.escrever_inode(numero, &inode)
         })
     }
 
@@ -510,6 +596,12 @@ impl Estado {
 
     /// Devolve todos os blocos do arquivo (inclusive os de índice).
     fn liberar_dados(&mut self, inode: &mut Inode) -> Result<(), i64> {
+        if inode.eh_link_rapido() {
+            // Aqui o i_block guarda texto, não números de bloco: não há nada para devolver.
+            inode.0[40..100].fill(0);
+            inode.definir_tamanho(0);
+            return Ok(());
+        }
         for i in 0..15 {
             let bloco = inode.bloco(i);
             if bloco != 0 {
@@ -792,9 +884,9 @@ impl Estado {
             }
             self.remover(dir_para, nome_para, false)?; // substitui um arquivo
         }
-        let diretorio = self.ler_inode(numero)?.eh_diretorio();
-        let tipo = if diretorio { TIPO_ENTRADA_DIRETORIO } else { TIPO_ENTRADA_ARQUIVO };
-        self.adicionar_entrada(dir_para, nome_para, numero, tipo)?;
+        let inode = self.ler_inode(numero)?;
+        let diretorio = inode.eh_diretorio();
+        self.adicionar_entrada(dir_para, nome_para, numero, inode.tipo_entrada())?;
         self.remover_entrada(dir_de, nome_de)?;
         if diretorio && dir_de != dir_para {
             // O ".." do diretório movido passa a apontar para o novo pai.

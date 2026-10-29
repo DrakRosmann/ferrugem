@@ -26,6 +26,7 @@
 //! exatamente de onde estava. O formato é o mesmo do Linux (para a libc).
 
 pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
 pub const SIGILL: u32 = 4;
 pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
@@ -33,9 +34,11 @@ pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
 pub const SIGALRM: u32 = 14;
 pub const SIGCHLD: u32 = 17;
-const SIGCONT: u32 = 18;
-const SIGSTOP: u32 = 19;
-const SIGTSTP: u32 = 20;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
 const SIGURG: u32 = 23;
 const SIGWINCH: u32 = 28;
 
@@ -48,6 +51,9 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 
 /// Sinais que ninguém pode bloquear nem tratar.
 pub const INBLOQUEAVEIS: u64 = (1 << SIGKILL) | (1 << SIGSTOP);
+
+/// Os que, por padrão, *param* o processo (até um SIGCONT).
+pub const PARADAS: u64 = (1 << SIGSTOP) | (1 << SIGTSTP) | (1 << SIGTTIN) | (1 << SIGTTOU);
 
 /// A `struct sigaction` do kernel Linux (32 bytes).
 #[derive(Clone, Copy, Default)]
@@ -64,10 +70,14 @@ impl Acao {
     }
 }
 
-/// O padrão destes é não fazer nada. (Ainda não há controle de jobs, então
-/// SIGSTOP/SIGTSTP também não param o processo.)
+/// O padrão destes é não fazer nada. (O SIGCONT faz seu trabalho — continuar
+/// um processo parado — no momento em que é enviado, não quando é entregue.)
 pub fn padrao_e_ignorar(sinal: u32) -> bool {
-    matches!(sinal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGSTOP | SIGTSTP)
+    matches!(sinal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
+}
+
+pub fn padrao_e_parar(sinal: u32) -> bool {
+    PARADAS & (1 << sinal) != 0
 }
 
 #[derive(Clone)]
@@ -101,6 +111,19 @@ impl Sinais {
         }
         self.pendentes |= 1 << sinal;
         true
+    }
+
+    /// Este sinal, agora, pararia o processo? (SIGSTOP sempre; os outros de
+    /// parar, se estiverem com a ação padrão e não bloqueados.)
+    pub fn pararia(&self, sinal: u32) -> bool {
+        sinal == SIGSTOP
+            || padrao_e_parar(sinal)
+                && self.acoes[sinal as usize].tratador == SIG_DFL
+                && self.bloqueados & (1 << sinal) == 0
+    }
+
+    pub fn ignora(&self, sinal: u32) -> bool {
+        self.ignorado(sinal) || self.bloqueados & (1 << sinal) != 0
     }
 
     /// Os que podem ser entregues agora (pendentes e não bloqueados).

@@ -51,6 +51,9 @@ fn iniciar_sessao(u: Usuario) -> ! {
         eprintln!("login: não consegui trocar de usuário");
         sys::sair(1);
     }
+    // Uma sessão nova, dona do terminal: daqui saem os jobs do shell.
+    let _ = sys::nova_sessao();
+    let _ = sys::dar_terminal(io::ENTRADA, sys::pid());
     if sys::mudar_diretorio(&u.casa).is_err() {
         eprintln!("login: diretório {} não existe; usando /", u.casa);
         let _ = sys::mudar_diretorio("/");

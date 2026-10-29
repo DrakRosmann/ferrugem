@@ -1,5 +1,6 @@
 //! kill — manda um sinal para processos. Padrão: SIGTERM (15).
-//! Exemplos: `kill 7`, `kill -9 7`, `kill -INT 7`.
+//! Exemplos: `kill 7`, `kill -9 7`, `kill -STOP 7`, `kill -CONT 7`.
+//! Um pid negativo é um grupo inteiro: `kill -- -7` (ou `kill -TERM -7`).
 
 #![no_std]
 #![no_main]
@@ -17,6 +18,9 @@ fn sinal(nome: &str) -> Option<i32> {
         "USR2" => Some(12),
         "ALRM" => Some(14),
         "TERM" => Some(15),
+        "CONT" => Some(18),
+        "STOP" => Some(19),
+        "TSTP" => Some(20),
         n => n.parse().ok(),
     }
 }
@@ -24,7 +28,9 @@ fn sinal(nome: &str) -> Option<i32> {
 fn principal(args: &[&str]) -> i32 {
     let mut numero = sys::SIGTERM;
     let mut pids = &args[1..];
-    if let Some(opcao) = pids.first().and_then(|a| a.strip_prefix('-')) {
+    if pids.first() == Some(&"--") {
+        pids = &pids[1..];
+    } else if let Some(opcao) = pids.first().filter(|a| a.parse::<i32>().is_err()).and_then(|a| a.strip_prefix('-')) {
         match sinal(opcao) {
             Some(s) => numero = s,
             None => {
@@ -33,6 +39,9 @@ fn principal(args: &[&str]) -> i32 {
             }
         }
         pids = &pids[1..];
+        if pids.first() == Some(&"--") {
+            pids = &pids[1..];
+        }
     }
     if pids.is_empty() {
         eprintln!("uso: kill [-SINAL] <pid>...");

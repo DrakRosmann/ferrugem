@@ -13,6 +13,14 @@
 //!   ls ~/docs                  ~ é o diretório pessoal
 //!   export NOME=valor; echo $NOME   variáveis de ambiente (passam para os programas)
 //!   sh -c 'ls | wc -l'         roda uma linha (é o que system() e popen() do C usam)
+//!   Ctrl+Z, jobs, fg, bg       controle de jobs
+//!
+//! ## Controle de jobs
+//!
+//! Cada pipeline vira um *grupo de processos* (um "job"), e o shell entrega o
+//! terminal ao grupo que está em primeiro plano. Assim o Ctrl+C e o Ctrl+Z do
+//! teclado chegam só nele. Ctrl+Z *para* o job (SIGTSTP); `fg` devolve o
+//! terminal a ele e manda SIGCONT; `bg` o deixa continuar em segundo plano.
 //!   'texto com espaços'        aspas simples ou duplas
 //! ```
 //!
@@ -52,7 +60,13 @@ fn prompt() -> String {
 fn principal(args: &[&str]) -> i32 {
     // Ctrl+C mata o programa que está rodando, não o shell.
     sys::ignorar_sinal(sys::SIGINT, true);
-    let mut shell = Shell { ultimo_status: 0, ambiente: ambiente().iter().map(|v| String::from(*v)).collect() };
+    let mut shell = Shell {
+        ultimo_status: 0,
+        ambiente: ambiente().iter().map(|v| String::from(*v)).collect(),
+        interativo: false,
+        meu_grupo: sys::grupo(),
+        jobs: Vec::new(),
+    };
 
     // `sh -c "comando"`: é assim que system() e popen() da libc chamam o shell.
     if args.get(1) == Some(&"-c") {
@@ -78,6 +92,16 @@ fn principal(args: &[&str]) -> i32 {
         return shell.ultimo_status;
     }
 
+    // Shell interativo: um grupo só dele, dono do terminal, e imune aos sinais
+    // de parar (quem para é o job, não o shell).
+    shell.interativo = true;
+    for sinal in [sys::SIGTSTP, sys::SIGTTIN, sys::SIGTTOU] {
+        sys::ignorar_sinal(sinal, true);
+    }
+    let _ = sys::mudar_grupo(0, 0);
+    shell.meu_grupo = sys::grupo();
+    let _ = sys::dar_terminal(0, shell.meu_grupo);
+
     let mut entrada = Leitor::new(0);
     loop {
         shell.recolher_segundo_plano();
@@ -86,7 +110,7 @@ fn principal(args: &[&str]) -> i32 {
             Ok(Some(linha)) => shell.executar_linha(&linha),
             Ok(None) => {
                 println!("exit");
-                return shell.ultimo_status;
+                shell.sair(shell.ultimo_status);
             }
             Err(e) if e == sys::EINTR => {} // Ctrl+C: prompt novo
             Err(e) => {
@@ -305,6 +329,31 @@ struct Shell {
     ultimo_status: i32,
     /// As variáveis de ambiente que os programas vão herdar ("NOME=valor").
     ambiente: Vec<String>,
+    /// Com controle de jobs (no terminal) ou não (scripts e `sh -c`).
+    interativo: bool,
+    meu_grupo: i32,
+    jobs: Vec<Job>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum EstadoJob {
+    Rodando,
+    Parado,
+}
+
+/// Um pipeline que ainda não terminou: em segundo plano ou parado.
+struct Job {
+    numero: usize,
+    pgid: i32,
+    /// Os processos dele que ainda não terminaram.
+    pids: Vec<i32>,
+    texto: String,
+    estado: EstadoJob,
+}
+
+fn texto_do_pipeline(p: &Pipeline) -> String {
+    let partes: Vec<String> = p.comandos.iter().map(|c| c.args.join(" ")).collect();
+    partes.join(" | ")
 }
 
 fn status_para_codigo(status: i32) -> i32 {
@@ -348,6 +397,10 @@ impl Shell {
                 self.ultimo_status = status;
                 return;
             }
+            if let Some(status) = self.controle_de_jobs(&p.comandos[0]) {
+                self.ultimo_status = status;
+                return;
+            }
             if let Some(status) = interno(&p.comandos[0]) {
                 self.ultimo_status = status;
                 return;
@@ -356,6 +409,7 @@ impl Shell {
 
         let n = p.comandos.len();
         let mut pids = Vec::new();
+        let mut pgid = 0; // o grupo do job é o pid do primeiro processo
         let mut entrada_anterior: Option<i32> = None;
         for (i, comando) in p.comandos.iter().enumerate() {
             let pipe = if i + 1 < n {
@@ -369,9 +423,19 @@ impl Shell {
             } else {
                 None
             };
+            let grupo = self.interativo.then_some(pgid);
             match sys::fork() {
-                Ok(0) => filho(comando, entrada_anterior, pipe, p.fundo, &self.ambiente),
-                Ok(pid) => pids.push(pid),
+                Ok(0) => filho(comando, entrada_anterior, pipe, p.fundo, &self.ambiente, grupo),
+                Ok(pid) => {
+                    if self.interativo {
+                        if pgid == 0 {
+                            pgid = pid;
+                        }
+                        // O filho também faz isso; fazer nos dois evita depender de quem roda antes.
+                        let _ = sys::mudar_grupo(pid, pgid);
+                    }
+                    pids.push(pid);
+                }
                 Err(e) => eprintln!("sh: fork: {}", e),
             }
             // O pai não usa as pontas dos pipes: fecha, senão o leitor nunca
@@ -388,25 +452,121 @@ impl Shell {
             let _ = sys::fechar(fd);
         }
 
-        if p.fundo {
-            if let Some(pid) = pids.last() {
-                println!("[{}]", pid);
-            }
+        if pids.is_empty() {
             return;
         }
-        let nome = &p.comandos[0].args[0];
-        for (i, pid) in pids.iter().enumerate() {
-            let Ok((_, status)) = sys::esperar(*pid) else { continue };
-            if i + 1 == pids.len() {
+        let job = Job {
+            numero: self.jobs.iter().map(|j| j.numero).max().unwrap_or(0) + 1,
+            pgid: if self.interativo { pgid } else { pids[0] },
+            pids,
+            texto: texto_do_pipeline(&p),
+            estado: EstadoJob::Rodando,
+        };
+        if p.fundo {
+            println!("[{}] {}", job.numero, job.pids.last().unwrap_or(&0));
+            self.jobs.push(job);
+            return;
+        }
+        self.primeiro_plano(job);
+    }
+
+    /// Dá o terminal ao job e espera ele terminar ou parar (Ctrl+Z).
+    fn primeiro_plano(&mut self, mut job: Job) {
+        if self.interativo {
+            let _ = sys::dar_terminal(0, job.pgid);
+        }
+        let ultimo = *job.pids.last().unwrap_or(&0);
+        let opcoes = if self.interativo { sys::WUNTRACED } else { 0 };
+        while let Some(&pid) = job.pids.first() {
+            let status = match sys::esperar_com(pid, opcoes) {
+                Ok(Some((_, status))) => status,
+                _ => {
+                    job.pids.remove(0);
+                    continue;
+                }
+            };
+            if let Some(sinal) = sys::sinal_que_parou(status) {
+                job.estado = EstadoJob::Parado;
+                println!("[{}]+  {:<10} {}", job.numero, "Parado", job.texto);
+                self.ultimo_status = 128 + sinal;
+                self.jobs.push(job);
+                break;
+            }
+            job.pids.remove(0);
+            if pid == ultimo {
                 self.ultimo_status = status_para_codigo(status);
             }
             if let Some(sinal) = sys::sinal_que_matou(status) {
                 // Ctrl+C e pipe quebrado são normais; o resto merece aviso.
                 if sinal != sys::SIGINT && sinal != 13 {
-                    eprintln!("{}: {} (sinal {})", nome, sys::nome_do_sinal(sinal), sinal);
+                    eprintln!("{}: {} (sinal {})", job.texto, sys::nome_do_sinal(sinal), sinal);
                 }
             }
         }
+        if self.interativo {
+            let _ = sys::dar_terminal(0, self.meu_grupo); // o terminal volta para o shell
+        }
+    }
+
+    /// O job escolhido por `%N` (ou o mais recente). Sai da lista.
+    fn tirar_job(&mut self, escolha: Option<&String>) -> Option<Job> {
+        let i = match escolha {
+            None => self.jobs.len().checked_sub(1)?,
+            Some(e) => {
+                let numero: usize = e.trim_start_matches('%').parse().ok()?;
+                self.jobs.iter().position(|j| j.numero == numero)?
+            }
+        };
+        Some(self.jobs.remove(i))
+    }
+
+    /// `jobs`, `fg` e `bg`.
+    fn controle_de_jobs(&mut self, comando: &Comando) -> Option<i32> {
+        let args = &comando.args;
+        match args[0].as_str() {
+            "jobs" => {
+                for (i, j) in self.jobs.iter().enumerate() {
+                    let marca = if i + 1 == self.jobs.len() { '+' } else { ' ' };
+                    let estado = if j.estado == EstadoJob::Parado { "Parado" } else { "Rodando" };
+                    println!("[{}]{}  {:<10} {}", j.numero, marca, estado, j.texto);
+                }
+                Some(0)
+            }
+            "fg" | "bg" => {
+                let Some(mut job) = self.tirar_job(args.get(1)) else {
+                    eprintln!("{}: job não existe", args[0]);
+                    return Some(1);
+                };
+                let parado = job.estado == EstadoJob::Parado;
+                job.estado = EstadoJob::Rodando;
+                if args[0] == "bg" {
+                    println!("[{}]+ {} &", job.numero, job.texto);
+                    let _ = sys::matar(-job.pgid, sys::SIGCONT);
+                    self.jobs.push(job);
+                    return Some(0);
+                }
+                println!("{}", job.texto);
+                if self.interativo {
+                    let _ = sys::dar_terminal(0, job.pgid); // antes do SIGCONT: ele pode ler na hora
+                }
+                if parado {
+                    let _ = sys::matar(-job.pgid, sys::SIGCONT);
+                }
+                self.primeiro_plano(job);
+                Some(self.ultimo_status)
+            }
+            "exit" => self.sair(args.get(1).and_then(|c| c.parse().ok()).unwrap_or(0)),
+            _ => None,
+        }
+    }
+
+    /// Jobs parados ficariam parados para sempre depois que o shell sai: encerra.
+    fn sair(&self, codigo: i32) -> ! {
+        for job in self.jobs.iter().filter(|j| j.estado == EstadoJob::Parado) {
+            let _ = sys::matar(-job.pgid, sys::SIGTERM);
+            let _ = sys::matar(-job.pgid, sys::SIGCONT);
+        }
+        sys::sair(codigo)
     }
 
     /// `export NOME=valor` e `unset NOME`.
@@ -438,20 +598,58 @@ impl Shell {
         }
     }
 
-    fn recolher_segundo_plano(&self) {
-        while let Ok(Some((pid, status))) = sys::recolher_terminado() {
-            match sys::sinal_que_matou(status) {
-                Some(sinal) => println!("[{}] {}", pid, sys::nome_do_sinal(sinal)),
-                None => println!("[{}] concluído ({})", pid, status_para_codigo(status)),
+    /// Antes de cada prompt: quem, em segundo plano, terminou ou parou?
+    fn recolher_segundo_plano(&mut self) {
+        while let Ok(Some((pid, status))) = sys::esperar_com(-1, sys::WNOHANG | sys::WUNTRACED) {
+            let Some(i) = self.jobs.iter().position(|j| j.pids.contains(&pid)) else { continue };
+            if let Some(sinal) = sys::sinal_que_parou(status) {
+                let job = &mut self.jobs[i];
+                if job.estado != EstadoJob::Parado {
+                    job.estado = EstadoJob::Parado;
+                    println!("[{}]+  {} ({})", job.numero, job.texto, sys::nome_do_sinal(sinal));
+                }
+                continue;
+            }
+            let job = &mut self.jobs[i];
+            job.pids.retain(|&p| p != pid);
+            if job.pids.is_empty() {
+                let como = match sys::sinal_que_matou(status) {
+                    Some(sinal) => String::from(sys::nome_do_sinal(sinal)),
+                    None => match status_para_codigo(status) {
+                        0 => String::from("Concluído"),
+                        c => format!("Saiu com {}", c),
+                    },
+                };
+                println!("[{}]   {:<10} {}", job.numero, como, job.texto);
+                self.jobs.remove(i);
             }
         }
     }
 }
 
 /// O que roda no processo filho: arruma os descritores e troca de programa.
-fn filho(comando: &Comando, entrada: Option<i32>, pipe: Option<(i32, i32)>, fundo: bool, ambiente: &[String]) -> ! {
-    if !fundo {
-        sys::ignorar_sinal(sys::SIGINT, false);
+/// `grupo`: com controle de jobs, o grupo onde entrar (0 = começar um novo).
+fn filho(
+    comando: &Comando,
+    entrada: Option<i32>,
+    pipe: Option<(i32, i32)>,
+    fundo: bool,
+    ambiente: &[String],
+    grupo: Option<i32>,
+) -> ! {
+    match grupo {
+        Some(pgid) => {
+            let _ = sys::mudar_grupo(0, pgid);
+            if !fundo {
+                let _ = sys::dar_terminal(0, sys::grupo());
+            }
+            // O programa volta a reagir ao teclado normalmente.
+            for sinal in [sys::SIGINT, sys::SIGTSTP, sys::SIGTTIN, sys::SIGTTOU] {
+                sys::ignorar_sinal(sinal, false);
+            }
+        }
+        None if !fundo => sys::ignorar_sinal(sys::SIGINT, false),
+        None => {}
     }
     if let Some(fd) = entrada {
         let _ = sys::duplicar_para(fd, 0);
@@ -531,7 +729,7 @@ fn interno(comando: &Comando) -> Option<i32> {
 }
 
 fn ajuda() {
-    println!("\x1b[1mComandos internos do shell:\x1b[0m cd, pwd, export, unset, exit (encerra a sessão), ajuda");
+    println!("\x1b[1mComandos internos do shell:\x1b[0m cd, pwd, export, unset, jobs, fg, bg, exit, ajuda");
     println!("\x1b[1mProgramas em /bin:\x1b[0m");
     if let Ok(mut programas) = sys::listar_diretorio("/bin") {
         programas.sort_by(|a, b| a.nome.cmp(&b.nome));
@@ -547,5 +745,5 @@ fn ajuda() {
         println!("{}", linha);
     }
     println!("\x1b[1mOperadores:\x1b[0m  a | b   a > arq   a >> arq   a < arq   a &   a ; b   $?");
-    println!("\x1b[1mTeclas:\x1b[0m  Ctrl+C interrompe   Ctrl+D fim de entrada");
+    println!("\x1b[1mTeclas:\x1b[0m  Ctrl+C interrompe   Ctrl+Z para (depois: fg ou bg)   Ctrl+D fim de entrada");
 }

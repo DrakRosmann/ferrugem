@@ -9,7 +9,8 @@ use ulib::*;
 programa!(principal);
 
 fn apagar(caminho: &str, recursivo: bool) -> Result<(), sys::Erro> {
-    let info = sys::stat(caminho)?;
+    // lstat: um link para um diretório é só um link; apagar não pode entrar nele.
+    let info = sys::lstat(caminho)?;
     if !info.eh_diretorio() {
         return sys::remover(caminho);
     }

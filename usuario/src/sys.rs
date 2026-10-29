@@ -33,6 +33,7 @@ pub const EACCES: Erro = Erro(13);
 pub const ECHILD: Erro = Erro(10);
 pub const EEXIST: Erro = Erro(17);
 pub const EXDEV: Erro = Erro(18);
+pub const ELOOP: Erro = Erro(40);
 
 impl Erro {
     pub fn descricao(self) -> &'static str {
@@ -63,6 +64,7 @@ impl Erro {
             36 => "nome longo demais",
             38 => "não implementado",
             39 => "diretório não está vazio",
+            40 => "links simbólicos demais (um laço?)",
             _ => "erro desconhecido",
         }
     }
@@ -205,6 +207,9 @@ impl Stat {
     pub fn eh_dispositivo(&self) -> bool {
         self.modo & 0o170000 == 0o020000
     }
+    pub fn eh_link(&self) -> bool {
+        self.modo & 0o170000 == 0o120000
+    }
 }
 
 fn decodificar_stat(b: &[u8; 144]) -> Stat {
@@ -223,6 +228,34 @@ pub fn stat(caminho: &str) -> Resultado<Stat> {
     let mut b = [0u8; 144];
     conferir(unsafe { syscall(4, c.as_ptr() as u64, b.as_mut_ptr() as u64, 0, 0) })?;
     Ok(decodificar_stat(&b))
+}
+
+/// Como `stat`, mas se o caminho for um link simbólico, fala do próprio link.
+pub fn lstat(caminho: &str) -> Resultado<Stat> {
+    let c = string_c(caminho);
+    let mut b = [0u8; 144];
+    conferir(unsafe { syscall(6, c.as_ptr() as u64, b.as_mut_ptr() as u64, 0, 0) })?;
+    Ok(decodificar_stat(&b))
+}
+
+/// Cria `caminho` como um link simbólico para `alvo`.
+pub fn criar_link_simbolico(alvo: &str, caminho: &str) -> Resultado<()> {
+    let (a, c) = (string_c(alvo), string_c(caminho));
+    conferir(unsafe { syscall(88, a.as_ptr() as u64, c.as_ptr() as u64, 0, 0) }).map(|_| ())
+}
+
+/// Cria `novo` como mais um nome (link físico) para `existente`.
+pub fn criar_link(existente: &str, novo: &str) -> Resultado<()> {
+    let (a, c) = (string_c(existente), string_c(novo));
+    conferir(unsafe { syscall(86, a.as_ptr() as u64, c.as_ptr() as u64, 0, 0) }).map(|_| ())
+}
+
+/// Para onde um link simbólico aponta.
+pub fn ler_link(caminho: &str) -> Resultado<String> {
+    let c = string_c(caminho);
+    let mut buf = [0u8; 4096];
+    let n = conferir(unsafe { syscall(89, c.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0) })?;
+    Ok(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
 }
 
 pub fn fstat(fd: i32) -> Resultado<Stat> {
@@ -361,9 +394,46 @@ pub fn esperar(pid: i32) -> Resultado<(i32, i32)> {
 
 /// Como `esperar(-1)`, mas não bloqueia: `Ok(None)` se nenhum filho terminou.
 pub fn recolher_terminado() -> Resultado<Option<(i32, i32)>> {
+    esperar_com(-1, WNOHANG)
+}
+
+pub const WNOHANG: u64 = 1;
+/// Também avisa quando um filho *para* (Ctrl+Z), não só quando termina.
+pub const WUNTRACED: u64 = 2;
+
+/// O `waitpid` completo. `pid`: > 0 um filho, -1 qualquer, -N o grupo N.
+/// `Ok(None)` só com WNOHANG, se ninguém mudou de estado.
+pub fn esperar_com(pid: i32, opcoes: u64) -> Resultado<Option<(i32, i32)>> {
     let mut status = 0i32;
-    let p = conferir(unsafe { syscall(61, -1i64 as u64, &raw mut status as u64, 1, 0) })?;
+    let p = conferir(unsafe { syscall(61, pid as i64 as u64, &raw mut status as u64, opcoes, 0) })?;
     Ok(if p == 0 { None } else { Some((p as i32, status)) })
+}
+
+/// `Some(sinal)` se o status diz que o processo *parou* (WUNTRACED).
+pub fn sinal_que_parou(status: i32) -> Option<i32> {
+    if status & 0xFF == 0x7F { Some((status >> 8) & 0xFF) } else { None }
+}
+
+// ------------------------------------------------- grupos de processos e terminal
+
+/// Põe o processo `pid` (0 = eu) no grupo `pgid` (0 = um grupo novo, com o número dele).
+pub fn mudar_grupo(pid: i32, pgid: i32) -> Resultado<()> {
+    conferir(unsafe { syscall(109, pid as u64, pgid as u64, 0, 0) }).map(|_| ())
+}
+
+pub fn grupo() -> i32 {
+    unsafe { syscall(111, 0, 0, 0, 0) as i32 }
+}
+
+/// Começa uma sessão nova, com este processo como líder.
+pub fn nova_sessao() -> Resultado<i32> {
+    conferir(unsafe { syscall(112, 0, 0, 0, 0) }).map(|s| s as i32)
+}
+
+/// Entrega o terminal (teclado e sinais do teclado) a um grupo.
+pub fn dar_terminal(fd: i32, pgid: i32) -> Resultado<()> {
+    let grupo = pgid;
+    conferir(unsafe { syscall(16, fd as u64, 0x5410, &raw const grupo as u64, 0) }).map(|_| ())
 }
 
 /// `Some(código)` se o processo terminou chamando `exit`.
@@ -384,6 +454,11 @@ pub const SIGUSR2: i32 = 12;
 pub const SIGALRM: i32 = 14;
 pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;
+pub const SIGCONT: i32 = 18;
+pub const SIGSTOP: i32 = 19;
+pub const SIGTSTP: i32 = 20;
+pub const SIGTTIN: i32 = 21;
+pub const SIGTTOU: i32 = 22;
 
 pub fn nome_do_sinal(sinal: i32) -> &'static str {
     match sinal {
@@ -397,6 +472,11 @@ pub fn nome_do_sinal(sinal: i32) -> &'static str {
         13 => "pipe quebrado",
         14 => "alarme",
         15 => "terminado",
+        18 => "continuado",
+        19 => "parado (SIGSTOP)",
+        20 => "parado",
+        21 => "parado (leu o terminal em segundo plano)",
+        22 => "parado (escreveu no terminal em segundo plano)",
         _ => "sinal",
     }
 }
@@ -520,6 +600,7 @@ pub fn reiniciar() -> Erro {
 pub struct InfoProcesso {
     pub pid: u32,
     pub pai: u32,
+    pub pgid: u32,
     pub uid: u32,
     pub estado: u32,
     pub memoria_kib: u64,
@@ -535,11 +616,12 @@ pub fn processos() -> Vec<InfoProcesso> {
             let r = &buf[i * 64..(i + 1) * 64];
             let u32_em = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
             let u64_em = |o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
-            let nome = &r[32..64];
-            let fim = nome.iter().position(|&b| b == 0).unwrap_or(32);
+            let nome = &r[32..60];
+            let fim = nome.iter().position(|&b| b == 0).unwrap_or(28);
             InfoProcesso {
                 pid: u32_em(0),
                 pai: u32_em(4),
+                pgid: u32_em(60),
                 estado: u32_em(8),
                 uid: u32_em(12),
                 memoria_kib: u64_em(16),

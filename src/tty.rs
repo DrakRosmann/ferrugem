@@ -5,11 +5,18 @@
 //! quando você aperta Enter. Ele também transforma teclas especiais:
 //!
 //! ```text
-//!   Ctrl+C  → sinal SIGINT para os programas do terminal
+//!   Ctrl+C  → SIGINT para o grupo em primeiro plano (interrompe)
+//!   Ctrl+Z  → SIGTSTP para o grupo em primeiro plano (para; o shell retoma com fg/bg)
+//!   Ctrl+\  → SIGQUIT
 //!   Ctrl+D  → fim de arquivo (o `read` devolve 0) se a linha estiver vazia
 //! ```
+//!
+//! O terminal tem um grupo de processos em *primeiro plano*: o job que o
+//! shell deixou "com o teclado". Só ele recebe os sinais do teclado, e só ele
+//! pode ler: um processo de segundo plano que tenta ler é parado (SIGTTIN).
 
-use crate::erro::{EFAULT, EINTR, ENOTTY};
+use crate::erro::{EFAULT, EINTR, EIO, ENOTTY, ERESTARTSYS};
+use crate::sinal;
 use crate::processo;
 use crate::spin::Mutex;
 use crate::{print, println};
@@ -24,6 +31,8 @@ struct Tty {
     /// A `struct termios` do Linux (36 bytes): os programas ligam e desligam
     /// o eco e o modo canônico com ioctl(TCSETS). O que importa aqui é c_lflag.
     termios: [u8; 36],
+    /// O grupo em primeiro plano (0 = ninguém definiu ainda: os sinais vão para todos).
+    primeiro_plano: u32,
 }
 
 const ISIG: u32 = 0o1;
@@ -64,6 +73,7 @@ static TTY: Mutex<Tty> = Mutex::new(Tty {
     fins: 0,
     interrupcoes: 0,
     termios: TERMIOS_PADRAO,
+    primeiro_plano: 0,
 });
 
 impl Tty {
@@ -95,9 +105,22 @@ pub fn ioctl(pedido: u64, dados: Option<&[u8]>, pid: u32) -> Result<alloc::vec::
             Ok(alloc::vec::Vec::new())
         }
         TIOCGWINSZ => Ok(alloc::vec![25, 0, 80, 0, 0, 0, 0, 0]), // 25 linhas, 80 colunas
-        TIOCGPGRP => Ok(pid.to_le_bytes().to_vec()),
-        TIOCSPGRP => Ok(alloc::vec::Vec::new()),
+        TIOCGPGRP => Ok((if tty.primeiro_plano != 0 { tty.primeiro_plano } else { pid }).to_le_bytes().to_vec()),
+        TIOCSPGRP => {
+            let grupo = dados.filter(|d| d.len() >= 4).ok_or(EFAULT)?;
+            tty.primeiro_plano = u32::from_le_bytes(grupo[..4].try_into().unwrap());
+            Ok(alloc::vec::Vec::new())
+        }
         _ => Err(ENOTTY),
+    }
+}
+
+/// Manda um sinal do teclado para quem está em primeiro plano.
+fn sinal_do_teclado(grupo: u32, numero: u32) {
+    if grupo != 0 {
+        processo::sinal_para_grupo(grupo, numero);
+    } else {
+        processo::sinal_para_grupo_todos(numero);
     }
 }
 
@@ -105,7 +128,17 @@ pub fn ioctl(pedido: u64, dados: Option<&[u8]>, pid: u32) -> Result<alloc::vec::
 pub fn receber(c: char) {
     let mut tty = TTY.lock();
     let lflag = tty.lflag();
-    if c == '\u{3}' && lflag & ISIG == 0 || lflag & ICANON == 0 && c != '\u{3}' {
+    let grupo = tty.primeiro_plano;
+    if lflag & ISIG != 0 && (c == '\u{1a}' || c == '\u{1c}') {
+        let (eco, numero) = if c == '\u{1a}' { ("^Z", sinal::SIGTSTP) } else { ("^\\", sinal::SIGQUIT) };
+        tty.linha.clear();
+        drop(tty);
+        println!("{}", eco);
+        sinal_do_teclado(grupo, numero);
+        return;
+    }
+    let especial = c == '\u{3}' && lflag & ISIG != 0;
+    if lflag & ICANON == 0 && !especial {
         // Modo "cru" (editores, jogos): cada tecla vai direto para o programa.
         let c = if c == '\u{8}' { '\u{7f}' } else { c };
         let mut utf8 = [0u8; 4];
@@ -123,7 +156,7 @@ pub fn receber(c: char) {
             tty.interrupcoes += 1;
             drop(tty);
             println!("^C");
-            processo::sinal_para_o_terminal(processo::SIGINT);
+            sinal_do_teclado(grupo, processo::SIGINT);
             processo::acordar(processo::CANAL_TERMINAL);
         }
         '\u{4}' => {
@@ -166,6 +199,17 @@ fn receber_normal(tty: &mut Tty, c: char, eco: bool) {
 
 /// Entrega no máximo uma linha. Dorme enquanto não houver nenhuma pronta.
 pub fn ler(buf: &mut [u8]) -> Result<usize, i64> {
+    // Quem não está em primeiro plano não lê o teclado: o grupo dele é parado
+    // com SIGTTIN, e esta chamada é refeita quando ele voltar (com `fg`).
+    let primeiro_plano = TTY.lock().primeiro_plano;
+    let (meu_grupo, _) = processo::grupo_e_sessao(0)?;
+    if primeiro_plano != 0 && meu_grupo != primeiro_plano {
+        if processo::atual().sinais.ignora(sinal::SIGTTIN) {
+            return Err(EIO);
+        }
+        processo::sinal_para_grupo(meu_grupo, sinal::SIGTTIN);
+        return Err(ERESTARTSYS);
+    }
     let interrupcoes_antes = TTY.lock().interrupcoes;
     loop {
         {

@@ -28,3 +28,8 @@ pub const ERANGE: i64 = 34;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
+pub const ELOOP: i64 = 40;
+
+/// Interno do kernel (o programa nunca vê): "refaça esta chamada de sistema
+/// quando o processo voltar a rodar". Usado quando ele é parado no meio dela.
+pub const ERESTARTSYS: i64 = 512;

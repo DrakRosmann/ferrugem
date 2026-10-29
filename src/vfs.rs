@@ -13,6 +13,13 @@
 //! Os caminhos que chegam aqui já estão normalizados e absolutos
 //! (`/home/../bin/./ls` vira `/bin/ls`; veja `normalizar`).
 //!
+//! ## Links
+//!
+//! Um link *simbólico* é um arquivo que contém um caminho; ao encontrá-lo no
+//! meio de uma busca, continuamos a partir do caminho que ele guarda. Um link
+//! *físico* é só mais um nome para o mesmo nó (o mesmo `Arc<No>`, ou o mesmo
+//! inode no ext2): o arquivo só some quando o último nome for apagado.
+//!
 //! ## Permissões
 //!
 //! Todo arquivo tem um dono, um grupo e 9 bits de permissão, em três trios:
@@ -45,6 +52,8 @@ pub enum Conteudo {
     Arquivo(Vec<u8>),
     Diretorio(BTreeMap<String, Arc<No>>),
     Dispositivo(Dispositivo),
+    /// Link simbólico: o caminho para onde aponta.
+    Link(String),
     /// Ponto de montagem: daqui para baixo, quem responde é o disco.
     Montagem(Arc<Ext2>),
 }
@@ -106,6 +115,7 @@ pub enum Tipo {
     Arquivo,
     Diretorio,
     Dispositivo(Dispositivo),
+    Link,
 }
 
 /// Qualquer arquivo ou diretório, esteja na memória ou no disco.
@@ -133,6 +143,7 @@ fn meta_padrao(conteudo: &Conteudo) -> Meta {
     Meta::de_root(match conteudo {
         Conteudo::Arquivo(_) => 0o644,
         Conteudo::Dispositivo(_) => 0o666,
+        Conteudo::Link(_) => 0o777,
         _ => 0o755,
     })
 }
@@ -156,9 +167,17 @@ impl Vnode {
                 Conteudo::Arquivo(_) => Tipo::Arquivo,
                 Conteudo::Diretorio(_) | Conteudo::Montagem(_) => Tipo::Diretorio,
                 Conteudo::Dispositivo(d) => Tipo::Dispositivo(*d),
+                Conteudo::Link(_) => Tipo::Link,
             }),
             Vnode::Disco(fs, inode) => {
-                Ok(if fs.info(*inode)?.diretorio { Tipo::Diretorio } else { Tipo::Arquivo })
+                let info = fs.info(*inode)?;
+                Ok(if info.diretorio {
+                    Tipo::Diretorio
+                } else if info.link {
+                    Tipo::Link
+                } else {
+                    Tipo::Arquivo
+                })
             }
         }
     }
@@ -177,6 +196,7 @@ impl Vnode {
             Vnode::Memoria(no) => Ok(match &*no.conteudo.lock() {
                 Conteudo::Arquivo(dados) => dados.len() as u64,
                 Conteudo::Diretorio(filhos) => filhos.len() as u64,
+                Conteudo::Link(alvo) => alvo.len() as u64,
                 _ => 0,
             }),
             Vnode::Disco(fs, inode) => fs.info(*inode).map(|i| i.tamanho),
@@ -206,6 +226,17 @@ impl Vnode {
                 Ok(())
             }
             Vnode::Disco(fs, inode) => fs.alterar(*inode, permissoes, uid, gid),
+        }
+    }
+
+    /// Para onde um link simbólico aponta.
+    pub fn ler_link(&self) -> Result<String, i64> {
+        match self {
+            Vnode::Memoria(no) => match &*no.conteudo.lock() {
+                Conteudo::Link(alvo) => Ok(alvo.clone()),
+                _ => Err(EINVAL),
+            },
+            Vnode::Disco(fs, inode) => fs.ler_link(*inode),
         }
     }
 
@@ -302,7 +333,14 @@ impl Vnode {
             Vnode::Disco(fs, inode) => Ok(fs
                 .listar(*inode)?
                 .into_iter()
-                .map(|(nome, i, dir)| (nome, 0x1_0000_0000 + i as u64, if dir { Tipo::Diretorio } else { Tipo::Arquivo }))
+                .map(|(nome, i, tipo)| {
+                    let tipo = match tipo {
+                        ext2::TIPO_ENTRADA_DIRETORIO => Tipo::Diretorio,
+                        ext2::TIPO_ENTRADA_LINK => Tipo::Link,
+                        _ => Tipo::Arquivo,
+                    };
+                    (nome, 0x1_0000_0000 + i as u64, tipo)
+                })
                 .collect()),
         }
     }
@@ -345,12 +383,60 @@ pub fn disco() -> Option<Arc<Ext2>> {
 
 /// Como `buscar`, mas exigindo permissão de atravessar (`x`) cada diretório do caminho.
 pub fn buscar_como(caminho: &str, cred: Cred) -> Result<Vnode, i64> {
-    let mut atual = raiz();
-    for parte in caminho.split('/').filter(|p| !p.is_empty()) {
-        atual.permite(cred, EXECUTAR)?;
-        atual = atual.filho(parte)?;
+    resolver(caminho, Some(cred), true)
+}
+
+/// Como `buscar_como`, mas se o último componente for um link, devolve o
+/// próprio link (para `lstat`, `readlink`, `unlink`...).
+pub fn buscar_como_sem_seguir(caminho: &str, cred: Cred) -> Result<Vnode, i64> {
+    resolver(caminho, Some(cred), false)
+}
+
+/// Quantos links seguidos uma busca aceita antes de desistir (um link pode
+/// apontar para si mesmo, direta ou indiretamente).
+const MAX_SALTOS: usize = 40;
+
+/// Anda pelo caminho, componente por componente, seguindo links simbólicos.
+fn resolver(caminho: &str, cred: Option<Cred>, seguir_ultimo: bool) -> Result<Vnode, i64> {
+    let mut pendentes: alloc::collections::VecDeque<String> =
+        caminho.split('/').filter(|p| !p.is_empty()).map(String::from).collect();
+    // A pilha de diretórios até aqui: o ".." de dentro de um link volta nela.
+    let mut pilha = alloc::vec![raiz()];
+    let mut saltos = 0;
+    while let Some(parte) = pendentes.pop_front() {
+        let atual = pilha.last().unwrap().clone();
+        match parte.as_str() {
+            "." => continue,
+            ".." => {
+                if pilha.len() > 1 {
+                    pilha.pop();
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(c) = cred {
+            atual.permite(c, EXECUTAR)?;
+        }
+        let filho = atual.filho(&parte)?;
+        let e_o_ultimo = pendentes.is_empty();
+        if filho.tipo()? == Tipo::Link && (!e_o_ultimo || seguir_ultimo) {
+            saltos += 1;
+            if saltos > MAX_SALTOS {
+                return Err(ELOOP);
+            }
+            let alvo = filho.ler_link()?;
+            if alvo.starts_with('/') {
+                pilha.truncate(1);
+            }
+            for p in alvo.split('/').filter(|p| !p.is_empty()).rev() {
+                pendentes.push_front(String::from(p));
+            }
+            continue;
+        }
+        pilha.push(filho);
     }
-    Ok(atual)
+    Ok(pilha.pop().unwrap())
 }
 
 fn raiz() -> Vnode {
@@ -383,12 +469,48 @@ pub fn normalizar(base: &str, caminho: &str) -> String {
     resultado
 }
 
+/// Acha um caminho (seguindo links), sem conferir permissões: uso interno do kernel.
 pub fn buscar(caminho: &str) -> Result<Vnode, i64> {
-    let mut atual = raiz();
-    for parte in caminho.split('/').filter(|p| !p.is_empty()) {
-        atual = atual.filho(parte)?;
+    resolver(caminho, None, true)
+}
+
+pub fn buscar_sem_seguir(caminho: &str) -> Result<Vnode, i64> {
+    resolver(caminho, None, false)
+}
+
+/// Cria um link simbólico em `caminho` apontando para `alvo`.
+pub fn criar_link_simbolico(caminho: &str, alvo: &str, meta: Meta) -> Result<(), i64> {
+    let (pai, nome) = separar(caminho)?;
+    match buscar(pai)? {
+        Vnode::Memoria(_) => criar_na_memoria(caminho, Conteudo::Link(String::from(alvo)), Some(meta)),
+        Vnode::Disco(fs, dir) => fs.criar_link_simbolico(dir, nome, alvo, meta.uid, meta.gid).map(|_| ()),
     }
-    Ok(atual)
+}
+
+/// Link físico: `novo` vira mais um nome para o arquivo `existente`.
+pub fn criar_link(existente: &str, novo: &str) -> Result<(), i64> {
+    let alvo = buscar_sem_seguir(existente)?;
+    if alvo.tipo()? == Tipo::Diretorio {
+        return Err(EPERM); // links para diretórios criariam ciclos na árvore
+    }
+    let (pai, nome) = separar(novo)?;
+    let pai = buscar(pai)?;
+    if !pai.mesmo_sistema(&alvo) {
+        return Err(EXDEV);
+    }
+    match (pai, alvo) {
+        (Vnode::Disco(fs, dir), Vnode::Disco(_, inode)) => fs.criar_link(dir, nome, inode),
+        (Vnode::Memoria(dir), Vnode::Memoria(no)) => {
+            let mut c = dir.conteudo.lock();
+            let Conteudo::Diretorio(filhos) = &mut *c else { return Err(ENOTDIR) };
+            if filhos.contains_key(nome) {
+                return Err(EEXIST);
+            }
+            filhos.insert(nome.to_string(), no);
+            Ok(())
+        }
+        _ => Err(EXDEV),
+    }
 }
 
 /// "/a/b/c" → ("/a/b", "c")

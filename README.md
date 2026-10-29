@@ -2,7 +2,8 @@
 
 Um sistema operacional tipo Unix para x86_64, escrito do zero em Rust (com um
 pouco de assembly). Kernel com memória virtual (com copy-on-write), processos,
-multitarefa preemptiva, sinais, usuários e permissões, chamadas de sistema
+multitarefa preemptiva, sinais, controle de jobs, usuários e permissões,
+links simbólicos e físicos, chamadas de sistema
 compatíveis com as do Linux, pipes, sistema de arquivos e driver de disco ext2
 — e, em cima dele, `login`, um shell e mais de 30 programas em modo usuário.
 Programas em C compilados com a **musl** (a libc do Alpine Linux) também rodam.
@@ -65,6 +66,10 @@ interrompe o programa que está rodando.
   SSE/FPU e TLS (FS) salvos por processo.
 - **Sinais:** tratadores próprios (`sigaction`, `rt_sigreturn`), máscara
   (`sigprocmask`), `SA_RESTART`, `alarm`, `pause`, `kill`, SIGCHLD, SIGPIPE.
+- **Controle de jobs:** grupos de processos e sessões (`setpgid`, `setsid`),
+  terminal com grupo em primeiro plano (`tcsetpgrp`), processos parados
+  (SIGSTOP/SIGTSTP/SIGCONT, `wait` com `WUNTRACED`), SIGTTIN para quem lê o
+  teclado em segundo plano, `kill` para um grupo inteiro.
 - **Usuários e permissões:** uid/gid real e efetivo, `rwx` + setuid, setgid e
   sticky em todo arquivo (memória e ext2), `chmod`, `chown`, `umask`, `setuid`.
 - **Syscalls** pela instrução `syscall` (ou `int 0x80`), com os mesmos números
@@ -75,17 +80,19 @@ interrompe o programa que está rodando.
 - **Arquivos:** VFS com descritores, posição, pipes e dispositivos (`/dev/tty`,
   `/dev/null`, `/dev/zero`). A raiz fica em memória (vinda do initrd) e
   `/disco` é um **disco ext2 de verdade** (driver ATA PIO), que persiste e que o
-  Linux consegue ler.
+  Linux consegue ler. Links simbólicos (curtos dentro do inode, longos em bloco,
+  como no Linux) e físicos, nos dois.
 - **Terminal:** edição de linha no kernel, `termios` (eco e modo canônico
-  ligáveis), Ctrl+C vira SIGINT, Ctrl+D vira fim de arquivo, cores ANSI tanto
-  na VGA quanto na serial.
+  ligáveis), Ctrl+C (SIGINT) e Ctrl+Z (SIGTSTP) só para o job em primeiro
+  plano, Ctrl+D vira fim de arquivo, cores ANSI tanto na VGA quanto na serial.
 
 **Modo usuário** (`usuario/`)
 - `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com
   `brk`, `print!`, sinais, ambiente, usuários, SHA-256.
 - `init` (processo 1) → `login` → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
-  `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`.
-- `login su passwd id whoami chmod chown env ls cat echo cp mv rm mkdir rmdir
+  `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`,
+  e controle de jobs: Ctrl+Z, `jobs`, `fg`, `bg`.
+- `login su passwd id whoami chmod chown env ln readlink ls cat echo cp mv rm mkdir rmdir
   touch grep wc head ps kill sleep date uptime free df uname clear desligar
   reiniciar teste`.
 - **Em C, com a musl** (`c/`): `ola` e `testec`, a bateria de testes da libc
@@ -156,14 +163,12 @@ versões do Linux.
 1. **Portar mais programas de verdade:** o Lua já tem script pronto (`make lua`);
    depois, `dash` e `busybox`. Para eles devem faltar algumas syscalls (o kernel
    avisa qual: `chamada de sistema N não implementada`).
-2. **Mapear arquivos com `mmap`** e links simbólicos.
-3. **Grupos de processos e controle de jobs** (Ctrl+Z, `fg`, `bg`), e o Ctrl+C
-   indo só para o programa em primeiro plano.
-4. **Threads** (`clone` com `CLONE_THREAD`, futex) — exigem trocar o "big kernel
+2. **Mapear arquivos com `mmap`** (hoje só memória anônima).
+3. **Threads** (`clone` com `CLONE_THREAD`, futex) — exigem trocar o "big kernel
    lock" por locks de verdade, o mesmo trabalho que o SMP.
-5. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs), boot UEFI, framebuffer.
-6. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-7. **Interface gráfica:** mouse, servidor de janelas.
+4. **Hardware moderno:** ACPI, APIC/IOAPIC, SMP (várias CPUs), boot UEFI, framebuffer.
+5. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
+6. **Interface gráfica:** mouse, servidor de janelas.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

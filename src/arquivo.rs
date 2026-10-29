@@ -88,6 +88,7 @@ impl Arquivo {
                 Ok(n)
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
+            vfs::Tipo::Link => Err(EINVAL), // o open segue os links: não chega aqui
             // Ler o terminal pode dormir até alguém digitar.
             vfs::Tipo::Dispositivo(Dispositivo::Terminal) => tty::ler(buf),
             vfs::Tipo::Dispositivo(Dispositivo::Nulo) => Ok(0),
@@ -118,6 +119,7 @@ impl Arquivo {
                 Ok(n)
             }
             vfs::Tipo::Diretorio => Err(EISDIR),
+            vfs::Tipo::Link => Err(EINVAL),
             vfs::Tipo::Dispositivo(Dispositivo::Terminal) => {
                 tty::escrever(dados);
                 Ok(dados.len())
@@ -135,7 +137,7 @@ impl Arquivo {
         let Tipo::No(no) = &self.tipo else { return Err(ESPIPE) };
         let tamanho = match no.tipo()? {
             vfs::Tipo::Arquivo => no.tamanho()? as i64,
-            vfs::Tipo::Diretorio => 0,
+            vfs::Tipo::Diretorio | vfs::Tipo::Link => 0,
             vfs::Tipo::Dispositivo(_) => return Err(ESPIPE),
         };
         let mut posicao = self.posicao.lock();
