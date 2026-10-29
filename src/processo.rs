@@ -629,7 +629,9 @@ fn carregar_programa(caminho: &str, args: &[String], ambiente: &[String], cred: 
         }
     };
     let mut espaco = EspacoEnderecos::novo().ok_or(ENOMEM)?;
-    let programa = elf::carregar(&dados, &mut espaco)?;
+    // Um executável PIE vai para uma base sorteada (64 GiB + até 1 GiB).
+    let base = if elf::relocavel(&dados)? { 0x10_0000_0000 + paginas_aleatorias(1 << 18) } else { 0 };
+    let programa = elf::carregar(&dados, &mut espaco, base, elf::LIMITE_IMAGEM)?;
 
     // ASLR: pilha, mmap e heap em posições sorteadas a cada execução, para que
     // um ataque não saiba de antemão onde estão.
@@ -641,12 +643,36 @@ fn carregar_programa(caminho: &str, args: &[String], ambiente: &[String], cred: 
         compartilhada: false,
         fonte: Fonte::Anonima,
     });
-    let mmap_topo = pilha_topo - PILHA_MAXIMA - 0x1000_0000 - paginas_aleatorias(1 << 18);
+    let mut mmap_topo = pilha_topo - PILHA_MAXIMA - 0x1000_0000 - paginas_aleatorias(1 << 18);
     let brk = ((programa.fim + 0xFFF) & !0xFFF) + paginas_aleatorias(8192);
 
+    // O carregador dinâmico (PT_INTERP) vai para a área do mmap, logo abaixo
+    // do topo, e é por ele que o programa começa.
+    let mut entrada = programa.entrada;
+    let mut base_interpretador = 0;
+    if let Some(caminho) = &programa.interpretador {
+        let no_interp = vfs::buscar_como(caminho, cred)?;
+        if no_interp.tipo()? != vfs::Tipo::Arquivo {
+            return Err(EACCES);
+        }
+        no_interp.permite(cred, vfs::LER)?;
+        let codigo = no_interp.ler_tudo()?;
+        if !elf::relocavel(&codigo)? {
+            return Err(ENOEXEC);
+        }
+        let (menor, maior) = elf::extensao(&codigo)?;
+        mmap_topo = (mmap_topo - (maior - menor + 0xFFF)) & !0xFFF;
+        base_interpretador = mmap_topo - menor;
+        let interp = elf::carregar(&codigo, &mut espaco, base_interpretador, paginacao::USUARIO_FIM)?;
+        if interp.interpretador.is_some() {
+            return Err(ENOEXEC); // um carregador não pode pedir outro
+        }
+        entrada = interp.entrada;
+    }
+
     let meta = no.meta()?;
-    let rsp = montar_pilha(&espaco, pilha_topo, args, ambiente, &programa, cred, meta)?;
-    Ok(Imagem { espaco, entrada: programa.entrada, rsp, brk, mmap_topo, meta })
+    let rsp = montar_pilha(&espaco, pilha_topo, caminho, args, ambiente, &programa, base_interpretador, cred, meta)?;
+    Ok(Imagem { espaco, entrada, rsp, brk, mmap_topo, meta })
 }
 
 /// Monta a pilha inicial no formato da ABI System V (a mesma do Linux):
@@ -658,12 +684,15 @@ fn carregar_programa(caminho: &str, args: &[String], ambiente: &[String], cred: 
 ///
 /// O "vetor auxiliar" (auxv) é como o kernel conta coisas para a libc: onde
 /// estão os program headers do executável, o tamanho da página, quem é o usuário...
+#[allow(clippy::too_many_arguments)]
 fn montar_pilha(
     espaco: &EspacoEnderecos,
     topo: u64,
+    caminho: &str,
     args: &[String],
     ambiente: &[String],
     programa: &elf::Programa,
+    base_interpretador: u64,
     cred: vfs::Cred,
     meta: vfs::Meta,
 ) -> Result<u64, i64> {
@@ -687,6 +716,9 @@ fn montar_pilha(
     aleatorio[..8].copy_from_slice(&tsc.to_le_bytes());
     aleatorio[8..].copy_from_slice(&(tsc.rotate_left(29) ^ 0x9E37_79B9_7F4A_7C15).to_le_bytes());
     let ptr_aleatorio = empilhar(&aleatorio)?;
+    let mut nome = caminho.as_bytes().to_vec();
+    nome.push(0);
+    let ptr_nome = empilhar(&nome)?;
 
     let mut palavras = vec![args.len() as u64];
     palavras.extend(&ponteiros_args);
@@ -694,18 +726,22 @@ fn montar_pilha(
     palavras.extend(&ponteiros_ambiente);
     palavras.push(0);
     let seguro = (meta.permissoes & (vfs::SETUID | vfs::SETGID) != 0) as u64;
-    let auxv: [(u64, u64); 12] = [
+    let auxv: [(u64, u64); 16] = [
         (3, programa.cabecalhos),            // AT_PHDR
         (4, 56),                             // AT_PHENT
         (5, programa.quantidade_cabecalhos), // AT_PHNUM
         (6, 4096),                           // AT_PAGESZ
-        (9, programa.entrada),               // AT_ENTRY
+        (7, base_interpretador),             // AT_BASE: onde ficou o carregador dinâmico
+        (8, 0),                              // AT_FLAGS
+        (9, programa.entrada),               // AT_ENTRY: o programa (mesmo com carregador)
+        (17, 100),                           // AT_CLKTCK
         (11, atual().uid as u64),            // AT_UID
         (12, cred.uid as u64),               // AT_EUID
         (13, atual().gid as u64),            // AT_GID
         (14, cred.gid as u64),               // AT_EGID
         (23, seguro),                        // AT_SECURE
         (25, ptr_aleatorio),                 // AT_RANDOM
+        (31, ptr_nome),                      // AT_EXECFN
         (0, 0),                              // AT_NULL
     ];
     for (tipo, valor) in auxv {

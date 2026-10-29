@@ -41,6 +41,18 @@ MUSL_GCC   := ferramentas/musl/bin/musl-gcc
 PROGRAMAS_C := $(if $(wildcard $(MUSL_GCC)),$(basename $(notdir $(wildcard c/*.c))))
 BINARIOS_C := $(addprefix $(BUILD)/c/,$(PROGRAMAS_C))
 FLAGS_C    := -static -no-pie -O2 -Wall -Wl,-Ttext-segment=0x40000000
+# Bibliotecas compartilhadas: o nosso carregador dinâmico (/lib/ld-ferrugem.so),
+# uma biblioteca de exemplo e um programa que a usa. Em C sem libc, com o
+# compilador do sistema (veja dinamico/).
+DINAMICO     := $(BUILD)/dinamico
+FLAGS_DIN    := -O2 -Wall -ffreestanding -fno-stack-protector -fno-builtin \
+                -fno-tree-loop-distribute-patterns -nostdlib -Wl,--hash-style=sysv -Wl,-z,noexecstack
+BINARIOS_DIN := $(DINAMICO)/ld-ferrugem.so $(DINAMICO)/libsaudacao.so $(DINAMICO)/dinamico
+# Com a musl compilada também como biblioteca compartilhada (o ferramentas/musl.sh
+# atual faz isso), a libc.so dela vira /lib/ld-musl-x86_64.so.1 (ela é o próprio
+# carregador) e o c/ola.c ganha uma versão dinâmica, /bin/ola-dinamico.
+MUSL_SO      := $(wildcard ferramentas/musl/lib/libc.so)
+BINARIOS_DIN += $(if $(MUSL_SO),$(BUILD)/c/ola-dinamico)
 # Programas de terceiros, sem nenhuma modificação (`make lua`).
 LUA        := $(wildcard ferramentas/lua/lua)
 
@@ -97,8 +109,22 @@ $(BUILD)/c/%: c/%.c $(MUSL_GCC) | $(BUILD)
 	mkdir -p $(BUILD)/c
 	$(MUSL_GCC) $(FLAGS_C) -o $@ $<
 
+# O carregador não pode ter relocações (ninguém o reloca): tudo "hidden".
+$(DINAMICO)/ld-ferrugem.so: dinamico/ld-ferrugem.c dinamico/sys.h | $(BUILD)
+	mkdir -p $(DINAMICO)
+	$(CC) $(FLAGS_DIN) -fPIC -fvisibility=hidden -shared -Wl,-e,_start -Wl,-Bsymbolic -o $@ $<
+$(DINAMICO)/libsaudacao.so: dinamico/libsaudacao.c dinamico/sys.h | $(BUILD)
+	mkdir -p $(DINAMICO)
+	$(CC) $(FLAGS_DIN) -fPIC -shared -Wl,-soname,libsaudacao.so -o $@ $<
+$(BUILD)/c/ola-dinamico: c/ola.c $(MUSL_SO) | $(BUILD)
+	mkdir -p $(BUILD)/c
+	$(MUSL_GCC) -O2 -Wall -o $@ $<
+$(DINAMICO)/dinamico: dinamico/dinamico.c dinamico/sys.h $(DINAMICO)/libsaudacao.so
+	$(CC) $(FLAGS_DIN) -fPIE -pie -Wl,-z,now -Wl,--dynamic-linker=/lib/ld-ferrugem.so \
+		-L$(DINAMICO) -o $@ $< -lsaudacao
+
 # O initrd é um tar com a árvore de arquivos inicial: raiz/ + os programas em /bin
-$(INITRD): $(USUARIO_OK) $(ARQUIVOS_RAIZ) $(BINARIOS_C) $(LUA)
+$(INITRD): $(USUARIO_OK) $(ARQUIVOS_RAIZ) $(BINARIOS_C) $(BINARIOS_DIN) $(LUA)
 	@$(if $(PROGRAMAS_C),,echo "(sem a musl: os programas em c/ ficam de fora; rode 'make musl')")
 	rm -rf $(RAIZ)
 	mkdir -p $(RAIZ)/bin
@@ -106,7 +132,10 @@ $(INITRD): $(USUARIO_OK) $(ARQUIVOS_RAIZ) $(BINARIOS_C) $(LUA)
 	for p in $(PROGRAMAS); do strip -o $(RAIZ)/bin/$$p $(USUARIO_BIN)/$$p; done
 	for p in $(PROGRAMAS_C); do strip -o $(RAIZ)/bin/$$p $(BUILD)/c/$$p; done
 	$(if $(LUA),strip -o $(RAIZ)/bin/lua $(LUA))
-	mkdir -p $(RAIZ)/var/log $(RAIZ)/var/spool/cron
+	mkdir -p $(RAIZ)/lib $(RAIZ)/var/log $(RAIZ)/var/spool/cron
+	cp $(DINAMICO)/ld-ferrugem.so $(DINAMICO)/libsaudacao.so $(RAIZ)/lib/
+	cp $(DINAMICO)/dinamico $(RAIZ)/bin/
+	$(if $(MUSL_SO),cp $(MUSL_SO) $(RAIZ)/lib/ld-musl-x86_64.so.1 && cp $(BUILD)/c/ola-dinamico $(RAIZ)/bin/)
 	chmod 4755 $(RAIZ)/bin/su $(RAIZ)/bin/passwd $(RAIZ)/bin/crontab    # setuid root
 	chmod 700 $(RAIZ)/var/spool/cron
 	chmod 600 $(RAIZ)/etc/shadow

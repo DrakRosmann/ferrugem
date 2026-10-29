@@ -1288,6 +1288,47 @@ fn interface_grafica() -> R {
     Ok(())
 }
 
+/// Roda um programa e devolve (status, o que ele escreveu na saída).
+fn saida_de(caminho: &str, args: &[&str]) -> Result<(i32, String), String> {
+    let (leitura, escrita) = sys::pipe().map_err(erro)?;
+    let status = em_filho(|| {
+        let _ = sys::duplicar_para(escrita, 1);
+        let _ = sys::fechar(escrita);
+        let _ = sys::fechar(leitura);
+        let e = sys::executar(caminho, args);
+        eprintln!("exec {}: {}", caminho, e);
+        127
+    })?;
+    let _ = sys::fechar(escrita);
+    let saida = String::from_utf8_lossy(&ler_tudo(leitura)).into_owned();
+    let _ = sys::fechar(leitura);
+    Ok((status, saida))
+}
+
+fn bibliotecas_dinamicas() -> R {
+    // Um PIE com PT_INTERP (/lib/ld-ferrugem.so) e uma biblioteca (libsaudacao.so).
+    let (status, saida) = saida_de("/bin/dinamico", &["dinamico", "teste"])?;
+    if sys::codigo_de_saida(status) != Some(0) {
+        return Err(format!("status {:#x}: {}", status, saida));
+    }
+    for esperado in ["olá, teste, da libsaudacao.so", "soma(2, 3) = 5", "cor(1) = verde", "contador = 41 -> 42"] {
+        if !saida.contains(esperado) {
+            return Err(format!("faltou {:?} em {:?}", esperado, saida));
+        }
+    }
+    // ASLR: o programa e a biblioteca mudam de lugar a cada execução.
+    let (_, outra) = saida_de("/bin/dinamico", &["dinamico", "teste"])?;
+    let endereco = |s: &str, chave: &str| s.lines().find(|l| l.contains(chave)).map(String::from);
+    if endereco(&saida, "programa em") == endereco(&outra, "programa em") || endereco(&saida, "carregada") == endereco(&outra, "carregada") {
+        return Err(String::from("o programa ou a biblioteca não mudaram de endereço"));
+    }
+    let (_, lista) = saida_de("/bin/ldd", &["ldd", "/bin/dinamico"])?;
+    if !lista.contains("libsaudacao.so => /lib/libsaudacao.so") {
+        return Err(format!("ldd: {:?}", lista));
+    }
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1298,7 +1339,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 55] = [
+    let testes: [(&str, fn() -> R); 56] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1354,6 +1395,7 @@ fn principal(args: &[&str]) -> i32 {
         ("FIFOs: open espera a outra ponta (memória e ext2)", fifos),
         ("pseudo-terminais: eco, Ctrl+C e SIGHUP", pseudo_terminais),
         ("interface gráfica: framebuffer, servidor de janelas e um cliente", interface_grafica),
+        ("bibliotecas dinâmicas: PT_INTERP, ld-ferrugem.so, PIE e ASLR", bibliotecas_dinamicas),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

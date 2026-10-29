@@ -3,6 +3,16 @@
 //! Um ELF tem um cabeçalho e uma lista de "program headers". Os do tipo
 //! `PT_LOAD` dizem: "copie N bytes do arquivo, a partir do deslocamento X,
 //! para o endereço virtual V, e zere o resto até M bytes" (o resto é o .bss).
+//!
+//! Dois tipos de ELF executam:
+//! - `ET_EXEC`: os endereços são absolutos (nossos programas, em 0x40000000).
+//! - `ET_DYN`: os endereços são relativos a uma *base* que escolhemos (um
+//!   executável PIE, ou uma biblioteca). Sorteamos a base (ASLR).
+//!
+//! Um programa ligado a bibliotecas compartilhadas tem um `PT_INTERP`: o
+//! caminho do *carregador dinâmico* (ld.so). O kernel carrega os dois e
+//! começa pelo carregador, que acha as bibliotecas, resolve os símbolos e só
+//! então pula para o programa (ele sabe onde, pelo vetor auxiliar).
 
 use crate::erro::*;
 use crate::paginacao::{
@@ -15,13 +25,18 @@ use crate::paginacao::{
 pub const LIMITE_IMAGEM: u64 = 0x40_0000_0000;
 
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PT_PHDR: u32 = 6;
+const ET_EXEC: u64 = 2;
+const ET_DYN: u64 = 3;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
 /// O que o carregador descobre sobre o programa.
 pub struct Programa {
     pub entrada: u64,
+    /// O carregador dinâmico que ele pede (PT_INTERP), se pedir.
+    pub interpretador: Option<alloc::string::String>,
     /// Onde a imagem termina (o heap começa logo depois).
     pub fim: u64,
     /// Endereço dos program headers na memória (a libc procura o TLS neles), ou 0.
@@ -46,17 +61,49 @@ fn u64_em(d: &[u8], o: usize) -> Result<u64, i64> {
     Ok(u64::from_le_bytes(ler(d, o)?))
 }
 
-/// Carrega os segmentos no espaço do processo.
-pub fn carregar(dados: &[u8], espaco: &mut EspacoEnderecos) -> Result<Programa, i64> {
-    // "\x7fELF", 64 bits, little-endian, executável (2), x86_64 (0x3E)
-    if dados.get(0..6) != Some(b"\x7fELF\x02\x01") || u16_em(dados, 16)? != 2 || u16_em(dados, 18)? != 0x3E {
+/// "\x7fELF", 64 bits, little-endian, x86_64 (0x3E); devolve o tipo (ET_EXEC ou ET_DYN).
+fn tipo(dados: &[u8]) -> Result<u64, i64> {
+    if dados.get(0..6) != Some(b"\x7fELF\x02\x01") || u16_em(dados, 18)? != 0x3E {
         return Err(ENOEXEC);
     }
-    let entrada = u64_em(dados, 24)?;
+    match u16_em(dados, 16)? {
+        t @ (ET_EXEC | ET_DYN) => Ok(t),
+        _ => Err(ENOEXEC),
+    }
+}
+
+/// É um ELF relocável (PIE ou biblioteca), que pode ir para qualquer base?
+pub fn relocavel(dados: &[u8]) -> Result<bool, i64> {
+    Ok(tipo(dados)? == ET_DYN)
+}
+
+/// Os endereços (antes da base) que os PT_LOAD ocupam: [menor, maior).
+pub fn extensao(dados: &[u8]) -> Result<(u64, u64), i64> {
+    let tabela = u64_em(dados, 32)? as usize;
+    let tamanho_entrada = u16_em(dados, 54)? as usize;
+    let (mut menor, mut maior) = (u64::MAX, 0);
+    for i in 0..u16_em(dados, 56)? as usize {
+        let o = tabela + i * tamanho_entrada;
+        if u32_em(dados, o)? == PT_LOAD {
+            let virt = u64_em(dados, o + 16)?;
+            menor = menor.min(virt);
+            maior = maior.max(virt.checked_add(u64_em(dados, o + 40)?).ok_or(ENOEXEC)?);
+        }
+    }
+    if menor >= maior { Err(ENOEXEC) } else { Ok((menor & !0xFFF, maior)) }
+}
+
+/// Carrega os segmentos no espaço do processo. `base`: somada a todos os
+/// endereços (só para ET_DYN; ET_EXEC exige 0). Tudo precisa caber abaixo de `limite`.
+pub fn carregar(dados: &[u8], espaco: &mut EspacoEnderecos, base: u64, limite: u64) -> Result<Programa, i64> {
+    if tipo(dados)? == ET_EXEC && base != 0 {
+        return Err(ENOEXEC);
+    }
+    let entrada = base + u64_em(dados, 24)?;
     let tabela = u64_em(dados, 32)? as usize;
     let tamanho_entrada = u16_em(dados, 54)? as usize;
     let quantidade = u16_em(dados, 56)? as usize;
-    let limite = LIMITE_IMAGEM;
+    let mut interpretador = None;
 
     let mut fim_imagem = USUARIO_INICIO;
     let mut cabecalhos = 0;
@@ -64,14 +111,21 @@ pub fn carregar(dados: &[u8], espaco: &mut EspacoEnderecos) -> Result<Programa, 
         let o = tabela + i * tamanho_entrada;
         let tipo = u32_em(dados, o)?;
         if tipo == PT_PHDR {
-            cabecalhos = u64_em(dados, o + 16)?;
+            cabecalhos = base + u64_em(dados, o + 16)?;
+        }
+        if tipo == PT_INTERP {
+            let inicio = u64_em(dados, o + 8)? as usize;
+            let tamanho = u64_em(dados, o + 32)? as usize;
+            let caminho = dados.get(inicio..inicio + tamanho).ok_or(ENOEXEC)?;
+            let caminho = caminho.split(|&b| b == 0).next().unwrap_or(&[]);
+            interpretador = Some(core::str::from_utf8(caminho).map_err(|_| ENOEXEC)?.into());
         }
         if tipo != PT_LOAD {
             continue;
         }
         let flags = u32_em(dados, o + 4)?;
         let deslocamento = u64_em(dados, o + 8)? as usize;
-        let virt = u64_em(dados, o + 16)?;
+        let virt = base + u64_em(dados, o + 16)?;
         let no_arquivo = u64_em(dados, o + 32)? as usize;
         let na_memoria = u64_em(dados, o + 40)?;
         if na_memoria == 0 {
@@ -119,5 +173,5 @@ pub fn carregar(dados: &[u8], espaco: &mut EspacoEnderecos) -> Result<Programa, 
     if !(USUARIO_INICIO..fim_imagem).contains(&entrada) {
         return Err(ENOEXEC);
     }
-    Ok(Programa { entrada, fim: fim_imagem, cabecalhos, quantidade_cabecalhos: quantidade as u64 })
+    Ok(Programa { entrada, interpretador, fim: fim_imagem, cabecalhos, quantidade_cabecalhos: quantidade as u64 })
 }

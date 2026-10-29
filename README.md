@@ -138,6 +138,16 @@ interface gráfica.
   programas, que conversam com o servidor por um socket Unix e desenham numa
   memória compartilhada (`ulib::janela`; exemplo: `pintar`).
 
+- **Bibliotecas dinâmicas:** o kernel carrega executáveis PIE (`ET_DYN`) numa
+  base sorteada e, se o programa pede um carregador (`PT_INTERP`), carrega os
+  dois e começa por ele, com o vetor auxiliar completo (`AT_BASE`,
+  `AT_ENTRY`, `AT_PHDR`, `AT_EXECFN`...). O carregador é nosso:
+  **`/lib/ld-ferrugem.so`** (`dinamico/`, em C sem libc) acha as bibliotecas
+  de `DT_NEEDED` em `/lib`, resolve os símbolos pela tabela hash do ELF,
+  aplica as relocações (`RELATIVE`, `64`, `GLOB_DAT`, `JUMP_SLOT`, `COPY`),
+  roda os construtores e pula para o programa. Exemplo: `dinamico` usa a
+  `libsaudacao.so`; `ldd` lista as bibliotecas de um programa.
+
 **Modo usuário** (`usuario/`)
 - `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com
   `brk`, `print!`, sinais, ambiente, usuários, SHA-256.
@@ -184,6 +194,7 @@ interface gráfica.
 | `src/sinal.rs` | Sinais: ações, máscara, quadro do tratador na pilha do usuário |
 | `usuario/src/usuarios.rs`, `sha256.rs` | /etc/passwd, /etc/group, /etc/shadow e o hash das senhas |
 | `c/` | Programas em C, compilados com a musl |
+| `dinamico/` | O carregador dinâmico (`ld-ferrugem.so`), uma biblioteca compartilhada e um programa que a usa |
 | `ferramentas/` | Scripts que baixam e compilam a musl e o Lua |
 | `testes/rodar.sh` | O `make teste` |
 
