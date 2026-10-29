@@ -24,7 +24,9 @@ echo "$SHA256  fontes/musl-$VERSAO.tar.gz" | sha256sum -c -
 rm -rf fontes/musl-$VERSAO
 tar xzf fontes/musl-$VERSAO.tar.gz -C fontes
 cd fontes/musl-$VERSAO
-./configure --prefix="$DESTINO" > /dev/null
+# --syslibdir: o link do carregador (ld-musl-x86_64.so.1) fica aqui, e não
+# no /lib do sistema de quem compila.
+./configure --prefix="$DESTINO" --syslibdir="$DESTINO/lib" > /dev/null
 make -j"$(nproc)" > /dev/null
 make install > /dev/null
 echo "musl $VERSAO instalada em $DESTINO"

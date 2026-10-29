@@ -1326,6 +1326,18 @@ fn bibliotecas_dinamicas() -> R {
     if !lista.contains("libsaudacao.so => /lib/libsaudacao.so") {
         return Err(format!("ldd: {:?}", lista));
     }
+    // Com a musl compartilhada instalada: um programa C comum, ligado à
+    // libc.so, pelo carregador da própria musl.
+    if sys::stat("/bin/ola-dinamico").is_ok() {
+        let (status, saida) = saida_de("/bin/ola-dinamico", &["ola-dinamico", "x"])?;
+        if sys::codigo_de_saida(status) != Some(0) || !saida.contains("malloc e snprintf funcionam: 3.142") {
+            return Err(format!("ola-dinamico (musl): status {:#x}, {:?}", status, saida));
+        }
+        let (_, lista) = saida_de("/bin/ldd", &["ldd", "/bin/ola-dinamico"])?;
+        if !lista.contains("ld-musl-x86_64.so.1") || lista.contains("Olá do C") {
+            return Err(format!("ldd da musl: {:?}", lista));
+        }
+    }
     Ok(())
 }
 
@@ -1453,7 +1465,7 @@ fn principal(args: &[&str]) -> i32 {
         ("FIFOs: open espera a outra ponta (memória e ext2)", fifos),
         ("pseudo-terminais: eco, Ctrl+C e SIGHUP", pseudo_terminais),
         ("interface gráfica: framebuffer, servidor de janelas e um cliente", interface_grafica),
-        ("bibliotecas dinâmicas: PT_INTERP, ld-ferrugem.so, PIE e ASLR", bibliotecas_dinamicas),
+        ("bibliotecas dinâmicas: ld-ferrugem.so, ld-musl, PIE e ASLR", bibliotecas_dinamicas),
         ("várias CPUs: 4 processos em CPUs diferentes, ao mesmo tempo", varias_cpus),
     ];
 

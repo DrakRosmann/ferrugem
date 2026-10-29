@@ -6,9 +6,9 @@
 //!   	libsaudacao.so => /lib/libsaudacao.so (0x...)
 //! ```
 //!
-//! Lê o PT_INTERP do executável (o carregador dinâmico) e roda o programa
-//! com LD_TRACE_LOADED_OBJECTS=1: o carregador então só lista o que
-//! carregou e sai, sem executar o programa.
+//! Lê o PT_INTERP do executável (o carregador dinâmico) e pede a ele a
+//! lista, sem executar o programa: o nosso (ld-ferrugem.so) entende
+//! LD_TRACE_LOADED_OBJECTS=1; o da musl, `ld-musl-x86_64.so.1 --list programa`.
 
 #![no_std]
 #![no_main]
@@ -60,7 +60,11 @@ fn principal(args: &[&str]) -> i32 {
     ambiente.push("LD_TRACE_LOADED_OBJECTS=1");
     match sys::fork() {
         Ok(0) => {
-            let erro = sys::executar_com_ambiente(&caminho, &[&caminho], &ambiente);
+            let erro = if carregador.contains("ld-musl") {
+                sys::executar(&carregador, &[&carregador, "--list", &caminho])
+            } else {
+                sys::executar_com_ambiente(&caminho, &[&caminho], &ambiente)
+            };
             eprintln!("ldd: {}: {}", caminho, erro);
             sys::sair(127);
         }

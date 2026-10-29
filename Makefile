@@ -122,9 +122,10 @@ $(DINAMICO)/ld-ferrugem.so: dinamico/ld-ferrugem.c dinamico/sys.h | $(BUILD)
 $(DINAMICO)/libsaudacao.so: dinamico/libsaudacao.c dinamico/sys.h | $(BUILD)
 	mkdir -p $(DINAMICO)
 	$(CC) $(FLAGS_DIN) -fPIC -shared -Wl,-soname,libsaudacao.so -o $@ $<
+# PIE: vai para uma base sorteada (as specs do musl-gcc não repassam -pie ao ld).
 $(BUILD)/c/ola-dinamico: c/ola.c $(MUSL_SO) | $(BUILD)
 	mkdir -p $(BUILD)/c
-	$(MUSL_GCC) -O2 -Wall -o $@ $<
+	$(MUSL_GCC) -O2 -Wall -fPIE -Wl,-pie -o $@ $<
 $(DINAMICO)/dinamico: dinamico/dinamico.c dinamico/sys.h $(DINAMICO)/libsaudacao.so
 	$(CC) $(FLAGS_DIN) -fPIE -pie -Wl,-z,now -Wl,--dynamic-linker=/lib/ld-ferrugem.so \
 		-L$(DINAMICO) -o $@ $< -lsaudacao

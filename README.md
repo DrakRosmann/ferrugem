@@ -150,7 +150,10 @@ interface gráfica.
   de `DT_NEEDED` em `/lib`, resolve os símbolos pela tabela hash do ELF,
   aplica as relocações (`RELATIVE`, `64`, `GLOB_DAT`, `JUMP_SLOT`, `COPY`),
   roda os construtores e pula para o programa. Exemplo: `dinamico` usa a
-  `libsaudacao.so`; `ldd` lista as bibliotecas de um programa.
+  `libsaudacao.so`; `ldd` lista as bibliotecas de um programa. Com a musl
+  compartilhada (`make musl`), o carregador dela também funciona, sem
+  modificações: `/lib/ld-musl-x86_64.so.1` e o `ola-dinamico`, um programa C
+  comum ligado à `libc.so`.
 
 **Modo usuário** (`usuario/`)
 - `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com
