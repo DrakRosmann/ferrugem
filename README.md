@@ -61,7 +61,10 @@ solta). O menu **Aplicativos** (no alto) abre terminais e programas e tem o
 baixo, minimizadas e maximizadas pelos botões (ou com dois cliques no
 título); a barra de tarefas, embaixo, alterna entre elas, e Alt+Tab também.
 No terminal, arrastar copia e o botão direito cola; nos programas, Ctrl+C e
-Ctrl+V. Se algo travar, Ctrl+Alt+Backspace derruba a interface gráfica.
+Ctrl+V. No canto direito do painel fica o **painel de controle**: brilho,
+estilo escuro, luz noturna, segundos no relógio, cursor grande, captura de
+tela (PNG em `~/`), bloquear a tela (pede a senha) e desligar. Se algo
+travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 
 ## O que já existe
 
@@ -143,6 +146,13 @@ Ctrl+V. Se algo travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   mouse) e janelas de outros programas, que conversam com o servidor por
   um socket Unix e desenham numa memória compartilhada (`ulib::janela`;
   exemplos: `pintar`, `fontes`, `componentes`).
+- **Painel de controle** (no estilo das configurações rápidas do GNOME):
+  brilho e luz noturna (um filtro de cor aplicado pelo servidor ao copiar
+  para a tela), estilo escuro (os programas com `ulib::ui` trocam de tema na
+  hora), segundos no relógio, cursor grande, captura de tela num PNG
+  (`ulib::png`), tela de bloqueio com senha, sair/reiniciar/desligar, e o
+  uso de memória. Os ajustes ficam em `~/.janelas`. Sem rede, som e
+  bateria no sistema, não há botões de mentira para eles.
 - **Componentes de interface** (`ulib::ui`, em "modo imediato", como a Dear
   ImGui): rótulos, botões, caixas de seleção, opções, campo de texto,
   lista com rolagem (roda do mouse, barra, setas), deslizante, barra de

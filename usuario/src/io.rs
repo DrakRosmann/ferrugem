@@ -76,6 +76,11 @@ impl Leitor {
         }
     }
 
+    /// Já há uma linha inteira no buffer (ler_linha não vai esperar)?
+    pub fn tem_linha(&self) -> bool {
+        self.buffer.contains(&b'\n')
+    }
+
     /// Reabre o leitor depois de um Ctrl+D no terminal.
     pub fn continuar(&mut self) {
         self.fim = false;

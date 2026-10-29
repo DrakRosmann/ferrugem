@@ -88,7 +88,7 @@ fn principal(_args: &[&str]) -> i32 {
                 limpar(&mut j, cor); // o desenho não é guardado: a tela nova começa limpa
                 j.mostrar();
             }
-            Evento::Tecla(_) | Evento::Roda { .. } | Evento::Seta(_) | Evento::Colar(_) => {}
+            Evento::Tecla(_) | Evento::Roda { .. } | Evento::Seta(_) | Evento::Colar(_) | Evento::Tema { .. } => {}
             Evento::Fechar => break,
         }
     }

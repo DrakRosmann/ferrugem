@@ -61,6 +61,22 @@ pub const TEMA_CLARO: Tema = Tema {
     texto_destaque: 0xFFFFFF,
 };
 
+/// O estilo escuro (ligado no painel de controle do `janelas`).
+pub const TEMA_ESCURO: Tema = Tema {
+    fundo: 0x242424,
+    painel: 0x303030,
+    texto: 0xEEEEEC,
+    texto_fraco: 0x9A9A96,
+    borda: 0x4C4C4C,
+    botao: 0x383838,
+    botao_sobre: 0x444444,
+    botao_apertado: 0x2C2C2C,
+    campo: 0x1C1C1C,
+    realce: 0x4A3027,
+    destaque: 0xC64A1C,
+    texto_destaque: 0xFFFFFF,
+};
+
 const MARGEM: i32 = 12;
 const ESPACO: i32 = 8;
 const ALTURA: i32 = 26;
@@ -216,6 +232,10 @@ impl Ui {
             }),
             Evento::Fechar => self.sair = true,
             Evento::Tamanho { .. } => self.redesenhar = true,
+            Evento::Tema { escuro } => {
+                self.tema = if escuro { TEMA_ESCURO } else { TEMA_CLARO };
+                self.redesenhar = true;
+            }
             // O texto colado chega como se tivesse sido digitado.
             Evento::Colar(ref texto) => {
                 self.teclas.extend(texto.chars().filter(|c| !c.is_control()).map(Tecla::Letra));

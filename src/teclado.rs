@@ -70,11 +70,14 @@ fn prefixo_alt() {
     }
 }
 
-/// Setas (só para quem capturou o teclado; os consoles não as usam).
-fn seta(letra: u8) {
+/// Setas e as teclas de edição (só para quem capturou o teclado; os
+/// consoles não as usam): as sequências de um terminal VT100/xterm.
+fn especial(sequencia: &[u8]) {
     let mut captura = CAPTURA.lock();
     if let Some(fila) = captura.as_mut() {
-        fila.extend([0x1B, b'[', letra]);
+        fila.push_back(0x1B);
+        fila.push_back(b'[');
+        fila.extend(sequencia);
         drop(captura);
         processo::acordar(canal());
     }
@@ -167,10 +170,15 @@ impl Estado {
             match (codigo, solta) {
                 (0x1D, _) => self.ctrl = !solta, // Ctrl da direita
                 (0x38, _) => self.alt = !solta,  // AltGr
-                (0x48, false) => seta(b'A'),
-                (0x50, false) => seta(b'B'),
-                (0x4D, false) => seta(b'C'),
-                (0x4B, false) => seta(b'D'),
+                (0x48, false) => especial(b"A"),
+                (0x50, false) => especial(b"B"),
+                (0x4D, false) => especial(b"C"),
+                (0x4B, false) => especial(b"D"),
+                (0x47, false) => especial(b"H"),  // Home
+                (0x4F, false) => especial(b"F"),  // End
+                (0x49, false) => especial(b"5~"), // Page Up
+                (0x51, false) => especial(b"6~"), // Page Down
+                (0x53, false) => especial(b"3~"), // Delete
                 (0x1C, false) => self.digitar('\n'),
                 (0x35, false) => self.digitar('/'),
                 _ => {}

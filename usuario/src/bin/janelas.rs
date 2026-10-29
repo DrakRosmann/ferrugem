@@ -101,10 +101,31 @@ impl Letras {
     }
 
     fn largura(&mut self, texto: &str, negrito: bool) -> i32 {
+        self.largura_em(texto, negrito, TAMANHO_LETRA)
+    }
+
+    fn largura_em(&mut self, texto: &str, negrito: bool, tamanho: u16) -> i32 {
         match self.tt(negrito) {
-            Some(f) => f.largura(texto, TAMANHO_LETRA),
+            Some(f) => f.largura(texto, tamanho),
             None => texto.chars().count() as i32 * LARGURA_LETRA,
         }
+    }
+
+    /// Texto em qualquer tamanho, com o topo em `y` (a fonte da VGA não muda de tamanho).
+    fn escrever_em(&mut self, q: &mut Quadro, x: i32, y: i32, texto: &str, cor: u32, negrito: bool, tamanho: u16) -> i32 {
+        match self.tt(negrito) {
+            Some(f) => q.texto_tt(f, x, y, texto, tamanho, cor),
+            None => {
+                q.texto(&self.vga, x, y, texto, cor, None);
+                texto.chars().count() as i32 * LARGURA_LETRA
+            }
+        }
+    }
+
+    /// Texto centrado em `cx`.
+    fn centrado(&mut self, q: &mut Quadro, cx: i32, y: i32, texto: &str, cor: u32, negrito: bool, tamanho: u16) {
+        let w = self.largura_em(texto, negrito, tamanho);
+        self.escrever_em(q, cx - w / 2, y, texto, cor, negrito, tamanho);
     }
 }
 
@@ -618,6 +639,22 @@ struct Servidor {
     proxima_posicao: i32,
     hora_mostrada: String,
     sair: bool,
+    // O painel de controle
+    ajustes: Ajustes,
+    controle_aberto: bool,
+    menu_desligar: bool,
+    arrastando_brilho: bool,
+    area_status: Area,
+    /// O filtro de cor mudou: a tela toda é copiada de novo (sem redesenhar).
+    refiltrar: bool,
+    aviso: Option<(String, u64)>,
+    cpus: usize,
+    // A tela bloqueada
+    travada: bool,
+    senha: String,
+    senha_errada: bool,
+    /// Só dá para bloquear se dá para conferir a senha (ler o /etc/shadow).
+    pode_bloquear: bool,
 }
 
 impl Servidor {
@@ -677,7 +714,41 @@ impl Servidor {
 
     fn compor(&mut self) {
         let Some(area) = self.sujo.take() else { return };
-        let hora = String::from(&sys::formatar_data(sys::hora_atual())[11..16]);
+        // A imagem sai do servidor enquanto é desenhada: assim os métodos de
+        // desenho podem usar o resto dele à vontade.
+        let mut imagem = core::mem::take(&mut self.imagem);
+        let (largura, altura) = (self.largura, self.altura);
+        let mut q = Quadro::novo(&mut imagem, largura, altura);
+        q.recorte = area;
+        if self.travada {
+            self.desenhar_bloqueio(&mut q);
+        } else {
+            self.desenhar_area_de_trabalho(&mut q);
+        }
+        drop(q);
+        self.imagem = imagem;
+        self.hora_mostrada = self.texto_do_relogio();
+        // Para a tela, só o pedaço que mudou (ou tudo, se o filtro de cor
+        // mudou), passando pelo filtro; o cursor vai por cima.
+        let area = if core::mem::take(&mut self.refiltrar) { (0, 0, largura, altura) } else { area };
+        let filtro = self.filtro();
+        let (x, y, w, h) = area;
+        for linha in y..y + h {
+            let i = (linha * largura + x) as usize;
+            let (destino, origem) = (&mut self.tela[i..i + w as usize], &self.imagem[i..i + w as usize]);
+            if filtro.is_none() {
+                destino.copy_from_slice(origem);
+            } else {
+                for (d, &o) in destino.iter_mut().zip(origem) {
+                    *d = Self::filtrar(filtro, o);
+                }
+            }
+        }
+        self.desenhar_cursor();
+    }
+
+    fn desenhar_area_de_trabalho(&mut self, q: &mut Quadro) {
+        let (largura, altura) = (self.largura, self.altura);
         let entradas = self.entradas_barra();
         let ativa = self.ativa();
         let contorno = match (&self.arraste, self.janelas.last()) {
@@ -686,33 +757,39 @@ impl Servidor {
             }
             _ => None,
         };
-        let Servidor { imagem, largura, altura, letras, janelas, menu_aberto, area_aplicativos, area_menu, mouse, .. } = self;
-        let (largura, altura) = (*largura, *altura);
-        let mut q = Quadro::novo(imagem, largura, altura);
-        q.recorte = area;
         // A área de trabalho e as janelas, de baixo para cima.
         q.retangulo(0, PAINEL, largura, altura - PAINEL - BARRA, COR_FUNDO);
-        let marca = letras.largura("FerrugemOS", true);
-        letras.escrever(&mut q, (largura - marca) / 2, altura / 2, 20, "FerrugemOS", 0x2F6A7E, true);
-        for (i, j) in janelas.iter().enumerate().filter(|(_, j)| !j.minimizada) {
-            j.desenhar(&mut q, letras, Some(i) == ativa);
+        let marca = self.letras.largura("FerrugemOS", true);
+        self.letras.escrever(q, (largura - marca) / 2, altura / 2, 20, "FerrugemOS", 0x2F6A7E, true);
+        for (i, j) in self.janelas.iter().enumerate().filter(|(_, j)| !j.minimizada) {
+            j.desenhar(q, &mut self.letras, Some(i) == ativa);
         }
         if let Some((x, y, w, h)) = contorno {
             q.moldura(x, y, w, h, COR_ATIVA);
             q.moldura(x + 1, y + 1, w - 2, h - 2, COR_ATIVA);
         }
-        // O painel de cima: o menu de aplicativos e o relógio.
+        // O painel de cima: Aplicativos, o relógio no meio e o botão do painel de controle.
         q.retangulo(0, 0, largura, PAINEL, COR_PAINEL);
-        let (ax, ay, aw, ah) = *area_aplicativos;
-        q.retangulo(ax, ay, aw, ah, if *menu_aberto { COR_ATIVA } else { 0x30353F });
-        letras.escrever(&mut q, ax + 10, ay, ah, "Aplicativos", COR_TEXTO, true);
-        let relogio = format!("{} UTC", hora);
-        let w = letras.largura(&relogio, false);
-        letras.escrever(&mut q, largura - w - 12, 0, PAINEL, &relogio, COR_TEXTO, false);
+        let (ax, ay, aw, ah) = self.area_aplicativos;
+        q.retangulo_redondo(ax, ay, aw, ah, 9, if self.menu_aberto { COR_ATIVA } else { 0x30353F });
+        self.letras.escrever(q, ax + 10, ay, ah, "Aplicativos", COR_TEXTO, true);
+        let relogio = self.texto_do_relogio();
+        let w = self.letras.largura(&relogio, true);
+        self.letras.escrever(q, (largura - w) / 2, 0, PAINEL, &relogio, COR_TEXTO, true);
+        let (sx, sy, sw, sh) = self.area_status;
+        let fundo_status = if self.controle_aberto { COR_ATIVA } else { COR_PAINEL };
+        q.retangulo_redondo(sx, sy, sw, sh, 9, fundo_status);
+        let mut x = sx + 10;
+        if self.ajustes.noturna {
+            self.letras.escrever(q, x, sy, sh, "☾", COR_TEXTO, false);
+            x += 18;
+        }
+        self.letras.escrever(q, x, sy, sh, if self.ajustes.escuro { "◐" } else { "☀" }, COR_TEXTO, false);
+        icone_desligar(q, sx + sw - 18, sy + sh / 2, COR_TEXTO, fundo_status);
         // A barra de tarefas.
         q.retangulo(0, altura - BARRA, largura, BARRA, COR_PAINEL);
         for (i, (x, y, w, h)) in entradas {
-            let j = &janelas[i];
+            let j = &self.janelas[i];
             let cor = if Some(i) == ativa {
                 COR_ATIVA
             } else if j.minimizada {
@@ -720,19 +797,21 @@ impl Servidor {
             } else {
                 0x30353F
             };
-            q.retangulo(x, y, w, h, cor);
+            q.retangulo_redondo(x, y, w, h, 6, cor);
             let texto = if j.minimizada { 0x9AA0AA } else { COR_TEXTO };
-            com_recorte(&mut q, (x + 4, y, w - 8, h), |q| {
-                letras.escrever(q, x + 8, y, h, &j.titulo, texto, false);
+            let titulo = j.titulo.clone();
+            let letras = &mut self.letras;
+            com_recorte(q, (x + 4, y, w - 8, h), |q| {
+                letras.escrever(q, x + 8, y, h, &titulo, texto, false);
             });
         }
-        // O menu aberto, por cima de tudo.
-        if *menu_aberto {
-            let (mx, my, mw, mh) = *area_menu;
+        // O menu Aplicativos, por cima de tudo.
+        if self.menu_aberto {
+            let (mx, my, mw, mh) = self.area_menu;
             q.retangulo(mx + 3, my + 3, mw, mh, 0x0E2630);
             q.retangulo(mx, my, mw, mh, COR_BORDA);
             q.retangulo(mx + 1, my + 1, mw - 2, mh - 2, 0x262B34);
-            let sobre = contem(*area_menu, mouse.0, mouse.1).then(|| (mouse.1 - my - 4) / ITEM_MENU);
+            let sobre = contem(self.area_menu, self.mouse.0, self.mouse.1).then(|| (self.mouse.1 - my - 4) / ITEM_MENU);
             for (k, (rotulo, _)) in APLICATIVOS.iter().enumerate() {
                 let iy = my + 4 + k as i32 * ITEM_MENU;
                 if sobre == Some(k as i32) {
@@ -741,36 +820,46 @@ impl Servidor {
                 if k == APLICATIVOS.len() - 1 {
                     q.retangulo(mx + 8, iy - 1, mw - 16, 1, 0x4C566A);
                 }
-                letras.escrever(&mut q, mx + 16, iy, ITEM_MENU, rotulo, COR_TEXTO, false);
+                self.letras.escrever(q, mx + 16, iy, ITEM_MENU, rotulo, COR_TEXTO, false);
             }
         }
-        self.hora_mostrada = hora;
-        // Para a tela, só o pedaço que mudou; o cursor vai por cima.
-        let (x, y, w, h) = area;
-        for linha in y..y + h {
-            let i = (linha * largura + x) as usize;
-            self.tela[i..i + w as usize].copy_from_slice(&self.imagem[i..i + w as usize]);
+        if self.controle_aberto {
+            self.desenhar_controle(q);
         }
-        self.desenhar_cursor();
+        // Um aviso (captura de tela salva...), no alto, no meio.
+        if let Some((texto, _)) = self.aviso.clone() {
+            let w = self.letras.largura(&texto, false) + 40;
+            let (x, y) = ((largura - w) / 2, PAINEL + 10);
+            q.retangulo_redondo(x, y, w, 36, 18, 0x2E2E33);
+            self.letras.escrever(q, x + 20, y, 36, &texto, PC_TEXTO, false);
+        }
     }
 
     /// Apaga o cursor (repondo o que havia embaixo) e o desenha na posição nova.
     fn desenhar_cursor(&mut self) {
         let (l, a) = (self.largura, self.altura);
+        let filtro = self.filtro();
+        // Repõe o que estava embaixo (o tamanho do cursor grande, que cobre o normal).
         if let Some((x0, y0)) = self.cursor_desenhado.take() {
-            for y in y0..(y0 + 16).min(a) {
-                for x in x0..(x0 + 12).min(l) {
+            for y in y0..(y0 + 32).min(a) {
+                for x in x0..(x0 + 24).min(l) {
                     let i = (y * l + x) as usize;
-                    self.tela[i] = self.imagem[i];
+                    self.tela[i] = Self::filtrar(filtro, self.imagem[i]);
                 }
             }
         }
         let (mx, my) = self.mouse;
+        let escala = if self.ajustes.cursor_grande { 2 } else { 1 };
         for (dy, linha) in CURSOR.iter().enumerate() {
             for (dx, c) in linha.bytes().enumerate() {
-                let (x, y) = (mx + dx as i32, my + dy as i32);
-                if x < l && y < a && c != b' ' {
-                    self.tela[(y * l + x) as usize] = if c == b'#' { 0 } else { 0xFFFFFF };
+                if c == b' ' {
+                    continue;
+                }
+                for (ex, ey) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().take(escala * escala) {
+                    let (x, y) = (mx + dx as i32 * escala as i32 + ex, my + dy as i32 * escala as i32 + ey);
+                    if x < l && y < a {
+                        self.tela[(y * l + x) as usize] = if c == b'#' { 0 } else { 0xFFFFFF };
+                    }
                 }
             }
         }
@@ -949,6 +1038,26 @@ impl Servidor {
 
     fn apertou(&mut self, botao: u8) {
         let (x, y) = self.mouse;
+        if self.travada {
+            return; // na tela bloqueada, só o teclado (a senha)
+        }
+        // O painel de controle: o clique dentro dele é dele; fora, fecha.
+        if self.controle_aberto {
+            let (px, py, _, _) = self.area_controle();
+            if contem(self.area_controle(), x, y) {
+                self.clique_no_controle(x - px, y - py);
+            } else {
+                self.fechar_controle();
+            }
+            return;
+        }
+        if contem(self.area_status, x, y) {
+            self.controle_aberto = true;
+            self.menu_aberto = false;
+            self.marcar(self.area_controle());
+            self.marcar_painel();
+            return;
+        }
         // Com o menu aberto, o clique é dele (escolher, ou fechar clicando fora).
         if self.menu_aberto {
             self.menu_aberto = false;
@@ -1035,6 +1144,9 @@ impl Servidor {
 
     fn soltou(&mut self, botao: u8) {
         let (x, y) = self.mouse;
+        if core::mem::take(&mut self.arrastando_brilho) {
+            self.ajustes.salvar();
+        }
         if let Some(Arraste::Redimensionar { largura, altura }) = self.arraste.take() {
             if let Some(n) = self.janelas.len().checked_sub(1) {
                 self.redimensionar(n, largura, altura);
@@ -1125,6 +1237,14 @@ impl Servidor {
         if self.menu_aberto {
             self.marcar(self.area_menu); // o item sob o mouse muda de cor
         }
+        if self.arrastando_brilho {
+            let x = mx - self.area_controle().0;
+            self.ajustar_brilho(x);
+            return;
+        }
+        if self.controle_aberto {
+            self.marcar(self.area_controle());
+        }
         if self.selecionando {
             if let Some(j) = self.janelas.last_mut() {
                 let (lx, ly) = j.local(mx, my);
@@ -1153,6 +1273,14 @@ impl Servidor {
     // ------------------------------------------------------------- teclado
 
     fn teclado(&mut self, dados: &[u8]) {
+        if self.travada {
+            self.tecla_na_tela_bloqueada(dados);
+            return;
+        }
+        if self.controle_aberto && dados == b"\x1b" {
+            self.fechar_controle();
+            return;
+        }
         // Alt+Tab (ESC + Tab, veja o teclado do kernel): a janela de baixo vem
         // para a frente — repetindo, passa por todas.
         let mut resto: &[u8] = dados;
@@ -1182,8 +1310,16 @@ impl Servidor {
                 while let Some(ch) = letras.next() {
                     if ch == '\x1b' && letras.peek() == Some(&'[') {
                         letras.next();
-                        if let Some(l @ 'A'..='D') = letras.next() {
-                            let _ = sys::escrever_tudo(c.fd, format!("seta {}\n", l).as_bytes());
+                        // setas, Home e End (ESC [ letra); PgUp, PgDn e Delete (ESC [ número ~)
+                        match letras.next() {
+                            Some(l @ ('A'..='D' | 'H' | 'F')) => {
+                                let _ = sys::escrever_tudo(c.fd, format!("seta {}\n", l).as_bytes());
+                            }
+                            Some(n @ ('3' | '5' | '6')) => {
+                                letras.next(); // o "~"
+                                let _ = sys::escrever_tudo(c.fd, format!("seta {}\n", n).as_bytes());
+                            }
+                            _ => {}
                         }
                         continue;
                     }
@@ -1217,6 +1353,7 @@ impl Servidor {
         let cliente = Cliente { fd, entrada: Vec::new(), pixels, shm };
         self.nova_janela(largura, altura, titulo, Conteudo::Cliente(cliente));
         let _ = sys::escrever_tudo(fd, format!("ok {}\n", shm).as_bytes());
+        self.mandar_tema(fd);
         true
     }
 
@@ -1229,6 +1366,10 @@ impl Servidor {
             }
         } else if let Some(texto) = linha.strip_prefix("copiar ") {
             self.transferencia = ulib::janela::desescapar(texto);
+        } else if let Some(titulo) = linha.strip_prefix("titulo ") {
+            self.janelas[k].titulo = String::from(titulo);
+            self.marcar_janela(k);
+            self.marcar_barra();
         } else if linha == "colar" {
             if let Conteudo::Cliente(c) = &self.janelas[k].conteudo {
                 let resposta = format!("colar {}\n", ulib::janela::escapar(&self.transferencia));
@@ -1328,8 +1469,15 @@ impl Servidor {
                 }
             }
             while let Ok(Some(_)) = sys::recolher_terminado() {}
-            if sys::formatar_data(sys::hora_atual())[11..16] != self.hora_mostrada {
+            if self.texto_do_relogio() != self.hora_mostrada {
                 self.marcar_painel();
+                if self.travada {
+                    self.marcar_tudo();
+                }
+            }
+            if self.aviso.as_ref().is_some_and(|(_, ate)| sys::tempo_ms() > *ate) {
+                self.aviso = None;
+                self.marcar((0, PAINEL, self.largura, 60));
             }
             if self.sujo.is_some() {
                 self.compor();
@@ -1424,6 +1572,18 @@ fn principal(_args: &[&str]) -> i32 {
         proxima_posicao: 0,
         hora_mostrada: String::new(),
         sair: false,
+        ajustes: Ajustes::carregar(),
+        controle_aberto: false,
+        menu_desligar: false,
+        arrastando_brilho: false,
+        area_status: (largura - 82, 3, 76, PAINEL - 6),
+        refiltrar: true,
+        aviso: None,
+        cpus: String::from_utf8_lossy(&sys::ler_arquivo("/proc/cpuinfo").unwrap_or_default()).matches("processor").count(),
+        travada: false,
+        senha: String::new(),
+        senha_errada: false,
+        pode_bloquear: sys::ler_arquivo("/etc/shadow").is_ok(),
     };
     s.marcar_tudo();
     s.abrir_terminal();
@@ -1436,4 +1596,433 @@ fn principal(_args: &[&str]) -> i32 {
     }
     let _ = sys::remover(ulib::janela::SOCKET);
     0
+}
+
+// -----------------------------------------------------------------------------
+// O painel de controle (as "configurações rápidas", no canto do painel)
+// -----------------------------------------------------------------------------
+
+/// O que o painel de controle liga e desliga. Fica guardado em ~/.janelas.
+struct Ajustes {
+    escuro: bool,
+    noturna: bool,
+    segundos: bool,
+    cursor_grande: bool,
+    /// Brilho, de 30 a 100 (%).
+    brilho: i32,
+}
+
+impl Ajustes {
+    fn arquivo() -> String {
+        format!("{}/.janelas", variavel("HOME").unwrap_or("/"))
+    }
+
+    fn carregar() -> Ajustes {
+        let mut a = Ajustes { escuro: false, noturna: false, segundos: false, cursor_grande: false, brilho: 100 };
+        let texto = sys::ler_arquivo(&Self::arquivo()).unwrap_or_default();
+        for linha in String::from_utf8_lossy(&texto).lines() {
+            let Some((chave, valor)) = linha.split_once('=') else { continue };
+            let ligado = valor.trim() == "1";
+            match chave.trim() {
+                "escuro" => a.escuro = ligado,
+                "noturna" => a.noturna = ligado,
+                "segundos" => a.segundos = ligado,
+                "cursor_grande" => a.cursor_grande = ligado,
+                "brilho" => a.brilho = valor.trim().parse().unwrap_or(100),
+                _ => {}
+            }
+        }
+        a.brilho = a.brilho.clamp(30, 100);
+        a
+    }
+
+    fn salvar(&self) {
+        let texto = format!(
+            "escuro={}\nnoturna={}\nsegundos={}\ncursor_grande={}\nbrilho={}\n",
+            self.escuro as u8, self.noturna as u8, self.segundos as u8, self.cursor_grande as u8, self.brilho
+        );
+        let fd = sys::abrir_com_permissoes(&Self::arquivo(), sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC, 0o644);
+        if let Ok(fd) = fd {
+            let _ = sys::escrever_tudo(fd, texto.as_bytes());
+            let _ = sys::fechar(fd);
+        }
+    }
+}
+
+const PC_LARGURA: i32 = 420;
+const PC_FUNDO: u32 = 0x232326;
+const PC_BLOCO: u32 = 0x3A3A3F;
+const PC_BLOCO_SOBRE: u32 = 0x47474D;
+const PC_TEXTO: u32 = 0xF2F2F2;
+const PC_TEXTO_FRACO: u32 = 0xB0B0B6;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Acao {
+    Captura,
+    Configuracoes,
+    Bloquear,
+    Desligar,
+}
+
+/// Os blocos que ligam e desligam: (rótulo, ícone).
+const BLOCOS: [(&str, &str); 4] = [("Estilo escuro", "◐"), ("Luz noturna", "☾"), ("Segundos", "◔"), ("Cursor grande", "")];
+const OPCOES_DESLIGAR: [&str; 3] = ["Sair da interface gráfica", "Reiniciar", "Desligar"];
+
+impl Servidor {
+    fn bloco_ligado(&self, i: usize) -> bool {
+        match i {
+            0 => self.ajustes.escuro,
+            1 => self.ajustes.noturna,
+            2 => self.ajustes.segundos,
+            _ => self.ajustes.cursor_grande,
+        }
+    }
+
+    /// Onde fica o painel de controle (o tamanho depende do que está aberto nele).
+    fn area_controle(&self) -> Area {
+        let altura = if self.menu_desligar { 70 + 3 * 52 + 12 } else { 376 };
+        (self.largura - PC_LARGURA - 8, PAINEL + 6, PC_LARGURA, altura)
+    }
+
+    /// Os botões redondos do alto: (ação, centro x relativo).
+    fn botoes_controle(&self) -> Vec<(Acao, i32)> {
+        let mut acoes = vec![Acao::Desligar];
+        if self.pode_bloquear {
+            acoes.push(Acao::Bloquear);
+        }
+        acoes.push(Acao::Configuracoes);
+        acoes.push(Acao::Captura);
+        acoes.iter().enumerate().map(|(k, &a)| (a, PC_LARGURA - 36 - k as i32 * 52)).collect()
+    }
+
+    fn area_bloco(i: usize) -> Area {
+        let w = (PC_LARGURA - 32 - 12) / 2;
+        (16 + (i as i32 % 2) * (w + 12), 124 + (i as i32 / 2) * 68, w, 56)
+    }
+
+    /// O filtro de cor (brilho e luz noturna), por canal, em 1/256; None = nenhum.
+    fn filtro(&self) -> Option<[u32; 3]> {
+        if self.ajustes.brilho >= 100 && !self.ajustes.noturna {
+            return None;
+        }
+        let b = (self.ajustes.brilho as u32 * 256) / 100;
+        Some(if self.ajustes.noturna { [b, b * 210 / 256, b * 140 / 256] } else { [b, b, b] })
+    }
+
+    fn filtrar(filtro: Option<[u32; 3]>, p: u32) -> u32 {
+        match filtro {
+            None => p,
+            Some([r, g, b]) => {
+                ((p >> 16 & 0xFF) * r >> 8) << 16 | ((p >> 8 & 0xFF) * g >> 8) << 8 | (p & 0xFF) * b >> 8
+            }
+        }
+    }
+
+    /// Um aviso que aparece por alguns segundos no alto da tela.
+    fn avisar(&mut self, texto: String) {
+        self.aviso = Some((texto, sys::tempo_ms() + 3500));
+        self.marcar((0, PAINEL, self.largura, 60));
+    }
+
+    fn mandar_tema(&self, fd: i32) {
+        let tema = if self.ajustes.escuro { "tema escuro\n" } else { "tema claro\n" };
+        let _ = sys::escrever_tudo(fd, tema.as_bytes());
+    }
+
+    fn fechar_controle(&mut self) {
+        self.marcar(self.area_controle());
+        self.marcar_painel();
+        self.controle_aberto = false;
+        self.menu_desligar = false;
+    }
+
+    /// Um clique dentro do painel de controle, em coordenadas dele.
+    fn clique_no_controle(&mut self, x: i32, y: i32) {
+        self.marcar(self.area_controle());
+        // Os botões redondos do alto.
+        if (16..56).contains(&y) {
+            if let Some(&(acao, _)) = self.botoes_controle().iter().find(|(_, cx)| (x - cx).abs() <= 20) {
+                match acao {
+                    Acao::Desligar => self.menu_desligar = !self.menu_desligar,
+                    Acao::Captura => {
+                        self.fechar_controle();
+                        self.capturar_tela();
+                    }
+                    Acao::Configuracoes => {
+                        self.fechar_controle();
+                        if sys::stat("/bin/configuracoes").is_ok() {
+                            self.lancar("configuracoes");
+                        } else {
+                            self.avisar(String::from("O aplicativo de configurações ainda não está instalado"));
+                        }
+                    }
+                    Acao::Bloquear => {
+                        self.fechar_controle();
+                        self.travada = true;
+                        self.senha.clear();
+                        self.senha_errada = false;
+                        self.marcar_tudo();
+                    }
+                }
+                self.marcar(self.area_controle());
+            }
+            return;
+        }
+        if self.menu_desligar {
+            let k = (y - 70) / 52;
+            if (70..70 + 3 * 52).contains(&y) {
+                match k {
+                    0 => self.sair = true,
+                    1 => self.lancar("reiniciar"),
+                    _ => self.lancar("desligar"),
+                }
+            }
+            return;
+        }
+        // O brilho: clicar (e arrastar) no controle.
+        if (70..110).contains(&y) && (16..PC_LARGURA - 16).contains(&x) {
+            self.arrastando_brilho = true;
+            self.ajustar_brilho(x);
+            return;
+        }
+        if let Some(i) = (0..BLOCOS.len()).find(|&i| contem(Self::area_bloco(i), x, y)) {
+            match i {
+                0 => {
+                    self.ajustes.escuro = !self.ajustes.escuro;
+                    let clientes: Vec<i32> = self
+                        .janelas
+                        .iter()
+                        .filter_map(|j| if let Conteudo::Cliente(c) = &j.conteudo { Some(c.fd) } else { None })
+                        .collect();
+                    for fd in clientes {
+                        self.mandar_tema(fd);
+                    }
+                }
+                1 => {
+                    self.ajustes.noturna = !self.ajustes.noturna;
+                    self.refiltrar = true;
+                }
+                2 => {
+                    self.ajustes.segundos = !self.ajustes.segundos;
+                    self.marcar_painel();
+                }
+                _ => self.ajustes.cursor_grande = !self.ajustes.cursor_grande,
+            }
+            self.ajustes.salvar();
+        }
+    }
+
+    fn ajustar_brilho(&mut self, x: i32) {
+        let novo = (30 + (x - 16) * 70 / (PC_LARGURA - 32)).clamp(30, 100);
+        if novo != self.ajustes.brilho {
+            self.ajustes.brilho = novo;
+            self.refiltrar = true;
+            self.marcar(self.area_controle());
+        }
+    }
+
+    /// Salva a tela num PNG em ~/captura-AAAAMMDD-HHMMSS.png.
+    fn capturar_tela(&mut self) {
+        self.compor();
+        let d = sys::data(sys::hora_atual());
+        let nome = format!(
+            "{}/captura-{:04}{:02}{:02}-{:02}{:02}{:02}.png",
+            variavel("HOME").unwrap_or(""),
+            d.ano,
+            d.mes,
+            d.dia,
+            d.hora,
+            d.minuto,
+            d.segundo
+        );
+        let png = ulib::png::codificar(&self.imagem, self.largura as u32, self.altura as u32);
+        let gravado = sys::abrir_com_permissoes(&nome, sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC, 0o644)
+            .and_then(|fd| sys::escrever_tudo(fd, &png).map(|_| fd))
+            .map(|fd| sys::fechar(fd));
+        match gravado {
+            Ok(_) => self.avisar(format!("Captura de tela salva em {}", nome)),
+            Err(e) => self.avisar(format!("Não consegui salvar {}: {}", nome, e)),
+        }
+    }
+
+    /// Com a tela bloqueada, o teclado vai para a senha.
+    fn tecla_na_tela_bloqueada(&mut self, dados: &[u8]) {
+        let texto = String::from_utf8_lossy(dados).into_owned();
+        let mut letras = texto.chars();
+        while let Some(c) = letras.next() {
+            match c {
+                '\r' | '\n' => {
+                    let nome = ulib::usuarios::nome_do_usuario(sys::uid());
+                    if ulib::usuarios::conferir_senha(&nome, &self.senha) {
+                        self.travada = false;
+                    } else {
+                        self.senha_errada = true;
+                    }
+                    self.senha.clear();
+                }
+                '\u{8}' | '\u{7f}' => {
+                    self.senha.pop();
+                }
+                '\u{1b}' => {
+                    letras.next(); // uma sequência (seta etc.): ignora
+                    letras.next();
+                }
+                c if !c.is_control() => {
+                    self.senha.push(c);
+                    self.senha_errada = false;
+                }
+                _ => {}
+            }
+        }
+        self.marcar_tudo();
+    }
+
+    /// O texto do relógio do painel: "qui 29 de out 21:53".
+    fn texto_do_relogio(&self) -> String {
+        const DIAS: [&str; 7] = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
+        const MESES: [&str; 12] = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+        let d = sys::data(sys::hora_atual());
+        let hora = if self.ajustes.segundos {
+            format!("{:02}:{:02}:{:02}", d.hora, d.minuto, d.segundo)
+        } else {
+            format!("{:02}:{:02}", d.hora, d.minuto)
+        };
+        format!("{} {} de {}  {}", DIAS[d.dia_da_semana as usize], d.dia, MESES[d.mes as usize - 1], hora)
+    }
+}
+
+/// O botão de desligar: um anel aberto em cima, com um traço.
+fn icone_desligar(q: &mut Quadro, cx: i32, cy: i32, cor: u32, fundo: u32) {
+    q.anel(cx * 2, cy * 2, 15, 11, cor);
+    q.retangulo(cx - 3, cy - 8, 6, 6, fundo);
+    q.retangulo(cx - 1, cy - 9, 2, 8, cor);
+}
+
+/// Um cadeado.
+fn icone_cadeado(q: &mut Quadro, cx: i32, cy: i32, cor: u32) {
+    q.anel(cx * 2 + 1, cy * 2 - 4, 10, 6, cor);
+    q.retangulo_redondo(cx - 6, cy - 1, 13, 10, 2, cor);
+}
+
+/// Uma câmera fotográfica.
+fn icone_camera(q: &mut Quadro, cx: i32, cy: i32, cor: u32, fundo: u32) {
+    q.retangulo_redondo(cx - 9, cy - 5, 18, 13, 3, cor);
+    q.retangulo(cx - 3, cy - 8, 6, 3, cor);
+    q.circulo_suave(cx * 2, cy * 2 + 2, 9, fundo);
+    q.circulo_suave(cx * 2, cy * 2 + 2, 5, cor);
+}
+
+/// O cursor do mouse em miniatura (para o bloco "Cursor grande").
+fn icone_cursor(q: &mut Quadro, x: i32, y: i32, cor: u32) {
+    for (dy, linha) in CURSOR.iter().enumerate() {
+        for (dx, c) in linha.bytes().enumerate() {
+            if c == b'#' || c == b'.' {
+                q.ponto(x + dx as i32, y + dy as i32, cor);
+            }
+        }
+    }
+}
+
+impl Servidor {
+    /// Desenha o painel de controle aberto.
+    fn desenhar_controle(&mut self, q: &mut Quadro) {
+        let (px, py, pw, ph) = self.area_controle();
+        let destaque = COR_ATIVA;
+        let botoes = self.botoes_controle();
+        let ligados: Vec<bool> = (0..BLOCOS.len()).map(|i| self.bloco_ligado(i)).collect();
+        q.retangulo_redondo(px + 2, py + 4, pw, ph, 20, 0x0A0B0D);
+        q.retangulo_redondo(px, py, pw, ph, 20, 0x3A3A40);
+        q.retangulo_redondo(px + 1, py + 1, pw - 2, ph - 2, 19, PC_FUNDO);
+        let letras = &mut self.letras;
+        // A pílula do sistema e os botões redondos.
+        let resumo = format!("⚡ {} CPUs", self.cpus);
+        let w = letras.largura_em(&resumo, true, 14) + 32;
+        q.retangulo_redondo(px + 16, py + 16, w, 40, 20, PC_BLOCO);
+        letras.escrever_em(q, px + 32, py + 26, &resumo, PC_TEXTO, true, 14);
+        for (acao, cx) in botoes {
+            let (cx, cy) = (px + cx, py + 36);
+            let ligado = acao == Acao::Desligar && self.menu_desligar;
+            let fundo = if ligado { destaque } else { PC_BLOCO };
+            q.circulo_suave(cx * 2, cy * 2, 40, fundo);
+            match acao {
+                Acao::Desligar => icone_desligar(q, cx, cy, PC_TEXTO, fundo),
+                Acao::Bloquear => icone_cadeado(q, cx, cy, PC_TEXTO),
+                Acao::Captura => icone_camera(q, cx, cy, PC_TEXTO, fundo),
+                Acao::Configuracoes => letras.centrado(q, cx, cy - 11, "⚙", PC_TEXTO, false, 18),
+            }
+        }
+        if self.menu_desligar {
+            for (k, opcao) in OPCOES_DESLIGAR.iter().enumerate() {
+                let y = py + 70 + k as i32 * 52;
+                let sobre = contem((px + 16, y, pw - 32, 44), self.mouse.0, self.mouse.1);
+                q.retangulo_redondo(px + 16, y, pw - 32, 44, 22, if sobre { PC_BLOCO_SOBRE } else { PC_BLOCO });
+                letras.escrever_em(q, px + 36, y + 13, opcao, PC_TEXTO, true, 14);
+            }
+            return;
+        }
+        // O brilho: a parte cheia, na cor de destaque, até o valor atual.
+        let (bx, by, bw) = (px + 16, py + 70, pw - 32);
+        q.retangulo_redondo(bx, by, bw, 40, 20, PC_BLOCO);
+        let cheio = 40 + (bw - 40) * (self.ajustes.brilho - 30) / 70;
+        q.retangulo_redondo(bx, by, cheio, 40, 20, destaque);
+        letras.escrever_em(q, bx + 14, by + 10, "☀", PC_TEXTO, false, 16);
+        letras.escrever_em(q, bx + bw - 52, by + 12, &format!("{}%", self.ajustes.brilho), PC_TEXTO, true, 13);
+        // Os blocos que ligam e desligam.
+        for (i, (rotulo, icone)) in BLOCOS.iter().enumerate() {
+            let (x, y, w, h) = Self::area_bloco(i);
+            let ligado = ligados[i];
+            q.retangulo_redondo(px + x, py + y, w, h, 28, if ligado { destaque } else { PC_BLOCO });
+            if icone.is_empty() {
+                icone_cursor(q, px + x + 20, py + y + 20, PC_TEXTO);
+            } else {
+                letras.escrever_em(q, px + x + 18, py + y + 18, icone, PC_TEXTO, false, 16);
+            }
+            letras.escrever_em(q, px + x + 48, py + y + 11, rotulo, PC_TEXTO, true, 13);
+            let estado = if ligado { "Ligado" } else { "Desligado" };
+            letras.escrever_em(q, px + x + 48, py + y + 29, estado, PC_TEXTO_FRACO, false, 11);
+        }
+        // O cartão do sistema: memória e tempo ligado (do /proc).
+        let (cx, cy, cw) = (px + 16, py + 260, pw - 32);
+        q.retangulo_redondo(cx, cy, cw, 100, 16, 0x2E2E33);
+        let meminfo = String::from_utf8_lossy(&sys::ler_arquivo("/proc/meminfo").unwrap_or_default()).into_owned();
+        let campo = |nome: &str| -> u64 {
+            meminfo.lines().find(|l| l.starts_with(nome)).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()).unwrap_or(0)
+        };
+        let (total, livre) = (campo("MemTotal:") / 1024, campo("MemFree:") / 1024);
+        let uptime = String::from_utf8_lossy(&sys::ler_arquivo("/proc/uptime").unwrap_or_default()).into_owned();
+        let segundos: u64 = uptime.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        letras.escrever_em(q, cx + 18, cy + 14, "Sistema", PC_TEXTO, true, 14);
+        let ligado = format!("ligado há {} min · {} janelas", segundos / 60, self.janelas.len());
+        let w = letras.largura_em(&ligado, false, 12);
+        letras.escrever_em(q, cx + cw - 18 - w, cy + 16, &ligado, PC_TEXTO_FRACO, false, 12);
+        letras.escrever_em(q, cx + 18, cy + 42, &format!("Memória: {} de {} MiB em uso", total - livre, total), PC_TEXTO, false, 12);
+        q.retangulo_redondo(cx + 18, cy + 66, cw - 36, 10, 5, PC_BLOCO);
+        let usado = if total > 0 { ((cw - 36) as u64 * (total - livre) / total) as i32 } else { 0 };
+        q.retangulo_redondo(cx + 18, cy + 66, usado.max(10), 10, 5, destaque);
+    }
+
+    /// A tela bloqueada: o relógio grande e a senha.
+    fn desenhar_bloqueio(&mut self, q: &mut Quadro) {
+        let (l, a) = (self.largura, self.altura);
+        q.retangulo(0, 0, l, a, 0x0E1A20);
+        let d = sys::data(sys::hora_atual());
+        let relogio = self.texto_do_relogio();
+        let letras = &mut self.letras;
+        letras.centrado(q, l / 2, a / 2 - 170, &format!("{:02}:{:02}", d.hora, d.minuto), PC_TEXTO, true, 72);
+        let data = relogio.rsplit_once("  ").map_or(relogio.as_str(), |(dia, _)| dia).to_string();
+        letras.centrado(q, l / 2, a / 2 - 70, &data, PC_TEXTO_FRACO, false, 18);
+        let nome = ulib::usuarios::nome_do_usuario(sys::uid());
+        q.circulo_suave(l, a - 40, 48, COR_ATIVA);
+        letras.centrado(q, l / 2, a / 2 - 20 - 15, &nome[..nome.len().min(1)].to_uppercase(), PC_TEXTO, true, 24);
+        letras.centrado(q, l / 2, a / 2 + 34, &nome, PC_TEXTO, true, 16);
+        let (fx, fy, fw) = (l / 2 - 140, a / 2 + 70, 280);
+        q.retangulo_redondo(fx, fy, fw, 40, 20, if self.senha_errada { 0x7A2020 } else { PC_BLOCO });
+        let pontos: String = self.senha.chars().map(|_| '•').collect();
+        let dica = if self.senha.is_empty() { "Senha" } else { &pontos };
+        let cor = if self.senha.is_empty() { PC_TEXTO_FRACO } else { PC_TEXTO };
+        letras.escrever_em(q, fx + 20, fy + 11, dica, cor, false, 14);
+        if self.senha_errada {
+            letras.centrado(q, l / 2, fy + 56, "Senha incorreta", 0xFF8A80, false, 13);
+        }
+    }
 }

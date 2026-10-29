@@ -105,6 +105,60 @@ impl<'a> Quadro<'a> {
         }
     }
 
+    /// Quanto de um pixel fica dentro do círculo de centro (cx, cy) — tudo em
+    /// 1/8 de pixel —, testando 16 pontos espalhados nele (0 a 16).
+    fn cobertura(px: i32, py: i32, cx8: i32, cy8: i32, raio8: i32) -> i32 {
+        let mut dentro = 0;
+        for i in 0..4 {
+            for j in 0..4 {
+                let (dx, dy) = (px * 8 + 2 * i + 1 - cx8, py * 8 + 2 * j + 1 - cy8);
+                dentro += (dx * dx + dy * dy <= raio8 * raio8) as i32;
+            }
+        }
+        dentro
+    }
+
+    /// Retângulo com cantos redondos de raio qualquer, com as curvas suavizadas.
+    pub fn retangulo_redondo(&mut self, x: i32, y: i32, largura: i32, altura: i32, raio: i32, cor: u32) {
+        let r = raio.min(largura / 2).min(altura / 2).max(0);
+        self.retangulo(x + r, y, largura - 2 * r, altura, cor);
+        self.retangulo(x, y + r, r, altura - 2 * r, cor);
+        self.retangulo(x + largura - r, y + r, r, altura - 2 * r, cor);
+        // Os quatro cantos: cada um, um quarto de círculo.
+        let centros = [(x + r, y + r, x, y), (x + largura - r, y + r, x + largura - r, y),
+                       (x + r, y + altura - r, x, y + altura - r), (x + largura - r, y + altura - r, x + largura - r, y + altura - r)];
+        for (cx, cy, x0, y0) in centros {
+            for py in y0..y0 + r {
+                for px in x0..x0 + r {
+                    let c = Self::cobertura(px, py, cx * 8, cy * 8, r * 8);
+                    self.misturar(px, py, cor, (c * 255 / 16) as u8);
+                }
+            }
+        }
+    }
+
+    /// Círculo cheio com a borda suavizada; centro e raio em 1/2 pixel
+    /// (assim dá para centrar entre dois pixels).
+    pub fn circulo_suave(&mut self, cx2: i32, cy2: i32, raio2: i32, cor: u32) {
+        self.anel(cx2, cy2, raio2, 0, cor);
+    }
+
+    /// Anel (o que fica entre dois círculos), com as bordas suavizadas; em 1/2 pixel.
+    pub fn anel(&mut self, cx2: i32, cy2: i32, externo2: i32, interno2: i32, cor: u32) {
+        let (cx8, cy8) = (cx2 * 4, cy2 * 4);
+        let r = externo2 / 2 + 1;
+        for py in cy2 / 2 - r..=cy2 / 2 + r {
+            for px in cx2 / 2 - r..=cx2 / 2 + r {
+                let fora = Self::cobertura(px, py, cx8, cy8, externo2 * 4);
+                let dentro = if interno2 > 0 { Self::cobertura(px, py, cx8, cy8, interno2 * 4) } else { 0 };
+                let c = fora - dentro;
+                if c > 0 {
+                    self.misturar(px, py, cor, (c * 255 / 16) as u8);
+                }
+            }
+        }
+    }
+
     /// Escurece a imagem inteira (o fundo atrás de uma caixa de diálogo).
     pub fn escurecer(&mut self, alfa: u8) {
         for y in 0..self.altura {

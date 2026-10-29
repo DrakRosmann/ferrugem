@@ -13,6 +13,7 @@
 //!   servidor → cliente:  ok 12\n  tecla 97\n  seta A\n  botao 10 20 1 1\n  mover 11 21\n
 //!                        roda 11 21 -1\n  fechar\n  colar <texto>\n
 //!                        tamanho 400 300 13\n   (redimensionada: a imagem nova é o segmento 13)
+//!                        tema escuro\n  tema claro\n   (o estilo escolhido no painel de controle)
 //!
 //! O texto da área de transferência vai numa linha só: `\\` vira `\\\\` e a
 //! quebra de linha vira `\\n`.
@@ -32,6 +33,12 @@ pub enum Seta {
     Baixo,
     Direita,
     Esquerda,
+    Inicio,
+    Fim,
+    PaginaAcima,
+    PaginaAbaixo,
+    /// A tecla Delete (apaga o caractere à direita).
+    Delete,
 }
 
 pub struct Janela {
@@ -59,6 +66,8 @@ pub enum Evento {
     Tamanho { largura: i32, altura: i32 },
     /// A resposta de `pedir_colagem`: o texto da área de transferência.
     Colar(String),
+    /// O estilo escuro foi ligado ou desligado (no painel de controle).
+    Tema { escuro: bool },
 }
 
 /// Põe o texto numa linha só, para o protocolo.
@@ -129,6 +138,24 @@ impl Janela {
         let _ = sys::escrever_tudo(self.fd, b"colar\n");
     }
 
+    /// Troca o título da janela.
+    pub fn mudar_titulo(&mut self, titulo: &str) {
+        let _ = sys::escrever_tudo(self.fd, format!("titulo {}\n", titulo).as_bytes());
+    }
+
+    /// Como `evento`, mas desiste depois de `ms` milissegundos:
+    /// `Some(None)` = o prazo passou sem nada; `None` = o servidor fechou.
+    pub fn evento_com_prazo(&mut self, ms: i32) -> Option<Option<Evento>> {
+        if !self.leitor.tem_linha() {
+            match sys::poll(&[(self.fd, sys::POLLIN)], ms) {
+                Ok(p) if p[0] != 0 => {}
+                Ok(_) => return Some(None),
+                Err(_) => return Some(None),
+            }
+        }
+        self.evento().map(Some)
+    }
+
     /// O descritor do socket (para esperar com `poll` junto com outras coisas).
     pub fn descritor(&self) -> i32 {
         self.fd
@@ -160,10 +187,16 @@ impl Janela {
                     Some("B") => Some(Evento::Seta(Seta::Baixo)),
                     Some("C") => Some(Evento::Seta(Seta::Direita)),
                     Some("D") => Some(Evento::Seta(Seta::Esquerda)),
+                    Some("H") => Some(Evento::Seta(Seta::Inicio)),
+                    Some("F") => Some(Evento::Seta(Seta::Fim)),
+                    Some("5") => Some(Evento::Seta(Seta::PaginaAcima)),
+                    Some("6") => Some(Evento::Seta(Seta::PaginaAbaixo)),
+                    Some("3") => Some(Evento::Seta(Seta::Delete)),
                     _ => None,
                 },
                 Some("fechar") => Some(Evento::Fechar),
                 Some("colar") => Some(Evento::Colar(desescapar(linha.get(6..).unwrap_or("")))),
+                Some("tema") => Some(Evento::Tema { escuro: partes.next() == Some("escuro") }),
                 Some("tamanho") => {
                     let (largura, altura, id) = (numero(), numero(), numero());
                     match sys::shmat(id) {

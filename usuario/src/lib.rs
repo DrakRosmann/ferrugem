@@ -31,6 +31,7 @@ pub mod cp437;
 mod lista_livre;
 mod memoria;
 pub mod sha256;
+pub mod png;
 pub mod sys;
 pub mod truetype;
 pub mod ui;
