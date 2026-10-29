@@ -111,19 +111,29 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     aleatorio::init();
     let discos = blocos::init();
     vfs::init();
-    let Some(modulo) = info.modulos().next() else {
-        panic!("nenhum initrd: rode com `make run` (que passa -initrd ao QEMU)");
-    };
-    let dados = unsafe {
-        core::slice::from_raw_parts(modulo.inicio as *const u8, (modulo.fim - modulo.inicio) as usize)
-    };
-    ok(format_args!("initrd: {} arquivos carregados em / (sistema de arquivos em memória)", initrd::carregar(dados)));
-
+    // Com `raiz=/dev/hdX` na linha de comando, o sistema inteiro vem do disco;
+    // senão, do initrd (copiado para a memória) e o disco fica em /disco.
+    let linha = info.linha_de_comando();
+    let raiz = linha.split(' ').find_map(|p| p.strip_prefix("raiz=/dev/"));
     if discos.is_empty() {
-        println!("  [ -- ] nenhum disco ATA: /disco não vai existir");
+        println!("  [ -- ] nenhum disco ATA");
     } else {
         ok(format_args!("discos: {}", discos.join("; ")));
-        montar_primeiro_ext2();
+    }
+    match raiz {
+        Some(nome) => montar_raiz(nome),
+        None => {
+            let Some(modulo) = info.modulos().next() else {
+                panic!("nenhum initrd e nenhum raiz=/dev/... na linha de comando: rode com `make run`");
+            };
+            let dados = unsafe {
+                core::slice::from_raw_parts(modulo.inicio as *const u8, (modulo.fim - modulo.inicio) as usize)
+            };
+            ok(format_args!("initrd: {} arquivos carregados em / (na memória)", initrd::carregar(dados)));
+            if !discos.is_empty() {
+                montar_primeiro_ext2();
+            }
+        }
     }
 
     pic::init();
@@ -140,6 +150,22 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
 
     // Daqui em diante, este fluxo é o processo 0: o ocioso.
     processo::ocioso()
+}
+
+/// A raiz no disco: o ext2 de /dev/<nome> vira o "/".
+fn montar_raiz(nome: &str) {
+    let Some(bloco) = blocos::buscar(nome) else {
+        panic!("raiz=/dev/{}: esse disco não existe", nome);
+    };
+    let fs = match ext2::Ext2::montar(bloco) {
+        Ok(fs) => fs,
+        Err(motivo) => panic!("raiz=/dev/{}: {}", nome, motivo),
+    };
+    let dispositivo = alloc::format!("/dev/{}", nome);
+    match vfs::trocar_raiz(vfs::Vnode::Disco(fs, ext2::RAIZ), &dispositivo) {
+        Ok(()) => ok(format_args!("raiz no disco: {} (ext2) montado em /; /dev, /proc e /tmp por cima", dispositivo)),
+        Err(e) => panic!("raiz=/dev/{}: faltam /dev, /proc ou /tmp no disco (erro {})", nome, e),
+    }
 }
 
 /// Monta em /disco o primeiro disco (ou partição) com ext2.

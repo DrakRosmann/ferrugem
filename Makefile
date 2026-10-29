@@ -6,6 +6,8 @@
 #    make run-nox  roda só no terminal (sem janela; Ctrl+A depois X para sair)
 #    make teste    boota, roda a bateria de testes (/bin/teste) e desliga
 #    make disco    recria o disco ext2 (disco.img) do zero
+#    make run-sistema  boota com a raiz no disco (sistema.img: o sistema inteiro num ext2)
+#    make sistema  recria o sistema.img do zero
 #    make musl     baixa e compila a musl (libc) para os programas em C de c/
 #    make lua      baixa e compila o Lua 5.4 (sem modificações) para /bin/lua
 #    make clean
@@ -26,6 +28,8 @@ RUSTLIB := target/$(TARGET)/release/libferrugem.a
 INITRD    := $(BUILD)/initrd.tar
 # Fora de build/ de propósito: o `make clean` não apaga o que você gravou no disco.
 DISCO     := disco.img
+# O sistema inteiro num disco ext2, para bootar com a raiz no disco (make run-sistema).
+SISTEMA   := sistema.img
 RAIZ      := $(BUILD)/raiz
 USUARIO_OK := $(BUILD)/usuario.ok
 USUARIO_BIN := usuario/target/$(TARGET)/release
@@ -53,7 +57,7 @@ ARQUIVOS_RAIZ := $(shell find raiz -type f)
 QEMU := qemu-system-x86_64 -cpu max -kernel $(KERNEL) -initrd $(INITRD) -m 256M \
         -drive file=$(DISCO),format=raw,if=ide,index=0
 
-.PHONY: all run run-nox teste clean disco musl lua
+.PHONY: all run run-nox run-sistema sistema teste clean disco musl lua
 
 all: $(KERNEL) $(INITRD) $(DISCO)
 
@@ -120,6 +124,19 @@ $(DISCO):
 disco:
 	rm -f $(DISCO)
 	$(MAKE) $(DISCO)
+
+# Criado uma vez (depois, o que você mudar nele fica). `make sistema` recria do zero.
+$(SISTEMA): | $(INITRD)
+	./ferramentas/sistema.sh $@
+
+sistema: $(INITRD)
+	./ferramentas/sistema.sh $(SISTEMA)
+
+# Raiz no disco: sem initrd; o kernel monta o hda como "/" (raiz=/dev/hda).
+run-sistema: $(KERNEL) $(SISTEMA)
+	qemu-system-x86_64 -cpu max -kernel $(KERNEL) -append "raiz=/dev/hda" -m 256M \
+		-drive file=$(SISTEMA),format=raw,if=ide,index=0 \
+		-chardev stdio,id=serial0,signal=off -serial chardev:serial0
 
 # signal=off: o Ctrl+C vai para o FerrugemOS em vez de matar o QEMU.
 run: all

@@ -40,6 +40,9 @@ make run        # janela do QEMU + terminal na serial (dá para digitar nos dois
 make run-nox    # só no terminal; para sair: Ctrl+A e depois X
 make teste      # boota, roda os testes do kernel e da libc, desliga e confere o disco com e2fsck
 make disco      # recria o disco (disco.img) do zero
+make run-sistema   # boota com a RAIZ NO DISCO: o sistema inteiro num ext2 (sistema.img),
+                   # onde tudo o que você muda (senhas, /home...) fica
+make sistema    # recria o sistema.img do zero
 
 make musl       # baixa (de musl.libc.org, conferindo o SHA-256) e compila a musl:
                 # depois disso os programas em c/ entram no sistema
@@ -98,6 +101,9 @@ interrompe o programa que está rodando.
   qualquer diretório; cache de disco com escrita adiada (vai para o disco no
   `sync`, ao desmontar, ao desligar ou a cada 3 s); `statfs` e `df`;
   `truncate` para qualquer tamanho; FIFOs (`mkfifo`) na memória e no ext2.
+- **Raiz no disco** (`raiz=/dev/hda` na linha de comando do kernel): o `/` vem
+  de um ext2, com `/dev`, `/proc` e um `/tmp` em memória montados por cima,
+  como numa distribuição Linux. Sem a opção, o `/` é o initrd na memória.
 - **Terminal:** edição de linha no kernel, `termios` (eco e modo canônico
   ligáveis), Ctrl+C (SIGINT) e Ctrl+Z (SIGTSTP) só para o job em primeiro
   plano, Ctrl+D vira fim de arquivo, cores ANSI tanto na VGA quanto na serial.

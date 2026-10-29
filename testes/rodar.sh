@@ -74,5 +74,38 @@ else
     cat "$temporario/fsck.txt"
     falhou=1
 fi
+# ---------------------------------------------------------------------------
+# Segunda rodada: a mesma bateria do kernel, agora com a raiz no disco
+# (raiz=/dev/hda, sem initrd): programas, /etc e /home vêm de um ext2.
+# ---------------------------------------------------------------------------
+echo
+echo "Com a raiz no disco (raiz=/dev/hda):"
+sistema="$temporario/sistema.img"
+./ferramentas/sistema.sh "$sistema" > /dev/null
+truncate -s 24M "$particionado.2"
+echo 'start=2048, size=30720, type=83' | sfdisk -q "$particionado.2" >/dev/null 2>&1
+mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E offset=1048576 "$particionado.2" 15M >/dev/null 2>&1
+{
+    sleep 2
+    printf 'root\r'; sleep 0.5; printf 'root\r'; sleep 1.5
+    printf 'teste\r'; sleep 12
+    printf 'desligar\r'; sleep 3
+} | timeout 40 qemu-system-x86_64 -cpu max -kernel build/ferrugem.bin -append "raiz=/dev/hda" -m 256M \
+        -drive file="$sistema",format=raw,if=ide,index=0 \
+        -drive file="$particionado.2",format=raw,if=ide,index=1 \
+        -display none -chardev stdio,id=s0,signal=off -serial chardev:s0 -no-reboot > "$saida.2" 2>&1
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida.2" | grep -E "raiz no disco|FALHOU|testes (passaram|falharam)" | sed 's/^/  /'
+if ! grep -q "testes passaram" "$saida.2"; then
+    echo "==> com a raiz no disco, os testes FALHARAM (fim da saída abaixo)"
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida.2" | tail -30
+    falhou=1
+elif e2fsck -fn "$sistema" > "$temporario/fsck2.txt" 2>&1; then
+    echo "==> e2fsck: o disco do sistema (a raiz) está consistente"
+else
+    echo "==> e2fsck encontrou erros no disco do sistema:"
+    cat "$temporario/fsck2.txt"
+    falhou=1
+fi
+
 [ $falhou = 0 ] && echo "==> sucesso"
 exit $falhou

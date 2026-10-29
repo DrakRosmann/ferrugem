@@ -6,3 +6,4 @@ Cargo.lock
 /ferramentas/musl
 /ferramentas/fontes
 /ferramentas/lua
+/sistema.img

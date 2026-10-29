@@ -36,6 +36,21 @@ impl Info {
         self.u32_em(0)
     }
 
+    /// A linha de comando do kernel (no QEMU: o que vem em `-append`).
+    pub fn linha_de_comando(&self) -> &'static str {
+        if self.flags() & (1 << 2) == 0 {
+            return "";
+        }
+        let ptr = self.u32_em(16) as usize as *const u8;
+        let mut tamanho = 0;
+        unsafe {
+            while *ptr.add(tamanho) != 0 && tamanho < 1024 {
+                tamanho += 1;
+            }
+            core::str::from_utf8(core::slice::from_raw_parts(ptr, tamanho)).unwrap_or("")
+        }
+    }
+
     pub fn nome_bootloader(&self) -> Option<&'static str> {
         if self.flags() & (1 << 9) == 0 {
             return None;

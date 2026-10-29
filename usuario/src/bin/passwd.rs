@@ -42,7 +42,12 @@ fn principal(args: &[&str]) -> i32 {
     }
     match usuarios::trocar_senha(&nome, &nova) {
         Ok(()) => {
-            println!("passwd: senha alterada (vale até desligar: o /etc fica na memória)");
+            // Com a raiz no disco (ext2), a senha nova fica; com o initrd, o /etc vive na memória.
+            if sys::statfs("/etc").is_ok_and(|i| i.tipo == 0xEF53) {
+                println!("passwd: senha alterada");
+            } else {
+                println!("passwd: senha alterada (vale até desligar: com o initrd, o /etc fica na memória)");
+            }
             0
         }
         Err(e) => {

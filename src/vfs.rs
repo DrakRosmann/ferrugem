@@ -454,6 +454,24 @@ pub fn init() {
     }
 }
 
+/// Troca a raiz: `nova` (um disco) passa a ser o "/", e por cima dela vão o
+/// /dev e o /proc do kernel e um /tmp em memória. Os diretórios /dev, /proc
+/// e /tmp precisam existir no disco (são só os pontos de montagem).
+pub fn trocar_raiz(nova: Vnode, dispositivo: &str) -> Result<(), i64> {
+    let memoria = Vnode::Memoria(RAIZ.lock().clone().ok_or(EINVAL)?);
+    let dev = memoria.filho("dev")?;
+    MONTAGENS.lock().push(Montagem {
+        ponto: memoria.id(),
+        raiz: nova,
+        caminho: String::from("/"),
+        dispositivo: String::from(dispositivo),
+        tipo: String::from("ext2"),
+    });
+    montar("/dev", dev, "devtmpfs", "devtmpfs")?;
+    montar("/proc", Vnode::Proc(NoProc::Raiz), "proc", "proc")?;
+    montar("/tmp", novo_tmpfs(), "tmpfs", "tmpfs")
+}
+
 /// Um sistema de arquivos em memória novo e vazio (o `tmpfs`), para montar.
 pub fn novo_tmpfs() -> Vnode {
     Vnode::Memoria(No::novo(diretorio_vazio(), Meta::de_root(0o1777)))
@@ -499,8 +517,15 @@ pub fn desmontar(caminho: &str) -> Result<(), i64> {
 
 /// (dispositivo, ponto de montagem, tipo) — o que o /proc/mounts mostra.
 pub fn montagens() -> Vec<(String, String, String)> {
-    let mut lista = alloc::vec![(String::from("rootfs"), String::from("/"), String::from("ramfs"))];
-    lista.extend(MONTAGENS.lock().iter().map(|m| (m.dispositivo.clone(), m.caminho.clone(), m.tipo.clone())));
+    let m = MONTAGENS.lock();
+    let mut lista = Vec::new();
+    if !m.iter().any(|x| x.caminho == "/") {
+        lista.push((String::from("rootfs"), String::from("/"), String::from("ramfs")));
+    }
+    // Com a raiz no disco, as montagens feitas antes (na árvore em memória) ficaram escondidas.
+    let raiz_no_disco = m.iter().position(|x| x.caminho == "/").unwrap_or(0);
+    let visiveis = m.iter().enumerate().filter(|(i, x)| *i >= raiz_no_disco || x.caminho == "/");
+    lista.extend(visiveis.map(|(_, x)| (x.dispositivo.clone(), x.caminho.clone(), x.tipo.clone())));
     lista
 }
 
