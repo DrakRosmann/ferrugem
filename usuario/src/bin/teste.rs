@@ -1763,6 +1763,67 @@ fn rede_placa() -> R {
     Ok(())
 }
 
+fn html_e_urls() -> R {
+    use ulib::html::{self, No};
+    use ulib::http::Url;
+    let doc = html::analisar(
+        "<!DOCTYPE html><title>T&iacute;tulo</title><p>um<p>dois &amp; tr&#234;s<ul><li>a<li>b</ul>\
+         <script>if (a < b) document.write('<p>')</script><a href=x.html class=c>link</a><br><img src='i.png'>",
+    );
+    let titulo = doc.achar("title").map(|t| t.texto()).unwrap_or_default();
+    if titulo != "Título" {
+        return Err(format!("título: {:?}", titulo));
+    }
+    let ps: Vec<String> = doc
+        .filhos
+        .iter()
+        .filter_map(|f| match f {
+            No::Elemento(e) if e.nome == "p" => Some(e.texto()),
+            _ => None,
+        })
+        .collect();
+    // o segundo <p> fecha o primeiro; a <ul> fecha o segundo; o <p> do script é texto
+    if ps.len() != 2 || ps[0] != "um" || ps[1] != "dois & três" {
+        return Err(format!("parágrafos: {:?}", ps));
+    }
+    let ul = doc.achar("ul").ok_or("sem <ul>")?;
+    let itens: Vec<String> = ul.filhos.iter().filter_map(|f| if let No::Elemento(e) = f { Some(e.texto()) } else { None }).collect();
+    if itens != ["a", "b"] {
+        return Err(format!("itens: {:?}", itens));
+    }
+    if doc.achar("script").map(|s| s.texto()) != Some("if (a < b) document.write('<p>')".into()) {
+        return Err("o script não ficou cru".into());
+    }
+    let a = doc.achar("a").ok_or("sem <a>")?;
+    if a.atributo("href") != Some("x.html") || a.atributo("class") != Some("c") || doc.achar("img").and_then(|i| i.atributo("src")) != Some("i.png") {
+        return Err("atributos".into());
+    }
+    let base = Url::ler("http://exemplo.com:8080/a/b/c.html?x=1#topo").ok_or("url base")?;
+    if base.host != "exemplo.com" || base.porta != 8080 || base.caminho != "/a/b/c.html?x=1" || base.fragmento != "topo" {
+        return Err(format!("url: {:?}", base));
+    }
+    for (relativo, esperado) in [
+        ("d.html", "http://exemplo.com:8080/a/b/d.html"),
+        ("../d.html", "http://exemplo.com:8080/a/d.html"),
+        ("../../../d.html", "http://exemplo.com:8080/d.html"),
+        ("/raiz", "http://exemplo.com:8080/raiz"),
+        ("?y=2", "http://exemplo.com:8080/a/b/c.html?y=2"),
+        ("#fim", "http://exemplo.com:8080/a/b/c.html?x=1#fim"),
+        ("//outro.org/p", "http://outro.org/p"),
+        ("https://seguro.org", "https://seguro.org/"),
+        ("./", "http://exemplo.com:8080/a/b/"),
+    ] {
+        let u = base.juntar(relativo).ok_or_else(|| format!("juntar {:?}", relativo))?;
+        if u.texto() != esperado {
+            return Err(format!("{:?} → {} (esperava {})", relativo, u.texto(), esperado));
+        }
+    }
+    if base.juntar("mailto:alguem@exemplo.com").is_some() || base.juntar("javascript:void(0)").is_some() {
+        return Err("mailto:/javascript: viraram endereço".into());
+    }
+    Ok(())
+}
+
 fn png_ler_e_gravar() -> R {
     use ulib::png;
     let abrir = |nome: &str| -> Result<png::Imagem, String> {
@@ -1823,7 +1884,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 64] = [
+    let testes: [(&str, fn() -> R); 65] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1888,6 +1949,7 @@ fn principal(args: &[&str]) -> i32 {
         ("TCP pelo loopback: 200 KB e de volta, recusa, poll no accept", rede_tcp_local),
         ("UDP pelo loopback: endereços, porta efêmera, socket conectado", rede_udp_local),
         ("placa de rede: ARP, ping no roteador e um download HTTP", rede_placa),
+        ("HTML tolerante (fechamentos implícitos, entidades) e URLs relativas", html_e_urls),
     ];
 
     // `teste trecho`: só os testes cujo nome contém o trecho.

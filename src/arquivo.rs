@@ -332,7 +332,8 @@ impl Drop for Arquivo {
 // Pipes
 // -----------------------------------------------------------------------------
 
-const CAPACIDADE_PIPE: usize = 4096;
+/// Como no Linux: 64 KiB (o buffer cresce conforme o uso).
+const CAPACIDADE_PIPE: usize = 64 * 1024;
 
 /// Um buffer circular entre dois processos. Quem lê de um pipe vazio dorme
 /// até alguém escrever; quem escreve num pipe cheio dorme até alguém ler.

@@ -170,6 +170,15 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   claro/escuro, cor de destaque, brilho, luz noturna, segundos, cursor
   grande; tudo vale na hora, também para os programas abertos). Todos no
   menu Aplicativos.
+- **Navegador** (`navegador`): HTML e imagens PNG, sem JavaScript e, do
+  CSS, só o atributo `style` mais simples. A diagramação tem quebra de
+  linha, títulos, listas aninhadas e numeradas, citações, `<pre>`,
+  tabelas simples, negrito, itálico (sintético), links (o visitado muda
+  de cor) e âncoras (`#id`). O leitor de HTML é tolerante como os
+  navegadores (`ulib::html`). Os downloads rodam num processo filho e a
+  janela continua respondendo. Também há histórico, barra de endereço
+  (palavras soltas viram uma busca no FrogFind) e `file://`. A página
+  inicial lista sites que ainda funcionam sem HTTPS.
 - **PNG** (`ulib::png`): decodificador completo — o inflate do zlib (blocos
   sem compressão, Huffman fixo e dinâmico), os 5 filtros, cinza/RGB/paleta/
   alfa em 1 a 16 bits, transparência (tRNS) e entrelaçamento Adam7 — e um
@@ -257,6 +266,7 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 | `src/pci.rs`, `rtl8139.rs` | Barramento PCI e o driver da placa de rede |
 | `src/rede.rs`, `tcp.rs`, `inet.rs` | A pilha de rede: Ethernet/ARP/IP/ICMP/UDP, o TCP e os sockets `AF_INET` |
 | `usuario/src/rede.rs`, `http.rs` | DNS, conexões por nome, URLs e o cliente HTTP |
+| `usuario/src/html.rs`, `bin/navegador.rs` | O leitor de HTML e o navegador (diagramação e desenho) |
 | `src/smp.rs`, `trampolim.asm` | Várias CPUs: APIC, ACPI, acordar as outras, a trava do kernel |
 | `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
 | `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
@@ -329,8 +339,8 @@ de páginas. O `make run` usa 4 CPUs.
 2. **Hardware moderno:** IOAPIC (as IRQs ainda vêm do PIC, só para a CPU
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
-3. **Rede:** DHCP (hoje o endereço é fixo), IPv6, outra placa (virtio-net
-   ou e1000); um navegador e HTTPS (TLS) estão a caminho.
+3. **Rede:** HTTPS (TLS 1.3) para o navegador, DHCP (hoje o endereço é
+   fixo), IPv6, outra placa (virtio-net ou e1000).
 4. **Interface gráfica:** ícones na área de trabalho, notificações,
    seleção de trechos nos campos de texto, mais programas.
 

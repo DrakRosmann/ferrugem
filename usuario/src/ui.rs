@@ -169,11 +169,21 @@ pub struct CampoTexto {
     pub texto: String,
     pub cursor: usize,
     rolagem: i32,
+    /// Ponha true para o campo pegar o foco no próximo desenho (um atalho
+    /// como o Ctrl+L do navegador).
+    pub pedir_foco: bool,
 }
 
 impl CampoTexto {
     pub fn novo(texto: &str) -> CampoTexto {
-        CampoTexto { texto: String::from(texto), cursor: texto.chars().count(), rolagem: 0 }
+        CampoTexto { texto: String::from(texto), cursor: texto.chars().count(), rolagem: 0, pedir_foco: false }
+    }
+
+    /// Troca o texto (o cursor vai para o fim).
+    pub fn mudar(&mut self, texto: &str) {
+        self.texto = String::from(texto);
+        self.cursor = texto.chars().count();
+        self.rolagem = 0;
     }
 
     fn byte(&self, caractere: usize) -> usize {
@@ -183,6 +193,23 @@ impl CampoTexto {
 
 /// Uma posição no texto: (linha, coluna em caracteres).
 pub type Posicao = (usize, usize);
+
+/// O que `Tela::area` devolve: onde ela ficou e o que o mouse fez nela.
+pub struct Area {
+    pub x: i32,
+    pub y: i32,
+    pub largura: i32,
+    pub altura: i32,
+    /// O mouse, relativo ao canto da área (se estiver em cima dela).
+    pub mouse: Option<(i32, i32)>,
+    /// O botão foi apertado e solto em cima da área.
+    pub clique: bool,
+    /// O botão está apertado (arrastando) com o mouse em cima.
+    pub apertado: bool,
+    /// A roda girou em cima da área: positivo = para baixo.
+    pub roda: i32,
+    pub focada: bool,
+}
 
 /// O estado de uma área de texto de várias linhas (o editor).
 pub struct AreaTexto {
@@ -374,6 +401,8 @@ pub struct Ui {
     sair: bool,
     /// Para o laço repassar à janela.
     pub pedidos: Vec<Pedido>,
+    /// Desenhar de novo daqui a tantos ms, mesmo sem eventos (só desta vez).
+    acordar: Option<i32>,
 }
 
 impl Default for Ui {
@@ -406,6 +435,7 @@ impl Ui {
             redesenhar: false,
             sair: false,
             pedidos: Vec::new(),
+            acordar: None,
         }
     }
 
@@ -528,6 +558,15 @@ impl Ui {
         }
     }
 
+    /// Texto em itálico (sintético: a fonte normal inclinada).
+    #[allow(clippy::too_many_arguments)]
+    pub fn escrever_italico(&mut self, q: &mut Quadro, x: i32, y: i32, texto: &str, cor: u32, negrito: bool, tamanho: u16) -> i32 {
+        match self.fonte(negrito) {
+            Some(f) => q.texto_tt_estilo(f, x, y, texto, tamanho, cor, true),
+            None => self.escrever(q, x, y, texto, cor, negrito, tamanho),
+        }
+    }
+
     /// (largura de cada letra, altura da linha) da fonte monoespaçada.
     pub fn medidas_mono(&mut self, tamanho: u16) -> (i32, i32) {
         match self.mono.as_mut() {
@@ -536,11 +575,18 @@ impl Ui {
         }
     }
 
-    /// Texto na fonte monoespaçada (a da VGA, se não houver outra).
+    /// Texto na fonte monoespaçada (a da VGA, se não houver outra). Cada
+    /// letra vai numa grade de `medidas_mono().0` pixels inteiros: o avanço
+    /// da fonte é fracionário (7,8 px no tamanho 13), e quem posiciona o
+    /// cursor ou mede o texto conta em colunas.
     pub fn escrever_mono(&mut self, q: &mut Quadro, x: i32, y: i32, texto: &str, cor: u32, tamanho: u16) {
+        let (coluna, _) = self.medidas_mono(tamanho);
         match self.mono.as_mut() {
             Some(f) => {
-                q.texto_tt(f, x, y, texto, tamanho, cor);
+                let mut buf = [0u8; 4];
+                for (i, c) in texto.chars().enumerate() {
+                    q.texto_tt(f, x + i as i32 * coluna, y, c.encode_utf8(&mut buf), tamanho, cor);
+                }
             }
             None => {
                 if let Some(v) = &self.vga {
@@ -625,6 +671,50 @@ impl Tela<'_> {
         ((x, y), sobre, clicado)
     }
 
+    /// Uma área que o programa desenha e controla por conta própria (a
+    /// página do navegador). Clicar nela tira o foco dos campos: as teclas
+    /// que sobrarem são dela (veja `tecla_da_area`).
+    pub fn area(&mut self, largura: i32, altura: i32) -> Area {
+        let (x, y) = self.alocar(largura, altura);
+        let id = self.novo_id();
+        let (sobre, clique) = self.interagir(id, (x, y, largura, altura), true);
+        let mouse = if sobre && !self.bloqueado() { Some((self.ui.mouse.0 - x, self.ui.mouse.1 - y)) } else { None };
+        let roda = if mouse.is_some() { core::mem::take(&mut self.ui.roda) } else { 0 };
+        let focada = self.ui.foco.is_none() || self.focado(id);
+        Area { x, y, largura, altura, mouse, clique, apertado: sobre && self.ui.apertado, roda, focada }
+    }
+
+    /// Uma tecla que sobrou para a área (ela tem o foco, ou ninguém tem).
+    pub fn tecla_da_area(&mut self, area: &Area, tecla: Tecla) -> bool {
+        if !area.focada {
+            return false;
+        }
+        match self.ui.teclas.iter().position(|t| *t == tecla) {
+            Some(i) => {
+                self.ui.teclas.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ninguém fica com o foco do teclado (depois do Enter na barra de
+    /// endereço, o espaço volta a rolar a página).
+    pub fn soltar_foco(&mut self) {
+        self.ui.foco = None;
+    }
+
+    /// Desenha de novo daqui a `ms` milissegundos, mesmo sem eventos (um
+    /// download em andamento, uma animação). Vale só para esta espera.
+    pub fn acordar_em(&mut self, ms: i32) {
+        self.ui.acordar = Some(self.ui.acordar.map_or(ms, |a| a.min(ms)));
+    }
+
+    /// Pede outro desenho logo depois deste (o estado mudou no meio).
+    pub fn redesenhar(&mut self) {
+        self.ui.redesenhar = true;
+    }
+
     /// Uma seta que nenhum componente usou (um atalho do programa, como
     /// "próxima imagem"). Chame depois dos componentes.
     pub fn seta(&mut self, s: Seta) -> bool {
@@ -685,6 +775,29 @@ impl Tela<'_> {
 
     pub fn escrever(&mut self, x: i32, y: i32, texto: &str, cor: u32, negrito: bool, tamanho: u16) -> i32 {
         self.ui.escrever(&mut self.q, x, y, texto, cor, negrito, tamanho)
+    }
+
+    pub fn escrever_italico(&mut self, x: i32, y: i32, texto: &str, cor: u32, negrito: bool, tamanho: u16) -> i32 {
+        self.ui.escrever_italico(&mut self.q, x, y, texto, cor, negrito, tamanho)
+    }
+
+    /// Texto na fonte monoespaçada.
+    pub fn escrever_mono(&mut self, x: i32, y: i32, texto: &str, cor: u32, tamanho: u16) {
+        self.ui.escrever_mono(&mut self.q, x, y, texto, cor, tamanho)
+    }
+
+    /// A largura de um texto (sem desenhar); `mono` = fonte monoespaçada.
+    pub fn medir(&mut self, texto: &str, tamanho: u16, negrito: bool, mono: bool) -> i32 {
+        if mono {
+            self.ui.medidas_mono(tamanho).0 * texto.chars().count() as i32
+        } else {
+            self.ui.largura_texto(texto, tamanho, negrito)
+        }
+    }
+
+    /// A altura de uma linha de texto nesse tamanho.
+    pub fn altura_texto(&mut self, tamanho: u16, mono: bool) -> i32 {
+        if mono { self.ui.medidas_mono(tamanho).1 } else { self.ui.altura_linha(tamanho) }
     }
 
     // ------------------------------------------------------------- interação
@@ -815,6 +928,14 @@ impl Tela<'_> {
         (self.ui.largura_texto(texto, tamanho, false) + 24).max(80)
     }
 
+    /// Um botão só do tamanho do texto (um ícone numa barra de ferramentas).
+    pub fn botao_compacto(&mut self, texto: &str) -> bool {
+        let tamanho = self.ui.tamanho;
+        let largura = (self.ui.largura_texto(texto, tamanho, false) + 20).max(34);
+        let (x, y) = self.alocar(largura, ALTURA);
+        self.botao_em(x, y, largura, texto)
+    }
+
     /// Um botão. Devolve true quando é clicado (ou apertado com Enter/espaço, com o foco).
     pub fn botao(&mut self, texto: &str) -> bool {
         let largura = self.largura_botao(texto);
@@ -877,7 +998,8 @@ impl Tela<'_> {
     /// Campo de texto de uma linha. Devolve true quando se aperta Enter nele.
     pub fn campo(&mut self, campo: &mut CampoTexto, largura: i32) -> bool {
         let (x, y) = self.alocar(largura, ALTURA);
-        self.campo_em(campo, x, y, largura, false)
+        let focar = core::mem::take(&mut campo.pedir_foco);
+        self.campo_em(campo, x, y, largura, focar)
     }
 
     fn campo_em(&mut self, campo: &mut CampoTexto, x: i32, y: i32, largura: i32, focar: bool) -> bool {
@@ -1629,7 +1751,11 @@ pub fn laco_com_prazo(janela: &mut Janela, ui: &mut Ui, ms: i32, mut f: impl FnM
         if ui.saindo() {
             return;
         }
-        match janela.evento_com_prazo(ms) {
+        let prazo = match ui.acordar.take() {
+            Some(a) if ms < 0 || a < ms => a,
+            _ => ms,
+        };
+        match janela.evento_com_prazo(prazo) {
             Some(Some(e)) => ui.receber(&e),
             Some(None) => {} // o prazo passou: desenha de novo
             None => return,

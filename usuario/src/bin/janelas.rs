@@ -593,10 +593,11 @@ const BARRA: i32 = 30;
 const ITEM_MENU: i32 = 26;
 
 /// O menu Aplicativos: (rótulo, programa). O primeiro e o último são especiais.
-const APLICATIVOS: [(&str, &str); 10] = [
+const APLICATIVOS: [(&str, &str); 11] = [
     ("Terminal", ""),
     ("Arquivos", "arquivos"),
     ("Editor de texto", "editor"),
+    ("Navegador", "navegador"),
     ("Imagens", "imagens"),
     ("Monitor do sistema", "monitor"),
     ("Configurações", "configuracoes"),

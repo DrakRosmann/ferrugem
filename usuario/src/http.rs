@@ -102,8 +102,14 @@ impl Url {
         if r.contains("://") || r.starts_with("sobre:") {
             return Url::ler(r);
         }
-        if r.contains(':') && !r.starts_with(['/', '?', '#', '.']) && r.find(':') < r.find('/') {
-            return None; // mailto:, javascript:, data:...
+        // Outro esquema ("mailto:", "javascript:", "data:"...): letras,
+        // dígitos, "+", "-" e "." antes do ":" (e começando com letra).
+        if let Some((esquema, _)) = r.split_once(':') {
+            let valido = esquema.starts_with(|c: char| c.is_ascii_alphabetic())
+                && esquema.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+            if valido {
+                return None;
+            }
         }
         let mut u = self.clone();
         u.fragmento.clear();

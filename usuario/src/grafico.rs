@@ -280,6 +280,13 @@ impl<'a> Quadro<'a> {
     /// Texto numa fonte TrueType de `tamanho` pixels. `(x, y)` é o canto de
     /// cima à esquerda da linha. Devolve a largura desenhada.
     pub fn texto_tt(&mut self, fonte: &mut FonteTT, x: i32, y: i32, texto: &str, tamanho: u16, cor: u32) -> i32 {
+        self.texto_tt_estilo(fonte, x, y, texto, tamanho, cor, false)
+    }
+
+    /// Como `texto_tt`; com `inclinado`, um itálico "sintético": cada linha
+    /// do glifo é empurrada para a direita conforme a altura (1 px a cada 4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn texto_tt_estilo(&mut self, fonte: &mut FonteTT, x: i32, y: i32, texto: &str, tamanho: u16, cor: u32, inclinado: bool) -> i32 {
         let (sobe, _) = fonte.metricas(tamanho);
         let base = y + sobe;
         let mut caneta = x * 64; // em 1/64 de pixel: as letras não acumulam arredondamentos
@@ -287,9 +294,10 @@ impl<'a> Quadro<'a> {
             let g = fonte.glifo(c, tamanho);
             let (gx, gy) = ((caneta + 32) / 64 + g.esquerda, base - g.topo);
             for linha in 0..g.altura {
+                let empurra = if inclinado { (base - (gy + linha)) / 4 } else { 0 };
                 for coluna in 0..g.largura {
                     let a = g.alfa[(linha * g.largura + coluna) as usize];
-                    self.misturar(gx + coluna, gy + linha, cor, a);
+                    self.misturar(gx + coluna + empurra, gy + linha, cor, a);
                 }
             }
             caneta += g.avanco;

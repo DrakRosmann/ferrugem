@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod grafico;
+pub mod html;
 pub mod http;
 pub mod io;
 pub mod janela;
