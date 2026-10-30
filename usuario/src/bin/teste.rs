@@ -1623,6 +1623,56 @@ fn area_de_texto() -> R {
     Ok(())
 }
 
+fn png_ler_e_gravar() -> R {
+    use ulib::png;
+    let abrir = |nome: &str| -> Result<png::Imagem, String> {
+        let dados = sys::ler_arquivo(&format!("/usr/share/imagens/{}", nome)).map_err(|e| format!("{}: {}", nome, e))?;
+        png::decodificar(&dados).ok_or_else(|| format!("{}: não decodificou", nome))
+    };
+    // Cada pixel das imagens de teste é uma fórmula (veja ferramentas/imagens.py).
+    let rgba = abrir("testes/rgba-entrelacado.png")?; // Adam7, os 5 filtros
+    for y in 0..23u32 {
+        for x in 0..37u32 {
+            let esperado = (255 - x) << 24 | (x * 7 % 256) << 16 | (y * 11 % 256) << 8 | ((x + y) * 3 % 256);
+            if rgba.pixels[(y * 37 + x) as usize] != esperado {
+                return Err(format!("rgba-entrelacado ({}, {}): {:#x}", x, y, rgba.pixels[(y * 37 + x) as usize]));
+            }
+        }
+    }
+    let paleta = abrir("testes/paleta.png")?; // 4 bits por pixel, com transparência
+    for y in 0..10u32 {
+        for x in 0..20u32 {
+            let i = (x + 2 * y) % 16;
+            let alfa = if i == 0 { 0 } else { 0xFF };
+            let esperado = alfa << 24 | (i * 16) << 16 | (255 - i * 16) << 8 | (i * 37 % 256);
+            if paleta.pixels[(y * 20 + x) as usize] != esperado {
+                return Err(format!("paleta ({}, {})", x, y));
+            }
+        }
+    }
+    let cinza = abrir("testes/cinza16.png")?; // 16 bits por canal
+    for y in 0..8u32 {
+        for x in 0..16u32 {
+            let g = (x * 4000 + y * 100) >> 8;
+            if cinza.pixels[(y * 16 + x) as usize] != 0xFF00_0000 | g << 16 | g << 8 | g {
+                return Err(format!("cinza16 ({}, {})", x, y));
+            }
+        }
+    }
+    // Uma imagem de verdade, com Huffman dinâmico (gravada pelo Pillow).
+    let m = abrir("mandelbrot.png")?;
+    if (m.largura, m.altura) != (640, 480) {
+        return Err(String::from("mandelbrot: tamanho"));
+    }
+    // Ida e volta pelo nosso codificador.
+    let original: Vec<u32> = (0..50 * 30).map(|i| (i * 2654435761u32) & 0xFFFFFF).collect();
+    let volta = png::decodificar(&png::codificar(&original, 50, 30)).ok_or("não leu o próprio PNG")?;
+    if volta.pixels.iter().zip(&original).any(|(a, b)| *a != 0xFF00_0000 | b) {
+        return Err(String::from("o PNG gravado não voltou igual"));
+    }
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1633,7 +1683,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 60] = [
+    let testes: [(&str, fn() -> R); 61] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1694,6 +1744,7 @@ fn principal(args: &[&str]) -> i32 {
         ("fontes TrueType: cmap, glifos compostos, suavização", fontes_truetype),
         ("componentes da interface: botão, caixa, campo, lista, diálogo", componentes_da_interface),
         ("área de texto do editor: teclado, colar, seleção pelo mouse", area_de_texto),
+        ("PNG: inflate, filtros, Adam7, paleta, 16 bits; ida e volta", png_ler_e_gravar),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

@@ -24,6 +24,7 @@ use crate::io::Leitor;
 use crate::sys;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 pub const SOCKET: &str = "/tmp/.janelas";
 
@@ -68,6 +69,23 @@ pub enum Evento {
     Colar(String),
     /// O estilo escuro foi ligado ou desligado (no painel de controle).
     Tema { escuro: bool },
+}
+
+/// Muda um ajuste da interface em ~/.janelas (ex.: "fundo" = o papel de
+/// parede), mantendo os outros. Depois, `Janela::pedir_recarga` avisa o servidor.
+pub fn mudar_ajuste(chave: &str, valor: &str) -> Result<(), sys::Erro> {
+    let caminho = format!("{}/.janelas", crate::variavel("HOME").unwrap_or("/"));
+    let antigo = sys::ler_arquivo(&caminho).unwrap_or_default();
+    let mut linhas: Vec<String> = String::from_utf8_lossy(&antigo)
+        .lines()
+        .filter(|l| l.split_once('=').map_or(true, |(c, _)| c.trim() != chave))
+        .map(String::from)
+        .collect();
+    linhas.push(format!("{}={}", chave, valor));
+    let fd = sys::abrir_com_permissoes(&caminho, sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC, 0o644)?;
+    let r = sys::escrever_tudo(fd, (linhas.join("\n") + "\n").as_bytes());
+    let _ = sys::fechar(fd);
+    r
 }
 
 /// Põe o texto numa linha só, para o protocolo.
@@ -136,6 +154,11 @@ impl Janela {
     /// Pede o texto da área de transferência: ele chega como `Evento::Colar`.
     pub fn pedir_colagem(&mut self) {
         let _ = sys::escrever_tudo(self.fd, b"colar\n");
+    }
+
+    /// Pede ao servidor para reler ~/.janelas (papel de parede, tema...).
+    pub fn pedir_recarga(&mut self) {
+        let _ = sys::escrever_tudo(self.fd, b"recarregar\n");
     }
 
     /// Troca o título da janela.

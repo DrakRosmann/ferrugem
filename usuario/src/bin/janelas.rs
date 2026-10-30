@@ -593,10 +593,11 @@ const BARRA: i32 = 30;
 const ITEM_MENU: i32 = 26;
 
 /// O menu Aplicativos: (rótulo, programa). O primeiro e o último são especiais.
-const APLICATIVOS: [(&str, &str); 7] = [
+const APLICATIVOS: [(&str, &str); 8] = [
     ("Terminal", ""),
     ("Arquivos", "arquivos"),
     ("Editor de texto", "editor"),
+    ("Imagens", "imagens"),
     ("Componentes", "componentes"),
     ("Fontes", "fontes"),
     ("Pintar", "pintar"),
@@ -651,6 +652,8 @@ struct Servidor {
     refiltrar: bool,
     aviso: Option<(String, u64)>,
     cpus: usize,
+    /// O papel de parede, do tamanho da área de trabalho.
+    papel: Option<Vec<u32>>,
     // A tela bloqueada
     travada: bool,
     senha: String,
@@ -759,10 +762,16 @@ impl Servidor {
             }
             _ => None,
         };
-        // A área de trabalho e as janelas, de baixo para cima.
-        q.retangulo(0, PAINEL, largura, altura - PAINEL - BARRA, COR_FUNDO);
-        let marca = self.letras.largura("FerrugemOS", true);
-        self.letras.escrever(q, (largura - marca) / 2, altura / 2, 20, "FerrugemOS", 0x2F6A7E, true);
+        // A área de trabalho (o papel de parede, ou a cor com o nome) e as
+        // janelas, de baixo para cima.
+        match &self.papel {
+            Some(p) => q.copiar(p, largura, altura - PAINEL - BARRA, 0, PAINEL),
+            None => {
+                q.retangulo(0, PAINEL, largura, altura - PAINEL - BARRA, COR_FUNDO);
+                let marca = self.letras.largura("FerrugemOS", true);
+                self.letras.escrever(q, (largura - marca) / 2, altura / 2, 20, "FerrugemOS", 0x2F6A7E, true);
+            }
+        }
         for (i, j) in self.janelas.iter().enumerate().filter(|(_, j)| !j.minimizada) {
             j.desenhar(q, &mut self.letras, Some(i) == ativa);
         }
@@ -1372,6 +1381,8 @@ impl Servidor {
             self.janelas[k].titulo = String::from(titulo);
             self.marcar_janela(k);
             self.marcar_barra();
+        } else if linha == "recarregar" {
+            self.recarregar();
         } else if linha == "colar" {
             if let Conteudo::Cliente(c) = &self.janelas[k].conteudo {
                 let resposta = format!("colar {}\n", ulib::janela::escapar(&self.transferencia));
@@ -1581,12 +1592,14 @@ fn principal(_args: &[&str]) -> i32 {
         area_status: (largura - 82, 3, 76, PAINEL - 6),
         refiltrar: true,
         aviso: None,
+        papel: None,
         cpus: String::from_utf8_lossy(&sys::ler_arquivo("/proc/cpuinfo").unwrap_or_default()).matches("processor").count(),
         travada: false,
         senha: String::new(),
         senha_errada: false,
         pode_bloquear: sys::ler_arquivo("/etc/shadow").is_ok(),
     };
+    s.carregar_papel();
     s.marcar_tudo();
     s.abrir_terminal();
     s.compor();
@@ -1612,6 +1625,8 @@ struct Ajustes {
     cursor_grande: bool,
     /// Brilho, de 30 a 100 (%).
     brilho: i32,
+    /// O papel de parede (um PNG), ou vazio.
+    fundo: String,
 }
 
 impl Ajustes {
@@ -1620,7 +1635,14 @@ impl Ajustes {
     }
 
     fn carregar() -> Ajustes {
-        let mut a = Ajustes { escuro: false, noturna: false, segundos: false, cursor_grande: false, brilho: 100 };
+        let mut a = Ajustes {
+            escuro: false,
+            noturna: false,
+            segundos: false,
+            cursor_grande: false,
+            brilho: 100,
+            fundo: String::new(),
+        };
         let texto = sys::ler_arquivo(&Self::arquivo()).unwrap_or_default();
         for linha in String::from_utf8_lossy(&texto).lines() {
             let Some((chave, valor)) = linha.split_once('=') else { continue };
@@ -1631,6 +1653,7 @@ impl Ajustes {
                 "segundos" => a.segundos = ligado,
                 "cursor_grande" => a.cursor_grande = ligado,
                 "brilho" => a.brilho = valor.trim().parse().unwrap_or(100),
+                "fundo" => a.fundo = String::from(valor.trim()),
                 _ => {}
             }
         }
@@ -1640,8 +1663,8 @@ impl Ajustes {
 
     fn salvar(&self) {
         let texto = format!(
-            "escuro={}\nnoturna={}\nsegundos={}\ncursor_grande={}\nbrilho={}\n",
-            self.escuro as u8, self.noturna as u8, self.segundos as u8, self.cursor_grande as u8, self.brilho
+            "escuro={}\nnoturna={}\nsegundos={}\ncursor_grande={}\nbrilho={}\nfundo={}\n",
+            self.escuro as u8, self.noturna as u8, self.segundos as u8, self.cursor_grande as u8, self.brilho, self.fundo
         );
         let fd = sys::abrir_com_permissoes(&Self::arquivo(), sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC, 0o644);
         if let Ok(fd) = fd {
@@ -1718,6 +1741,41 @@ impl Servidor {
                 ((p >> 16 & 0xFF) * r >> 8) << 16 | ((p >> 8 & 0xFF) * g >> 8) << 8 | (p & 0xFF) * b >> 8
             }
         }
+    }
+
+    /// Carrega o papel de parede, já do tamanho da área de trabalho: cobre
+    /// tudo, cortando o que sobrar (sem deformar).
+    fn carregar_papel(&mut self) {
+        self.papel = None;
+        if self.ajustes.fundo.is_empty() {
+            return;
+        }
+        let Some(img) = sys::ler_arquivo(&self.ajustes.fundo).ok().and_then(|d| ulib::png::decodificar(&d)) else {
+            self.avisar(format!("Não consegui ler o papel de parede {}", self.ajustes.fundo));
+            return;
+        };
+        let (l, a) = (self.largura, self.altura - PAINEL - BARRA);
+        let (iw, ih) = (img.largura as i32, img.altura as i32);
+        let escala = (l as f32 / iw as f32).max(a as f32 / ih as f32);
+        let (w, h) = ((iw as f32 * escala) as i32 + 1, (ih as f32 * escala) as i32 + 1);
+        let mut pixels = vec![COR_FUNDO; (l * a) as usize];
+        let mut q = Quadro::novo(&mut pixels, l, a);
+        q.desenhar_imagem(&img.pixels, iw, ih, (l - w) / 2, (a - h) / 2, w, h);
+        self.papel = Some(pixels);
+    }
+
+    /// Um programa (as configurações, o visualizador de imagens) mudou o
+    /// ~/.janelas: relê tudo.
+    fn recarregar(&mut self) {
+        self.ajustes = Ajustes::carregar();
+        self.carregar_papel();
+        let clientes: Vec<i32> =
+            self.janelas.iter().filter_map(|j| if let Conteudo::Cliente(c) = &j.conteudo { Some(c.fd) } else { None }).collect();
+        for fd in clientes {
+            self.mandar_tema(fd);
+        }
+        self.refiltrar = true;
+        self.marcar_tudo();
     }
 
     /// Um aviso que aparece por alguns segundos no alto da tela.

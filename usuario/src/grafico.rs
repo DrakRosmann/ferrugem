@@ -159,6 +159,47 @@ impl<'a> Quadro<'a> {
         }
     }
 
+    /// Desenha uma imagem (pixels 0xAARRGGBB) esticada ou encolhida para o
+    /// retângulo (x, y, largura, altura), respeitando a transparência. Ao
+    /// encolher, cada pixel é a média dos pixels da origem que ele cobre (sem
+    /// serrilhado); ao esticar, o mais próximo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn desenhar_imagem(&mut self, origem: &[u32], ow: i32, oh: i32, x: i32, y: i32, largura: i32, altura: i32) {
+        if ow <= 0 || oh <= 0 || largura <= 0 || altura <= 0 {
+            return;
+        }
+        let (rx, ry, rl, ra) = self.recorte;
+        // Só os pixels de destino que aparecem.
+        let (dx0, dx1) = ((rx - x).max(0), (rx + rl - x).min(largura));
+        let (dy0, dy1) = ((ry - y).max(0), (ry + ra - y).min(altura));
+        for dy in dy0..dy1 {
+            let (sy0, sy1) = ((dy as i64 * oh as i64 / altura as i64) as i32, ((dy + 1) as i64 * oh as i64 / altura as i64) as i32);
+            let sy1 = sy1.max(sy0 + 1).min(oh);
+            for dx in dx0..dx1 {
+                let (sx0, sx1) = ((dx as i64 * ow as i64 / largura as i64) as i32, ((dx + 1) as i64 * ow as i64 / largura as i64) as i32);
+                let sx1 = sx1.max(sx0 + 1).min(ow);
+                let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                for sy in sy0..sy1 {
+                    for sx in sx0..sx1 {
+                        let p = origem[(sy * ow + sx) as usize];
+                        let alfa = p >> 24;
+                        a += alfa;
+                        // as cores pesam pela opacidade (senão o transparente "suja" a borda)
+                        r += (p >> 16 & 0xFF) * alfa;
+                        g += (p >> 8 & 0xFF) * alfa;
+                        b += (p & 0xFF) * alfa;
+                        n += 1;
+                    }
+                }
+                if a == 0 {
+                    continue;
+                }
+                let cor = (r / a) << 16 | (g / a) << 8 | (b / a);
+                self.misturar(x + dx, y + dy, cor, (a / n) as u8);
+            }
+        }
+    }
+
     /// Escurece a imagem inteira (o fundo atrás de uma caixa de diálogo).
     pub fn escurecer(&mut self, alfa: u8) {
         for y in 0..self.altura {

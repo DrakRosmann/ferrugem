@@ -160,6 +160,8 @@ pub enum Pedido {
     Copiar(String),
     Colar,
     Titulo(String),
+    /// Reler ~/.janelas (depois de `janela::mudar_ajuste`).
+    Recarregar,
 }
 
 /// O estado de um campo de texto: o texto e onde está o cursor (em caracteres).
@@ -599,6 +601,23 @@ impl Tela<'_> {
             let p = (self.x0, self.cy);
             self.cy += altura + ESPACO;
             p
+        }
+    }
+
+    /// Reserva um espaço para o programa desenhar o que quiser (em `t.q`); devolve onde.
+    pub fn reservar(&mut self, largura: i32, altura: i32) -> (i32, i32) {
+        self.alocar(largura, altura)
+    }
+
+    /// Uma seta que nenhum componente usou (um atalho do programa, como
+    /// "próxima imagem"). Chame depois dos componentes.
+    pub fn seta(&mut self, s: Seta) -> bool {
+        match self.ui.teclas.iter().position(|t| *t == Tecla::Seta(s)) {
+            Some(i) => {
+                self.ui.teclas.remove(i);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1102,6 +1121,11 @@ impl Tela<'_> {
         self.ui.pedidos.push(Pedido::Colar);
     }
 
+    /// Pede ao servidor para reler os ajustes (~/.janelas).
+    pub fn pedir_recarga(&mut self) {
+        self.ui.pedidos.push(Pedido::Recarregar);
+    }
+
     /// Troca o título da janela.
     pub fn mudar_titulo(&mut self, titulo: &str) {
         self.ui.pedidos.push(Pedido::Titulo(String::from(titulo)));
@@ -1582,6 +1606,7 @@ pub fn laco_com_prazo(janela: &mut Janela, ui: &mut Ui, ms: i32, mut f: impl FnM
                 Pedido::Copiar(texto) => janela.copiar(&texto),
                 Pedido::Colar => janela.pedir_colagem(),
                 Pedido::Titulo(t) => janela.mudar_titulo(&t),
+                Pedido::Recarregar => janela.pedir_recarga(),
             }
         }
         janela.mostrar();

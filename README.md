@@ -150,7 +150,14 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   pastas primeiro, clique duplo abre — pasta, imagem, programa ou texto —,
   criar pasta, renomear, apagar, copiar e colar) e `editor` (editor de
   texto com números de linha, seleção pelo mouse, área de transferência,
-  Ctrl+S/O/N/A). Ambos no menu Aplicativos.
+  Ctrl+S/O/N/A) e `imagens` (visualizador: ajustar ou tamanho real,
+  anterior/próxima pelas setas, transparência sobre xadrez, "usar como papel
+  de parede"). Todos no menu Aplicativos.
+- **PNG** (`ulib::png`): decodificador completo — o inflate do zlib (blocos
+  sem compressão, Huffman fixo e dinâmico), os 5 filtros, cinza/RGB/paleta/
+  alfa em 1 a 16 bits, transparência (tRNS) e entrelaçamento Adam7 — e um
+  codificador simples (para a captura de tela). Papéis de parede e um
+  fractal em `/usr/share/imagens` (gerados por `ferramentas/imagens.py`).
 - **Painel de controle** (no estilo das configurações rápidas do GNOME):
   brilho e luz noturna (um filtro de cor aplicado pelo servidor ao copiar
   para a tela), estilo escuro (os programas com `ulib::ui` trocam de tema na
@@ -298,9 +305,9 @@ de páginas. O `make run` usa 4 CPUs.
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica, rumo a um desktop como o XFCE:** visualizador de
-   imagens (PNG), monitor do sistema, configurações (papel de parede, cor
-   de destaque); mouse absoluto no QEMU.
+4. **Interface gráfica, rumo a um desktop como o XFCE:** monitor do
+   sistema, configurações (papel de parede, cor de destaque); mouse absoluto
+   no QEMU.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)
