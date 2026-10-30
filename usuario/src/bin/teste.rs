@@ -1573,6 +1573,56 @@ fn componentes_da_interface() -> R {
     Ok(())
 }
 
+fn area_de_texto() -> R {
+    use ulib::janela::{Evento, Seta};
+    use ulib::ui::{AreaTexto, Pedido, Ui};
+    let mut ui = Ui::novo();
+    let mut pixels = vec![0u32; 400 * 300];
+    let mut area = AreaTexto::novo("");
+    let mut evento = |ui: &mut Ui, area: &mut AreaTexto, e: Evento| {
+        ui.receber(&e);
+        let mut t = ui.comecar(ulib::grafico::Quadro::novo(&mut pixels, 400, 300));
+        t.area_texto(area, 376, 276);
+    };
+    for e in [
+        Evento::Tecla('a'),
+        Evento::Tecla('b'),
+        Evento::Tecla('\n'),
+        Evento::Tecla('c'),
+        Evento::Tecla('\u{8}'),
+        Evento::Colar(String::from("xy\nz")),
+        Evento::Seta(Seta::Cima),
+        Evento::Seta(Seta::Fim),
+        Evento::Tecla('!'),
+        Evento::Seta(Seta::Inicio),
+        Evento::Seta(Seta::Delete),
+    ] {
+        evento(&mut ui, &mut area, e);
+    }
+    if area.texto() != "ab\ny!\nz" || !area.modificado {
+        return Err(format!("texto: {:?}", area.texto()));
+    }
+    // Selecionar com o mouse (arrastar pela 2ª linha, "y!") e copiar.
+    let (cw, lh) = ui.medidas_mono(13);
+    let (x0, y0) = (12 + cw * 4 + 12, 16 + lh + lh / 2); // a 2ª linha, 1ª coluna
+    evento(&mut ui, &mut area, Evento::Botao { x: x0 + 1, y: y0, botao: 1, apertado: true });
+    evento(&mut ui, &mut area, Evento::Mover { x: x0 + 2 * cw, y: y0 });
+    evento(&mut ui, &mut area, Evento::Botao { x: x0 + 2 * cw, y: y0, botao: 1, apertado: false });
+    if area.texto_selecionado() != "y!" {
+        return Err(format!("seleção: {:?}", area.texto_selecionado()));
+    }
+    evento(&mut ui, &mut area, Evento::Tecla('\u{3}'));
+    if !matches!(ui.pedidos.first(), Some(Pedido::Copiar(t)) if t == "y!") {
+        return Err(String::from("Ctrl+C não copiou a seleção"));
+    }
+    // Digitar com uma seleção troca o que estava selecionado.
+    evento(&mut ui, &mut area, Evento::Tecla('Ç'));
+    if area.texto() != "ab\nÇ\nz" {
+        return Err(format!("trocar a seleção: {:?}", area.texto()));
+    }
+    Ok(())
+}
+
 fn principal(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"--endereco-da-pilha") {
         let local = 0u8;
@@ -1583,7 +1633,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 59] = [
+    let testes: [(&str, fn() -> R); 60] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1643,6 +1693,7 @@ fn principal(args: &[&str]) -> i32 {
         ("várias CPUs: 4 processos em CPUs diferentes, ao mesmo tempo", varias_cpus),
         ("fontes TrueType: cmap, glifos compostos, suavização", fontes_truetype),
         ("componentes da interface: botão, caixa, campo, lista, diálogo", componentes_da_interface),
+        ("área de texto do editor: teclado, colar, seleção pelo mouse", area_de_texto),
     ];
 
     println!("Rodando {} testes do kernel...", testes.len());

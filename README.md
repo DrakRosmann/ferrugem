@@ -146,6 +146,11 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   mouse) e janelas de outros programas, que conversam com o servidor por
   um socket Unix e desenham numa memória compartilhada (`ulib::janela`;
   exemplos: `pintar`, `fontes`, `componentes`).
+- **Aplicativos:** `arquivos` (gerenciador de arquivos: tabela com ícones,
+  pastas primeiro, clique duplo abre — pasta, imagem, programa ou texto —,
+  criar pasta, renomear, apagar, copiar e colar) e `editor` (editor de
+  texto com números de linha, seleção pelo mouse, área de transferência,
+  Ctrl+S/O/N/A). Ambos no menu Aplicativos.
 - **Painel de controle** (no estilo das configurações rápidas do GNOME):
   brilho e luz noturna (um filtro de cor aplicado pelo servidor ao copiar
   para a tela), estilo escuro (os programas com `ulib::ui` trocam de tema na
@@ -293,9 +298,9 @@ de páginas. O `make run` usa 4 CPUs.
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica, rumo a um desktop como o XFCE:** gerenciador de
-   arquivos, editor de texto, visualizador de imagens (PNG), monitor do
-   sistema, configurações (papel de parede, tema); mouse absoluto no QEMU.
+4. **Interface gráfica, rumo a um desktop como o XFCE:** visualizador de
+   imagens (PNG), monitor do sistema, configurações (papel de parede, cor
+   de destaque); mouse absoluto no QEMU.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

@@ -82,7 +82,7 @@ const ESPACO: i32 = 8;
 const ALTURA: i32 = 26;
 const ALTURA_MENU: i32 = 24;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Tecla {
     Letra(char),
     Apagar,
@@ -90,15 +90,76 @@ pub enum Tecla {
     Tab,
     Esc,
     Seta(Seta),
-    /// Ctrl+C e Ctrl+V.
+    /// Ctrl+C, Ctrl+V e Ctrl+X.
     Copiar,
     Colar,
+    Recortar,
+    /// Texto colado (pode ter várias linhas).
+    Texto(String),
+    /// Outro Ctrl+letra (um atalho: veja `Tela::atalho`).
+    Controle(char),
+}
+
+/// Os ícones das tabelas (16 × 16 pixels).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Icone {
+    Pasta,
+    Arquivo,
+    Texto,
+    Imagem,
+    Programa,
+    Acima,
+}
+
+/// Desenha um ícone com o canto de cima à esquerda em (x, y).
+pub fn desenhar_icone(q: &mut Quadro, icone: Icone, x: i32, y: i32) {
+    match icone {
+        Icone::Pasta => {
+            q.retangulo_arredondado(x, y + 2, 8, 6, 0xC98F2A);
+            q.retangulo_arredondado(x, y + 4, 16, 11, 0xE8A83A);
+            q.retangulo(x + 1, y + 6, 14, 1, 0xF5C76E);
+        }
+        Icone::Acima => {
+            q.retangulo_arredondado(x, y + 4, 16, 11, 0xE8A83A);
+            q.linha(x + 8, y + 6, x + 8, y + 13, 2, 0xFFFFFF);
+            q.linha(x + 5, y + 9, x + 8, y + 6, 2, 0xFFFFFF);
+            q.linha(x + 11, y + 9, x + 8, y + 6, 2, 0xFFFFFF);
+        }
+        Icone::Programa => {
+            q.retangulo_arredondado(x, y + 1, 16, 14, 0x2E3436);
+            q.linha(x + 3, y + 5, x + 6, y + 8, 1, 0x8AE234);
+            q.linha(x + 6, y + 8, x + 3, y + 11, 1, 0x8AE234);
+            q.retangulo(x + 8, y + 11, 5, 1, 0x8AE234);
+        }
+        _ => {
+            // Uma folha com o canto dobrado, e o desenho do tipo dentro.
+            q.retangulo(x + 2, y, 9, 16, 0x8A8A86);
+            q.retangulo(x + 2, y, 12, 16, 0x8A8A86);
+            q.retangulo(x + 3, y + 1, 10, 14, 0xFFFFFF);
+            q.retangulo(x + 10, y, 4, 4, 0xD0D0CC);
+            match icone {
+                Icone::Texto => {
+                    for k in 0..4 {
+                        q.retangulo(x + 5, y + 5 + k * 2, 6, 1, 0x7A7A76);
+                    }
+                }
+                Icone::Imagem => {
+                    q.retangulo(x + 4, y + 5, 8, 8, 0x87CEEB);
+                    q.linha(x + 4, y + 12, x + 7, y + 8, 1, 0x4E9A06);
+                    q.linha(x + 7, y + 8, x + 11, y + 12, 1, 0x4E9A06);
+                    q.retangulo(x + 9, y + 6, 2, 2, 0xF0C020);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// O que os componentes pedem à janela (a área de transferência).
 pub enum Pedido {
     Copiar(String),
     Colar,
+    Titulo(String),
 }
 
 /// O estado de um campo de texto: o texto e onde está o cursor (em caracteres).
@@ -118,23 +179,161 @@ impl CampoTexto {
     }
 }
 
+/// Uma posição no texto: (linha, coluna em caracteres).
+pub type Posicao = (usize, usize);
+
+/// O estado de uma área de texto de várias linhas (o editor).
+pub struct AreaTexto {
+    pub linhas: Vec<String>,
+    pub cursor: Posicao,
+    /// Onde a seleção começou (ela vai daqui até o cursor).
+    ancora: Option<Posicao>,
+    /// A primeira linha e a primeira coluna visíveis.
+    rolagem: (usize, usize),
+    /// Mudou desde a última vez que foi salvo?
+    pub modificado: bool,
+}
+
+impl AreaTexto {
+    pub fn novo(texto: &str) -> AreaTexto {
+        let linhas: Vec<String> = texto.split('\n').map(String::from).collect();
+        AreaTexto { linhas, cursor: (0, 0), ancora: None, rolagem: (0, 0), modificado: false }
+    }
+
+    pub fn texto(&self) -> String {
+        self.linhas.join("\n")
+    }
+
+    fn byte(&self, (l, c): Posicao) -> usize {
+        self.linhas[l].char_indices().nth(c).map_or(self.linhas[l].len(), |(i, _)| i)
+    }
+
+    fn colunas(&self, l: usize) -> usize {
+        self.linhas[l].chars().count()
+    }
+
+    /// A seleção, em ordem (início, fim), se houver uma.
+    pub fn selecao(&self) -> Option<(Posicao, Posicao)> {
+        let a = self.ancora?;
+        (a != self.cursor).then(|| (a.min(self.cursor), a.max(self.cursor)))
+    }
+
+    pub fn texto_selecionado(&self) -> String {
+        let Some((a, b)) = self.selecao() else { return String::new() };
+        if a.0 == b.0 {
+            return String::from(&self.linhas[a.0][self.byte(a)..self.byte(b)]);
+        }
+        let mut s = String::from(&self.linhas[a.0][self.byte(a)..]);
+        for l in a.0 + 1..b.0 {
+            s.push('\n');
+            s.push_str(&self.linhas[l]);
+        }
+        s.push('\n');
+        s.push_str(&self.linhas[b.0][..self.byte(b)]);
+        s
+    }
+
+    pub fn selecionar_tudo(&mut self) {
+        self.ancora = Some((0, 0));
+        let ultima = self.linhas.len() - 1;
+        self.cursor = (ultima, self.colunas(ultima));
+    }
+
+    pub fn apagar_selecao(&mut self) -> bool {
+        let Some((a, b)) = self.selecao() else {
+            self.ancora = None;
+            return false;
+        };
+        let resto = String::from(&self.linhas[b.0][self.byte(b)..]);
+        let inicio = self.byte(a);
+        self.linhas[a.0].truncate(inicio);
+        self.linhas[a.0].push_str(&resto);
+        self.linhas.drain(a.0 + 1..=b.0);
+        self.cursor = a;
+        self.ancora = None;
+        self.modificado = true;
+        true
+    }
+
+    /// Insere texto no cursor (no lugar da seleção, se houver).
+    pub fn inserir(&mut self, texto: &str) {
+        self.apagar_selecao();
+        for c in texto.chars() {
+            let b = self.byte(self.cursor);
+            if c == '\n' {
+                let resto = self.linhas[self.cursor.0].split_off(b);
+                self.linhas.insert(self.cursor.0 + 1, resto);
+                self.cursor = (self.cursor.0 + 1, 0);
+            } else if !c.is_control() || c == '\t' {
+                self.linhas[self.cursor.0].insert(b, c);
+                self.cursor.1 += 1;
+            }
+        }
+        self.modificado = true;
+    }
+
+    /// Backspace (`para_tras`) ou Delete.
+    fn apagar(&mut self, para_tras: bool) {
+        if self.apagar_selecao() {
+            return;
+        }
+        let (l, c) = self.cursor;
+        if para_tras {
+            if c > 0 {
+                self.cursor.1 -= 1;
+                let b = self.byte(self.cursor);
+                self.linhas[l].remove(b);
+            } else if l > 0 {
+                let linha = self.linhas.remove(l);
+                self.cursor = (l - 1, self.colunas(l - 1));
+                self.linhas[l - 1].push_str(&linha);
+            } else {
+                return;
+            }
+        } else if c < self.colunas(l) {
+            let b = self.byte(self.cursor);
+            self.linhas[l].remove(b);
+        } else if l + 1 < self.linhas.len() {
+            let linha = self.linhas.remove(l + 1);
+            self.linhas[l].push_str(&linha);
+        } else {
+            return;
+        }
+        self.modificado = true;
+    }
+}
+
 /// O estado de uma lista: o item escolhido e quanto ela foi rolada (em pixels).
 #[derive(Default)]
 pub struct Lista {
     pub selecionado: Option<usize>,
     pub rolagem: i32,
+    /// Clique duplo ou Enter num item: "abrir" (o programa pega com `take()`).
+    pub ativado: Option<usize>,
+    /// (instante, item) do último clique, para reconhecer o clique duplo.
+    ultimo_clique: (u64, usize),
 }
 
-/// Uma caixa de diálogo: um título, uma mensagem e os botões.
+/// Uma caixa de diálogo: um título, uma mensagem, os botões e (às vezes)
+/// um campo de texto (ex.: "nome da pasta nova").
 pub struct Dialogo {
     pub titulo: String,
     pub mensagem: String,
     pub botoes: Vec<String>,
+    pub campo: Option<CampoTexto>,
 }
 
 impl Dialogo {
+    /// Pergunta um texto. Depois da resposta, ele está em `Tela::texto_do_dialogo`.
+    pub fn com_campo(titulo: &str, mensagem: &str, texto: &str, botoes: &[&str]) -> Dialogo {
+        let mut d = Self::novo(titulo, mensagem, botoes);
+        d.campo = Some(CampoTexto::novo(texto));
+        d
+    }
+
     pub fn novo(titulo: &str, mensagem: &str, botoes: &[&str]) -> Dialogo {
         Dialogo {
+            campo: None,
             titulo: String::from(titulo),
             mensagem: String::from(mensagem),
             botoes: botoes.iter().map(|b| String::from(*b)).collect(),
@@ -148,7 +347,11 @@ pub struct Ui {
     pub tamanho: u16,
     normal: Option<FonteTT>,
     negrito: Option<FonteTT>,
+    /// Monoespaçada (todas as letras da mesma largura): para editar texto.
+    mono: Option<FonteTT>,
     vga: Option<Fonte>,
+    /// O texto do campo da última caixa de diálogo respondida.
+    resposta: String,
     mouse: (i32, i32),
     apertado: bool,
     /// Neste evento: o botão foi apertado / solto, a roda girou.
@@ -184,7 +387,9 @@ impl Ui {
             tamanho: 13,
             normal: FonteTT::carregar("/usr/share/fonts/DejaVuSans.ttf"),
             negrito: FonteTT::carregar("/usr/share/fonts/DejaVuSans-Bold.ttf"),
+            mono: FonteTT::carregar("/usr/share/fonts/LiberationMono-Regular.ttf"),
             vga: Fonte::carregar(),
+            resposta: String::new(),
             mouse: (-1, -1),
             apertado: false,
             clicou: false,
@@ -228,6 +433,9 @@ impl Ui {
                 '\u{1b}' => Tecla::Esc,
                 '\u{3}' => Tecla::Copiar,
                 '\u{16}' => Tecla::Colar,
+                '\u{18}' => Tecla::Recortar,
+                // Os outros Ctrl+letra: atalhos (Ctrl+S = 19 → 's').
+                c @ '\u{1}'..='\u{1a}' => Tecla::Controle((c as u8 + 0x60) as char),
                 c => Tecla::Letra(c),
             }),
             Evento::Fechar => self.sair = true,
@@ -236,10 +444,8 @@ impl Ui {
                 self.tema = if escuro { TEMA_ESCURO } else { TEMA_CLARO };
                 self.redesenhar = true;
             }
-            // O texto colado chega como se tivesse sido digitado.
-            Evento::Colar(ref texto) => {
-                self.teclas.extend(texto.chars().filter(|c| !c.is_control()).map(Tecla::Letra));
-            }
+            // O texto colado vai para quem tem o foco.
+            Evento::Colar(ref texto) => self.teclas.push(Tecla::Texto(texto.clone())),
         }
     }
 
@@ -309,6 +515,28 @@ impl Ui {
                     q.texto(v, x, y, texto, cor, None);
                 }
                 texto.chars().count() as i32 * LARGURA_LETRA
+            }
+        }
+    }
+
+    /// (largura de cada letra, altura da linha) da fonte monoespaçada.
+    pub fn medidas_mono(&mut self, tamanho: u16) -> (i32, i32) {
+        match self.mono.as_mut() {
+            Some(f) => ((f.glifo('M', tamanho).avanco + 32) / 64, f.metricas(tamanho).1),
+            None => (LARGURA_LETRA, ALTURA_LETRA),
+        }
+    }
+
+    /// Texto na fonte monoespaçada (a da VGA, se não houver outra).
+    pub fn escrever_mono(&mut self, q: &mut Quadro, x: i32, y: i32, texto: &str, cor: u32, tamanho: u16) {
+        match self.mono.as_mut() {
+            Some(f) => {
+                q.texto_tt(f, x, y, texto, tamanho, cor);
+            }
+            None => {
+                if let Some(v) = &self.vga {
+                    q.texto(v, x, y, texto, cor, None);
+                }
             }
         }
     }
@@ -396,6 +624,11 @@ impl Tela<'_> {
         } else {
             self.cy += pixels;
         }
+    }
+
+    /// Quanto sobra de altura daqui até o fim da janela.
+    pub fn altura_livre(&self) -> i32 {
+        self.q.altura - self.cy - MARGEM
     }
 
     /// Quanto sobra de largura a partir da margem esquerda atual.
@@ -609,7 +842,14 @@ impl Tela<'_> {
     /// Campo de texto de uma linha. Devolve true quando se aperta Enter nele.
     pub fn campo(&mut self, campo: &mut CampoTexto, largura: i32) -> bool {
         let (x, y) = self.alocar(largura, ALTURA);
+        self.campo_em(campo, x, y, largura, false)
+    }
+
+    fn campo_em(&mut self, campo: &mut CampoTexto, x: i32, y: i32, largura: i32, focar: bool) -> bool {
         let id = self.novo_id();
+        if focar {
+            self.ui.foco = Some(id);
+        }
         let tamanho = self.ui.tamanho;
         let clicou_aqui = self.ui.clicou && self.mouse_em((x, y, largura, ALTURA));
         self.interagir(id, (x, y, largura, ALTURA), true);
@@ -629,11 +869,17 @@ impl Tela<'_> {
             Tecla::Enter,
             Tecla::Seta(Seta::Esquerda),
             Tecla::Seta(Seta::Direita),
+            Tecla::Seta(Seta::Inicio),
+            Tecla::Seta(Seta::Fim),
+            Tecla::Seta(Seta::Delete),
             Tecla::Copiar,
             Tecla::Colar,
+            Tecla::Recortar,
         ];
         while self.focado(id) {
-            let Some(i) = self.ui.teclas.iter().position(|t| matches!(t, Tecla::Letra(_)) || teclas.contains(t)) else {
+            let Some(i) =
+                self.ui.teclas.iter().position(|t| matches!(t, Tecla::Letra(_) | Tecla::Texto(_)) || teclas.contains(t))
+            else {
                 break;
             };
             self.ui.redesenhar = true;
@@ -643,16 +889,33 @@ impl Tela<'_> {
                     campo.texto.insert(b, c);
                     campo.cursor += 1;
                 }
+                Tecla::Texto(t) => {
+                    // Colado: numa linha só.
+                    let t: String = t.chars().map(|c| if c == '\n' { ' ' } else { c }).filter(|c| !c.is_control()).collect();
+                    let b = campo.byte(campo.cursor);
+                    campo.texto.insert_str(b, &t);
+                    campo.cursor += t.chars().count();
+                }
                 Tecla::Apagar if campo.cursor > 0 => {
                     campo.cursor -= 1;
                     let b = campo.byte(campo.cursor);
                     campo.texto.remove(b);
                 }
+                Tecla::Seta(Seta::Delete) if campo.cursor < campo.texto.chars().count() => {
+                    let b = campo.byte(campo.cursor);
+                    campo.texto.remove(b);
+                }
                 Tecla::Seta(Seta::Esquerda) => campo.cursor = campo.cursor.saturating_sub(1),
                 Tecla::Seta(Seta::Direita) => campo.cursor = (campo.cursor + 1).min(campo.texto.chars().count()),
+                Tecla::Seta(Seta::Inicio) => campo.cursor = 0,
+                Tecla::Seta(Seta::Fim) => campo.cursor = campo.texto.chars().count(),
                 Tecla::Enter => enter = true,
-                // Sem seleção de trecho: Ctrl+C copia o campo inteiro.
+                // Sem seleção de trecho: Ctrl+C copia o campo inteiro (e Ctrl+X o recorta).
                 Tecla::Copiar => self.ui.pedidos.push(Pedido::Copiar(campo.texto.clone())),
+                Tecla::Recortar => {
+                    self.ui.pedidos.push(Pedido::Copiar(core::mem::take(&mut campo.texto)));
+                    campo.cursor = 0;
+                }
                 Tecla::Colar => self.ui.pedidos.push(Pedido::Colar),
                 _ => {}
             }
@@ -670,6 +933,7 @@ impl Tela<'_> {
         let focado = self.focado(id);
         self.q.retangulo_arredondado(x, y, largura, ALTURA, if focado { t.destaque } else { t.borda });
         self.q.retangulo_arredondado(x + 1, y + 1, largura - 2, ALTURA - 2, t.campo);
+        let antes = self.q.recorte;
         self.q.recortar(x + 3, y + 2, largura - 6, ALTURA - 4);
         let topo = y + (ALTURA - self.ui.altura_linha(tamanho)) / 2;
         let texto = campo.texto.clone();
@@ -678,26 +942,208 @@ impl Tela<'_> {
             let cursor_x = x + 6 + px - campo.rolagem;
             self.q.retangulo(cursor_x, y + 5, 1, ALTURA - 10, t.texto);
         }
-        self.q.sem_recorte();
+        self.q.recorte = antes;
         enter
+    }
+
+    /// Uma área de texto de várias linhas, com rolagem e seleção pelo mouse
+    /// (o editor de texto). Ctrl+C, Ctrl+X e Ctrl+V usam a área de transferência.
+    pub fn area_texto(&mut self, area: &mut AreaTexto, largura: i32, altura: i32) {
+        let (x, y) = self.alocar(largura, altura);
+        let id = self.novo_id();
+        let tamanho = self.ui.tamanho;
+        let (cw, lh) = self.ui.medidas_mono(tamanho);
+        // A margem com os números das linhas.
+        let margem = cw * 4 + 12;
+        let (tx, ty) = (x + margem, y + 4);
+        let visiveis = ((altura - 8) / lh).max(1) as usize;
+        let colunas_visiveis = ((largura - margem - 18) / cw).max(1) as usize;
+        let posicao_do_mouse = |area: &AreaTexto, mx: i32, my: i32| -> Posicao {
+            let l = (area.rolagem.0 as i32 + (my - ty) / lh).clamp(0, area.linhas.len() as i32 - 1) as usize;
+            let c = (area.rolagem.1 as i32 + (mx - tx + cw / 2) / cw).max(0) as usize;
+            (l, c.min(area.colunas(l)))
+        };
+        let clicou_aqui = self.ui.clicou && self.mouse_em((x, y, largura, altura));
+        // A área de texto é o centro do programa: sem ninguém com o foco, ele é dela.
+        if self.ui.foco.is_none() && !self.bloqueado() {
+            self.ui.foco = Some(id);
+        }
+        let (sobre, _) = self.interagir(id, (x, y, largura, altura), true);
+        if clicou_aqui {
+            area.cursor = posicao_do_mouse(area, self.ui.mouse.0, self.ui.mouse.1);
+            area.ancora = Some(area.cursor);
+        } else if self.ui.ativo == Some(id) && self.ui.apertado {
+            // arrastando: a seleção vai até o mouse
+            area.cursor = posicao_do_mouse(area, self.ui.mouse.0, self.ui.mouse.1);
+            self.ui.redesenhar = true;
+        }
+        if sobre && self.ui.roda != 0 {
+            let r = area.rolagem.0 as i32 + self.ui.roda * 3;
+            area.rolagem.0 = r.clamp(0, area.linhas.len().saturating_sub(1) as i32) as usize;
+            self.ui.roda = 0;
+            self.ui.redesenhar = true;
+        }
+        // O teclado (com o foco).
+        let mut mexeu = false;
+        while self.focado(id) {
+            let Some(i) = self.ui.teclas.iter().position(|t| !matches!(t, Tecla::Esc | Tecla::Controle(_))) else {
+                break;
+            };
+            mexeu = true;
+            self.ui.redesenhar = true;
+            let (l, c) = area.cursor;
+            let ultima = area.linhas.len() - 1;
+            match self.ui.teclas.remove(i) {
+                Tecla::Letra(ch) => area.inserir(&String::from(ch)),
+                Tecla::Texto(t) => area.inserir(&t),
+                Tecla::Enter => area.inserir("\n"),
+                Tecla::Tab => area.inserir("    "),
+                Tecla::Apagar => area.apagar(true),
+                Tecla::Seta(Seta::Delete) => area.apagar(false),
+                Tecla::Copiar => {
+                    if area.selecao().is_some() {
+                        self.ui.pedidos.push(Pedido::Copiar(area.texto_selecionado()));
+                    }
+                }
+                Tecla::Recortar => {
+                    if area.selecao().is_some() {
+                        self.ui.pedidos.push(Pedido::Copiar(area.texto_selecionado()));
+                        area.apagar_selecao();
+                    }
+                }
+                Tecla::Colar => self.ui.pedidos.push(Pedido::Colar),
+                Tecla::Seta(s) => {
+                    area.ancora = None;
+                    area.cursor = match s {
+                        Seta::Esquerda if c > 0 => (l, c - 1),
+                        Seta::Esquerda if l > 0 => (l - 1, area.colunas(l - 1)),
+                        Seta::Direita if c < area.colunas(l) => (l, c + 1),
+                        Seta::Direita if l < ultima => (l + 1, 0),
+                        Seta::Cima if l > 0 => (l - 1, c.min(area.colunas(l - 1))),
+                        Seta::Baixo if l < ultima => (l + 1, c.min(area.colunas(l + 1))),
+                        Seta::Inicio => (l, 0),
+                        Seta::Fim => (l, area.colunas(l)),
+                        Seta::PaginaAcima => {
+                            let n = l.saturating_sub(visiveis);
+                            (n, c.min(area.colunas(n)))
+                        }
+                        Seta::PaginaAbaixo => {
+                            let n = (l + visiveis).min(ultima);
+                            (n, c.min(area.colunas(n)))
+                        }
+                        _ => (l, c),
+                    };
+                }
+                _ => {}
+            }
+        }
+        // Rola para o cursor ficar à vista (depois de digitar ou andar).
+        if mexeu || clicou_aqui {
+            let (l, c) = area.cursor;
+            if l < area.rolagem.0 {
+                area.rolagem.0 = l;
+            }
+            if l >= area.rolagem.0 + visiveis {
+                area.rolagem.0 = l + 1 - visiveis;
+            }
+            if c < area.rolagem.1 {
+                area.rolagem.1 = c;
+            }
+            if c >= area.rolagem.1 + colunas_visiveis {
+                area.rolagem.1 = c + 1 - colunas_visiveis;
+            }
+        }
+
+        // O desenho.
+        let t = self.ui.tema;
+        let focado = self.focado(id);
+        self.q.retangulo(x, y, largura, altura, if focado { t.destaque } else { t.borda });
+        self.q.retangulo(x + 1, y + 1, largura - 2, altura - 2, t.campo);
+        self.q.retangulo(x + 1, y + 1, margem - 6, altura - 2, t.painel);
+        let antes = self.q.recorte;
+        let selecao = area.selecao();
+        let ultima_visivel = (area.rolagem.0 + visiveis).min(area.linhas.len());
+        for l in area.rolagem.0..ultima_visivel {
+            let ly = ty + (l - area.rolagem.0) as i32 * lh;
+            let numero = alloc::format!("{:>4}", l + 1);
+            self.q.recortar(x + 1, y + 1, margem - 8, altura - 2);
+            self.ui.escrever_mono(&mut self.q, x + 2, ly, &numero, t.texto_fraco, tamanho);
+            self.q.recortar(tx - 2, y + 1, largura - margem - 4, altura - 2);
+            // a parte selecionada desta linha
+            if let Some((a, b)) = selecao {
+                if (a.0..=b.0).contains(&l) {
+                    let de = if l == a.0 { a.1 } else { 0 };
+                    let ate = if l == b.0 { b.1 } else { area.colunas(l) + 1 };
+                    let sx = tx + (de as i32 - area.rolagem.1 as i32) * cw;
+                    self.q.retangulo(sx, ly, (ate - de) as i32 * cw, lh, t.realce);
+                }
+            }
+            let texto: String = area.linhas[l].chars().skip(area.rolagem.1).take(colunas_visiveis + 1).collect();
+            self.ui.escrever_mono(&mut self.q, tx, ly, &texto, t.texto, tamanho);
+        }
+        if focado {
+            let (l, c) = area.cursor;
+            if (area.rolagem.0..ultima_visivel).contains(&l) && c >= area.rolagem.1 {
+                let cx = tx + (c - area.rolagem.1) as i32 * cw;
+                let cy = ty + (l - area.rolagem.0) as i32 * lh;
+                self.q.retangulo(cx, cy, 2, lh, t.destaque);
+            }
+        }
+        self.q.recorte = antes;
+    }
+
+    /// Põe um texto na área de transferência.
+    pub fn copiar(&mut self, texto: &str) {
+        self.ui.pedidos.push(Pedido::Copiar(String::from(texto)));
+    }
+
+    /// Pede o texto da área de transferência: ele chega a quem tem o foco.
+    pub fn pedir_colagem(&mut self) {
+        self.ui.pedidos.push(Pedido::Colar);
+    }
+
+    /// Troca o título da janela.
+    pub fn mudar_titulo(&mut self, titulo: &str) {
+        self.ui.pedidos.push(Pedido::Titulo(String::from(titulo)));
+    }
+
+    /// Um atalho de teclado (Ctrl+letra): true se foi apertado neste evento.
+    pub fn atalho(&mut self, letra: char) -> bool {
+        match self.ui.teclas.iter().position(|t| *t == Tecla::Controle(letra)) {
+            Some(i) => {
+                self.ui.teclas.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     // ------------------------------------------------------------- listas
 
-    /// Lista de itens com rolagem (roda do mouse, barra ou setas). Devolve o
-    /// item escolhido neste evento (clique ou Enter).
-    pub fn lista<S: AsRef<str>>(&mut self, lista: &mut Lista, itens: &[S], largura: i32, altura: i32) -> Option<usize> {
+    /// O que a lista e a tabela têm em comum: rolagem (roda, barra, setas),
+    /// seleção (clique, setas), ativação (clique duplo, Enter). `desenhar`
+    /// desenha o item `i` na faixa (x, y, largura, altura), com a cor do texto.
+    #[allow(clippy::too_many_arguments)]
+    fn lista_base(
+        &mut self,
+        lista: &mut Lista,
+        n: usize,
+        largura: i32,
+        altura: i32,
+        cabecalho: i32,
+        item: i32,
+        mut desenhar: impl FnMut(&mut Ui, &mut Quadro, usize, (i32, i32, i32, i32), u32),
+    ) -> ((i32, i32), Option<usize>) {
         let (x, y) = self.alocar(largura, altura);
         let id = self.novo_id();
         let id_barra = self.novo_id();
-        let tamanho = self.ui.tamanho;
-        let item = self.ui.altura_linha(tamanho) + 6;
-        let visivel = altura - 2;
-        let total = itens.len() as i32 * item;
+        let corpo_y = y + cabecalho;
+        let visivel = altura - 2 - cabecalho;
+        let total = n as i32 * item;
         let maximo = (total - visivel).max(0);
         let barra = if total > visivel { 12 } else { 0 };
-        let area_itens = (x, y, largura - barra, altura);
-        let area_barra = (x + largura - barra - 1, y + 1, barra, visivel);
+        let area_itens = (x, corpo_y, largura - barra, visivel + 1);
+        let area_barra = (x + largura - barra - 1, corpo_y + 1, barra, visivel);
         let mut escolhido = None;
 
         let clicou_itens = self.ui.clicou && self.mouse_em(area_itens);
@@ -709,8 +1155,14 @@ impl Tela<'_> {
             self.ui.redesenhar = true;
         }
         if clicou_itens {
-            let i = ((self.ui.mouse.1 - y - 1 + lista.rolagem) / item) as usize;
-            if i < itens.len() {
+            let i = ((self.ui.mouse.1 - corpo_y - 1 + lista.rolagem) / item) as usize;
+            if i < n {
+                // Dois cliques rápidos no mesmo item: "ativa" (abre).
+                let agora = crate::sys::tempo_ms();
+                if lista.ultimo_clique.1 == i && agora - lista.ultimo_clique.0 < 450 {
+                    lista.ativado = Some(i);
+                }
+                lista.ultimo_clique = (agora, i);
                 lista.selecionado = Some(i);
                 escolhido = Some(i);
                 self.ui.redesenhar = true;
@@ -723,21 +1175,36 @@ impl Tela<'_> {
         }
         if barra > 0 && self.ui.ativo == Some(id_barra) && (self.ui.apertado || self.ui.clicou) {
             let curso = (visivel - polegar).max(1);
-            lista.rolagem = (self.ui.mouse.1 - y - 1 - polegar / 2) * maximo / curso;
+            lista.rolagem = (self.ui.mouse.1 - corpo_y - 1 - polegar / 2) * maximo / curso;
             self.ui.redesenhar = true;
         }
-        // Setas e Enter com o foco.
-        let teclas = [Tecla::Seta(Seta::Cima), Tecla::Seta(Seta::Baixo), Tecla::Enter];
+        let pagina = (visivel / item).max(1) as usize;
+        let teclas = [
+            Tecla::Seta(Seta::Cima),
+            Tecla::Seta(Seta::Baixo),
+            Tecla::Seta(Seta::Inicio),
+            Tecla::Seta(Seta::Fim),
+            Tecla::Seta(Seta::PaginaAcima),
+            Tecla::Seta(Seta::PaginaAbaixo),
+            Tecla::Enter,
+        ];
         while let Some(t) = self.tecla(id, &teclas) {
-            let n = itens.len();
-            match t {
-                Tecla::Seta(Seta::Cima) if n > 0 => lista.selecionado = Some(lista.selecionado.map_or(0, |s| s.saturating_sub(1))),
-                Tecla::Seta(Seta::Baixo) if n > 0 => {
-                    lista.selecionado = Some(lista.selecionado.map_or(0, |s| (s + 1).min(n - 1)))
-                }
-                Tecla::Enter => escolhido = lista.selecionado,
-                _ => {}
+            if n == 0 {
+                continue;
             }
+            let atual = lista.selecionado;
+            lista.selecionado = Some(match t {
+                Tecla::Seta(Seta::Cima) => atual.map_or(0, |s| s.saturating_sub(1)),
+                Tecla::Seta(Seta::Baixo) => atual.map_or(0, |s| (s + 1).min(n - 1)),
+                Tecla::Seta(Seta::Inicio) => 0,
+                Tecla::Seta(Seta::Fim) => n - 1,
+                Tecla::Seta(Seta::PaginaAcima) => atual.map_or(0, |s| s.saturating_sub(pagina)),
+                Tecla::Seta(Seta::PaginaAbaixo) => atual.map_or(0, |s| (s + pagina).min(n - 1)),
+                _ => {
+                    lista.ativado = atual;
+                    atual.unwrap_or(0)
+                }
+            });
             // o escolhido fica à vista
             if let Some(s) = lista.selecionado {
                 let topo = s as i32 * item;
@@ -750,36 +1217,94 @@ impl Tela<'_> {
             }
         }
         lista.rolagem = lista.rolagem.clamp(0, maximo);
+        if lista.selecionado.is_some_and(|s| s >= n) {
+            lista.selecionado = None;
+        }
 
         let t = self.ui.tema;
         let focado = self.focado(id);
         self.q.retangulo(x, y, largura, altura, if focado { t.destaque } else { t.borda });
         self.q.retangulo(x + 1, y + 1, largura - 2, altura - 2, t.campo);
-        self.q.recortar(x + 1, y + 1, largura - 2 - barra, visivel);
+        let antes = self.q.recorte;
+        self.q.recortar(x + 1, corpo_y + 1, largura - 2 - barra, visivel);
         let primeiro = (lista.rolagem / item) as usize;
-        let ultimo = (((lista.rolagem + visivel) / item) as usize + 1).min(itens.len());
-        let topo_texto = (item - self.ui.altura_linha(tamanho)) / 2;
+        let ultimo = (((lista.rolagem + visivel) / item) as usize + 1).min(n);
         for i in primeiro..ultimo {
-            let iy = y + 1 + i as i32 * item - lista.rolagem;
-            let selecionado = lista.selecionado == Some(i);
-            let cor = if selecionado {
-                self.q.retangulo(x + 1, iy, largura - 2 - barra, item, t.destaque);
+            let iy = corpo_y + 1 + i as i32 * item - lista.rolagem;
+            let faixa = (x + 1, iy, largura - 2 - barra, item);
+            let cor = if lista.selecionado == Some(i) {
+                self.q.retangulo(faixa.0, faixa.1, faixa.2, faixa.3, t.destaque);
                 t.texto_destaque
             } else {
-                if sobre && contem((x, iy, largura - barra, item), self.ui.mouse) {
-                    self.q.retangulo(x + 1, iy, largura - 2 - barra, item, t.realce);
+                if sobre && contem(faixa, self.ui.mouse) {
+                    self.q.retangulo(faixa.0, faixa.1, faixa.2, faixa.3, t.realce);
                 }
                 t.texto
             };
-            self.escrever(x + 8, iy + topo_texto, itens[i].as_ref(), cor, false, tamanho);
+            desenhar(self.ui, &mut self.q, i, faixa, cor);
         }
-        self.q.sem_recorte();
+        self.q.recorte = antes;
         if barra > 0 {
             let (bx, by, bw, bh) = area_barra;
             self.q.retangulo(bx, by, bw, bh, t.painel);
             let py = by + if maximo > 0 { lista.rolagem * (visivel - polegar) / maximo } else { 0 };
             let cor = if self.ui.ativo == Some(id_barra) { t.destaque } else { t.borda };
             self.q.retangulo_arredondado(bx + 2, py + 1, bw - 4, polegar - 2, cor);
+        }
+        ((x, y), escolhido)
+    }
+
+    /// Lista de itens com rolagem (roda do mouse, barra ou setas). Devolve o
+    /// item escolhido neste evento (clique ou Enter); o clique duplo e o
+    /// Enter também marcam `lista.ativado`.
+    pub fn lista<S: AsRef<str>>(&mut self, lista: &mut Lista, itens: &[S], largura: i32, altura: i32) -> Option<usize> {
+        let tamanho = self.ui.tamanho;
+        let item = self.ui.altura_linha(tamanho) + 6;
+        let topo = (item - self.ui.altura_linha(tamanho)) / 2;
+        let ((_, _), escolhido) = self.lista_base(lista, itens.len(), largura, altura, 0, item, |ui, q, i, (x, y, _, _), cor| {
+            ui.escrever(q, x + 7, y + topo, itens[i].as_ref(), cor, false, tamanho);
+        });
+        escolhido
+    }
+
+    /// Uma tabela: colunas com título (nome, largura) e, em cada linha, um
+    /// ícone e os textos das colunas. Funciona como a lista.
+    pub fn tabela(
+        &mut self,
+        lista: &mut Lista,
+        colunas: &[(&str, i32)],
+        linhas: &[(Icone, Vec<String>)],
+        largura: i32,
+        altura: i32,
+    ) -> Option<usize> {
+        let tamanho = self.ui.tamanho;
+        let item = self.ui.altura_linha(tamanho) + 8;
+        let topo = (item - self.ui.altura_linha(tamanho)) / 2;
+        let cabecalho = item;
+        let ((x, y), escolhido) =
+            self.lista_base(lista, linhas.len(), largura, altura, cabecalho, item, |ui, q, i, (x, y, _, h), cor| {
+                let (icone, textos) = &linhas[i];
+                desenhar_icone(q, *icone, x + 6, y + (h - 16) / 2);
+                let mut cx = x + 30;
+                for (k, texto) in textos.iter().enumerate() {
+                    let w = colunas.get(k).map_or(100, |c| c.1);
+                    let antes = q.recorte;
+                    let (rx, ry, rw, rh) = antes;
+                    let fim = (cx + w - 8).min(rx + rw);
+                    q.recorte = (cx.max(rx), ry, (fim - cx.max(rx)).max(0), rh);
+                    ui.escrever(q, cx, y + topo, texto, cor, false, tamanho);
+                    q.recorte = antes;
+                    cx += w;
+                }
+            });
+        // O cabeçalho das colunas.
+        let t = self.ui.tema;
+        self.q.retangulo(x + 1, y + 1, largura - 2, cabecalho - 1, t.painel);
+        self.q.retangulo(x + 1, y + cabecalho, largura - 2, 1, t.borda);
+        let mut cx = x + 30;
+        for (nome, w) in colunas {
+            self.escrever(cx, y + topo, nome, t.texto_fraco, true, tamanho - 1);
+            cx += w;
         }
         escolhido
     }
@@ -920,7 +1445,8 @@ impl Tela<'_> {
         let largura = 380.min(self.largura - 40);
         let linhas = self.ui.quebrar(&mensagem, largura - 40, tamanho);
         let altura_linha = self.ui.altura_linha(tamanho) + 2;
-        let altura = 20 + 26 + linhas.len() as i32 * altura_linha + 16 + ALTURA + 20;
+        let com_campo = dialogo.as_ref().is_some_and(|d| d.campo.is_some());
+        let altura = 20 + 26 + linhas.len() as i32 * altura_linha + 16 + ALTURA + 20 + if com_campo { ALTURA + 12 } else { 0 };
         let (x, y) = ((self.largura - largura) / 2, (self.q.altura - altura) / 2);
         self.q.retangulo(x + 3, y + 3, largura, altura, 0x404040);
         self.q.retangulo(x, y, largura, altura, t.borda);
@@ -930,11 +1456,18 @@ impl Tela<'_> {
         for (i, l) in linhas.iter().enumerate() {
             self.escrever(x + 20, y + 46 + i as i32 * altura_linha, l, t.texto, false, tamanho);
         }
+        let mut escolha = None;
+        // O campo de texto (sempre com o foco; Enter = o primeiro botão).
+        if let Some(campo) = dialogo.as_mut().and_then(|d| d.campo.as_mut()) {
+            let cy = y + 46 + linhas.len() as i32 * altura_linha + 8;
+            if self.campo_em(campo, x + 20, cy, largura - 40, true) {
+                escolha = Some(0);
+            }
+        }
         // Os botões, alinhados à direita.
         let larguras: Vec<i32> = botoes.iter().map(|b| self.largura_botao(b)).collect();
         let mut bx = x + largura - 20 - larguras.iter().sum::<i32>() - ESPACO * (botoes.len() as i32 - 1);
         let by = y + altura - 20 - ALTURA;
-        let mut escolha = None;
         for (i, b) in botoes.iter().enumerate() {
             if self.botao_em(bx, by, larguras[i], b) {
                 escolha = Some(i);
@@ -950,10 +1483,17 @@ impl Tela<'_> {
         }
         self.dentro_do_modal = false;
         if escolha.is_some() {
-            *dialogo = None;
+            if let Some(campo) = dialogo.take().and_then(|d| d.campo) {
+                self.ui.resposta = campo.texto;
+            }
             self.ui.redesenhar = true;
         }
         escolha
+    }
+
+    /// O texto que foi digitado na última caixa de diálogo com campo.
+    pub fn texto_do_dialogo(&mut self) -> String {
+        core::mem::take(&mut self.ui.resposta)
     }
 }
 
@@ -1017,7 +1557,13 @@ impl Drop for Tela<'_> {
 
 /// O laço de um programa com janela: desenha com `f`, mostra, espera um
 /// evento, e de novo — até a janela ser fechada (pelo "x" ou por `t.fechar_janela()`).
-pub fn laco(janela: &mut Janela, ui: &mut Ui, mut f: impl FnMut(&mut Tela)) {
+pub fn laco(janela: &mut Janela, ui: &mut Ui, f: impl FnMut(&mut Tela)) {
+    laco_com_prazo(janela, ui, -1, f)
+}
+
+/// Como `laco`, mas redesenha também a cada `ms` milissegundos sem eventos
+/// (para o que se atualiza sozinho, como um relógio ou o monitor do sistema).
+pub fn laco_com_prazo(janela: &mut Janela, ui: &mut Ui, ms: i32, mut f: impl FnMut(&mut Tela)) {
     loop {
         let mut vezes = 0;
         loop {
@@ -1035,14 +1581,16 @@ pub fn laco(janela: &mut Janela, ui: &mut Ui, mut f: impl FnMut(&mut Tela)) {
             match pedido {
                 Pedido::Copiar(texto) => janela.copiar(&texto),
                 Pedido::Colar => janela.pedir_colagem(),
+                Pedido::Titulo(t) => janela.mudar_titulo(&t),
             }
         }
         janela.mostrar();
         if ui.saindo() {
             return;
         }
-        match janela.evento() {
-            Some(e) => ui.receber(&e),
+        match janela.evento_com_prazo(ms) {
+            Some(Some(e)) => ui.receber(&e),
+            Some(None) => {} // o prazo passou: desenha de novo
             None => return,
         }
         if ui.saindo() {
