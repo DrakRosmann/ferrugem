@@ -71,8 +71,11 @@ USUARIO_SRC := $(wildcard usuario/src/*.rs usuario/src/bin/*.rs) $(wildcard comu
                usuario/Cargo.toml usuario/usuario.ld
 ARQUIVOS_RAIZ := $(shell find raiz -type f)
 
-# 4 CPUs (o kernel acorda as outras três: veja src/smp.rs).
-QEMU := qemu-system-x86_64 -cpu max -smp 4 -kernel $(KERNEL) -initrd $(INITRD) -m 256M \
+# 4 CPUs (o kernel acorda as outras três: veja src/smp.rs) e a placa de rede
+# RTL8139 na rede "user" do QEMU (nós somos 10.0.2.15; o computador de fora,
+# 10.0.2.2; o DNS, 10.0.2.3).
+REDE := -nic user,model=rtl8139
+QEMU := qemu-system-x86_64 -cpu max -smp 4 -kernel $(KERNEL) -initrd $(INITRD) -m 256M $(REDE) \
         -drive file=$(DISCO),format=raw,if=ide,index=0
 
 .PHONY: all run run-nox run-sistema sistema teste clean disco musl lua
@@ -178,7 +181,7 @@ sistema: $(INITRD)
 
 # Raiz no disco: sem initrd; o kernel monta o hda como "/" (raiz=/dev/hda).
 run-sistema: $(KERNEL) $(SISTEMA)
-	qemu-system-x86_64 -cpu max -smp 4 -kernel $(KERNEL) -append "raiz=/dev/hda" -m 256M \
+	qemu-system-x86_64 -cpu max -smp 4 -kernel $(KERNEL) -append "raiz=/dev/hda" -m 256M $(REDE) \
 		-drive file=$(SISTEMA),format=raw,if=ide,index=0 \
 		-chardev stdio,id=serial0,signal=off -serial chardev:serial0
 

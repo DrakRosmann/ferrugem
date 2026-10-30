@@ -330,7 +330,12 @@ fn do_descritor(fd: u64) -> Result<(Arc<Arquivo>, Arc<Socket>), i64> {
 }
 
 fn descritor_para(s: Arc<Socket>, flags: u64) -> Resultado {
-    let arq = Arquivo::novo(Tipo::Socket(s), arquivo::O_RDWR | flags & SOCK_NONBLOCK);
+    descritor_com_flags(Tipo::Socket(s), flags)
+}
+
+/// Um descritor novo para um socket, com SOCK_NONBLOCK e SOCK_CLOEXEC.
+pub(crate) fn descritor_com_flags(tipo: Tipo, flags: u64) -> Resultado {
+    let arq = Arquivo::novo(tipo, arquivo::O_RDWR | flags & SOCK_NONBLOCK);
     let fd = novo_descritor(arq)?;
     if flags & SOCK_CLOEXEC != 0 {
         processo::atual().arquivos().fecha_no_exec |= 1 << fd;
@@ -516,7 +521,7 @@ pub fn recvfrom(fd: u64, buf: u64, tamanho: u64, flags: u64, ptr: u64, ptr_taman
 }
 
 /// struct msghdr { name, namelen, iov, iovlen, control, controllen, flags }
-fn ler_msghdr(ptr: u64) -> Result<(u64, u64, Vec<(u64, u64)>), i64> {
+pub(crate) fn ler_msghdr(ptr: u64) -> Result<(u64, u64, Vec<(u64, u64)>), i64> {
     let m = ler_usuario(ptr, 56)?;
     let campo = |i: usize| u64::from_le_bytes(m[i..i + 8].try_into().unwrap());
     let (nome, tamanho_nome, iov, quantos) = (campo(0), campo(8) & 0xFFFF_FFFF, campo(16), campo(24));

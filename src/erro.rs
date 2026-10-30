@@ -37,14 +37,20 @@ pub const EDESTADDRREQ: i64 = 89;
 pub const EMSGSIZE: i64 = 90;
 pub const EPROTOTYPE: i64 = 91;
 pub const ENOPROTOOPT: i64 = 92;
+pub const EPROTONOSUPPORT: i64 = 93;
 pub const ESOCKTNOSUPPORT: i64 = 94;
 pub const EOPNOTSUPP: i64 = 95;
 pub const EAFNOSUPPORT: i64 = 97;
 pub const EADDRINUSE: i64 = 98;
+pub const EADDRNOTAVAIL: i64 = 99;
+pub const ENETUNREACH: i64 = 101;
+pub const ECONNRESET: i64 = 104;
 pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
 pub const ECONNREFUSED: i64 = 111;
 pub const ETIMEDOUT: i64 = 110;
+pub const EALREADY: i64 = 114;
+pub const EINPROGRESS: i64 = 115;
 
 /// Interno do kernel (o programa nunca vê): "refaça esta chamada de sistema
 /// quando o processo voltar a rodar". Usado quando ele é parado no meio dela.

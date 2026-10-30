@@ -286,10 +286,12 @@ fn irq(numero: u8) {
         0 => {
             pit::tique();
             processo::tique();
+            crate::rede::tique();
         }
         1 => teclado::tratar_irq(),
         4 => serial::tratar_irq(),
         12 => crate::mouse::tratar_irq(),
+        n if n == crate::rtl8139::irq() => crate::rtl8139::tratar_irq(),
         _ => {}
     }
     pic::fim_de_interrupcao(numero);

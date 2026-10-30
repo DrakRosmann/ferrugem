@@ -28,6 +28,7 @@ pub enum Global {
     Mounts,
     Loadavg,
     Stat,
+    Rede,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,11 +51,12 @@ pub enum NoProc {
     DoProcesso(Pid, Item),
 }
 
-const GLOBAIS: [(&str, Global); 7] = [
+const GLOBAIS: [(&str, Global); 8] = [
     ("cpuinfo", Global::Cpuinfo),
     ("loadavg", Global::Loadavg),
     ("meminfo", Global::Meminfo),
     ("mounts", Global::Mounts),
+    ("rede", Global::Rede),
     ("stat", Global::Stat),
     ("uptime", Global::Uptime),
     ("version", Global::Version),
@@ -300,6 +302,7 @@ fn global(g: Global) -> String {
             }
             t
         }
+        Global::Rede => crate::rede::descrever(),
         Global::Loadavg => {
             let lista = processo::listar();
             let rodando = lista.iter().filter(|r| r.estado <= 1).count().saturating_sub(1);

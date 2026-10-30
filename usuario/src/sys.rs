@@ -67,6 +67,16 @@ impl Erro {
             38 => "não implementado",
             39 => "diretório não está vazio",
             40 => "links simbólicos demais (um laço?)",
+            11 => "tente de novo (nada pronto ainda)",
+            88 => "não é um socket",
+            97 => "família de endereços não suportada",
+            98 => "endereço já em uso",
+            99 => "endereço indisponível",
+            101 => "rede inalcançável",
+            104 => "conexão encerrada pelo outro lado",
+            110 => "tempo esgotado",
+            111 => "conexão recusada",
+            115 => "conectando",
             _ => "erro desconhecido",
         }
     }
@@ -347,6 +357,14 @@ pub fn diretorio_atual() -> String {
         Ok(n) => String::from_utf8_lossy(&buf[..(n as usize).saturating_sub(1)]).into_owned(),
         Err(_) => String::from("?"),
     }
+}
+
+/// Grava um arquivo inteiro (criando, ou apagando o que havia).
+pub fn escrever_arquivo(caminho: &str, dados: &[u8]) -> Resultado<()> {
+    let fd = abrir_com_permissoes(caminho, O_WRONLY | O_CREAT | O_TRUNC, 0o644)?;
+    let r = escrever_tudo(fd, dados);
+    let _ = fechar(fd);
+    r
 }
 
 /// Lê um arquivo inteiro.
@@ -1104,3 +1122,88 @@ pub fn truncar_fd(fd: i32, tamanho: u64) -> Resultado<()> {
 }
 
 pub const O_NONBLOCK: u64 = 0o4000;
+
+// -----------------------------------------------------------------------------
+// Rede (AF_INET): os IPs vão como número (10.0.2.15 = 0x0A00020F)
+// -----------------------------------------------------------------------------
+
+pub const AF_INET: u64 = 2;
+pub const IPPROTO_ICMP: u64 = 1;
+
+unsafe fn syscall6(numero: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> i64 {
+    let resposta: i64;
+    unsafe {
+        asm!("syscall", inlateout("rax") numero as i64 => resposta, in("rdi") a, in("rsi") b, in("rdx") c,
+             in("r10") d, in("r8") e, in("r9") f, lateout("rcx") _, lateout("r11") _, options(nostack));
+    }
+    resposta
+}
+
+/// struct sockaddr_in
+fn endereco_inet(ip: u32, porta: u16) -> [u8; 16] {
+    let mut e = [0u8; 16];
+    e[0] = AF_INET as u8;
+    e[2..4].copy_from_slice(&porta.to_be_bytes());
+    e[4..8].copy_from_slice(&ip.to_be_bytes());
+    e
+}
+
+fn ler_endereco_inet(e: &[u8; 16]) -> (u32, u16) {
+    (u32::from_be_bytes(e[4..8].try_into().unwrap()), u16::from_be_bytes([e[2], e[3]]))
+}
+
+/// Um socket de rede: SOCK_STREAM (TCP), SOCK_DGRAM (UDP) ou SOCK_DGRAM com
+/// IPPROTO_ICMP (o ping).
+pub fn socket_inet(tipo: u64, protocolo: u64) -> Resultado<i32> {
+    conferir(unsafe { syscall(41, AF_INET, tipo, protocolo, 0) }).map(|fd| fd as i32)
+}
+
+pub fn conectar_inet(fd: i32, ip: u32, porta: u16) -> Resultado<()> {
+    let e = endereco_inet(ip, porta);
+    conferir(unsafe { syscall(42, fd as u64, e.as_ptr() as u64, 16, 0) }).map(|_| ())
+}
+
+pub fn ligar_inet(fd: i32, ip: u32, porta: u16) -> Resultado<()> {
+    let e = endereco_inet(ip, porta);
+    conferir(unsafe { syscall(49, fd as u64, e.as_ptr() as u64, 16, 0) }).map(|_| ())
+}
+
+/// Aceita uma conexão: (descritor, IP e porta de quem conectou).
+pub fn aceitar_inet(fd: i32) -> Resultado<(i32, u32, u16)> {
+    let mut e = [0u8; 16];
+    let mut tamanho = 16u32;
+    let novo = conferir(unsafe { syscall(43, fd as u64, e.as_mut_ptr() as u64, &raw mut tamanho as u64, 0) })?;
+    let (ip, porta) = ler_endereco_inet(&e);
+    Ok((novo as i32, ip, porta))
+}
+
+pub fn enviar_para_inet(fd: i32, dados: &[u8], ip: u32, porta: u16) -> Resultado<usize> {
+    let e = endereco_inet(ip, porta);
+    let r = unsafe { syscall6(44, fd as u64, dados.as_ptr() as u64, dados.len() as u64, 0, e.as_ptr() as u64, 16) };
+    conferir(r).map(|n| n as usize)
+}
+
+/// Recebe um datagrama: (tamanho, IP e porta de quem mandou).
+pub fn receber_de_inet(fd: i32, buf: &mut [u8]) -> Resultado<(usize, u32, u16)> {
+    let mut e = [0u8; 16];
+    let mut tamanho = 16u32;
+    let r = unsafe {
+        syscall6(45, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, e.as_mut_ptr() as u64, &raw mut tamanho as u64)
+    };
+    let n = conferir(r)?;
+    let (ip, porta) = ler_endereco_inet(&e);
+    Ok((n as usize, ip, porta))
+}
+
+/// O endereço local de um socket (`getsockname`).
+pub fn endereco_local_inet(fd: i32) -> Resultado<(u32, u16)> {
+    let mut e = [0u8; 16];
+    let mut tamanho = 16u32;
+    conferir(unsafe { syscall(51, fd as u64, e.as_mut_ptr() as u64, &raw mut tamanho as u64, 0) })?;
+    Ok(ler_endereco_inet(&e))
+}
+
+/// `shutdown`: 0 = não vou mais ler, 1 = não vou mais escrever, 2 = os dois.
+pub fn desligar_socket(fd: i32, como: u64) -> Resultado<()> {
+    conferir(unsafe { syscall(48, fd as u64, como, 0, 0) }).map(|_| ())
+}

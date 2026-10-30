@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod grafico;
+pub mod http;
 pub mod io;
 pub mod janela;
 #[path = "../../comum/cp437.rs"]
@@ -32,6 +33,7 @@ mod lista_livre;
 mod memoria;
 pub mod sha256;
 pub mod png;
+pub mod rede;
 pub mod sys;
 pub mod truetype;
 pub mod ui;

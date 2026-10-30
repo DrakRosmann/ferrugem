@@ -15,7 +15,7 @@ use crate::paginacao::EspacoEnderecos;
 use crate::paginacao::{Fonte, Regiao};
 use crate::processo::{self, MAX_ARQUIVOS};
 use crate::vfs::{self, Vnode};
-use crate::{epoll, heap, pit, porta, println, quadros, rtc, sinal, socket, tty};
+use crate::{epoll, heap, inet, pit, porta, println, quadros, rtc, sinal, socket, tty};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -84,7 +84,9 @@ pub fn tratar(ctx: &mut Contexto) {
         }
         26 => sys_msync(a1, a2),
         28 => Ok(0), // madvise: só um conselho; pode ser ignorado
+        41 if a1 == inet::AF_INET => inet::socket(a2, a3),
         41 => socket::socket(a1, a2),
+        n @ (42..=52 | 54 | 55 | 288) if inet::e_inet(a1) => inet::chamada(n, a1, a2, a3, a4, a5, ctx.r9),
         42 => socket::connect(a1, a2, a3),
         43 => socket::accept(a1, a2, a3, 0),
         288 => socket::accept(a1, a2, a3, a4),
@@ -960,7 +962,7 @@ fn sys_fstat(fd: u64, buf: u64) -> Resultado {
     let arq = arquivo(fd)?;
     let stat = match (arq.vnode(), &arq.tipo) {
         (Some(no), _) => stat_do_no(no)?,
-        (None, Tipo::Socket(_)) => montar_stat(0, S_IFSOCK | 0o777, 0, 0, 0, 0),
+        (None, Tipo::Socket(_) | Tipo::Inet(_)) => montar_stat(0, S_IFSOCK | 0o777, 0, 0, 0, 0),
         (None, Tipo::Epoll(_)) => montar_stat(0, 0o600, 0, 0, 0, 0),
         (None, _) => montar_stat(0, S_IFIFO | 0o600, 0, 0, 0, 0),
     };

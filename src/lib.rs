@@ -25,6 +25,11 @@ mod cp437;
 mod lista_livre;
 mod multiboot;
 mod paginacao;
+mod inet;
+mod pci;
+mod rede;
+mod rtl8139;
+mod tcp;
 mod pic;
 mod pit;
 mod porta;
@@ -168,6 +173,9 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     ok(format_args!("PIC, timer a {} Hz, teclado ABNT2{} e serial", pit::FREQUENCIA, mouse));
     if let Some(descricao) = video {
         ok(format_args!("{}", descricao));
+    }
+    if let Some(descricao) = rtl8139::init() {
+        ok(format_args!("{}; IP {}", descricao, rede::texto_ip(rede::MEU_IP)));
     }
 
     processo::init();

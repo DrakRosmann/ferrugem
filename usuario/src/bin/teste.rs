@@ -1623,6 +1623,146 @@ fn area_de_texto() -> R {
     Ok(())
 }
 
+/// O byte `i` dos dados de teste da rede (o rodar.sh gera o mesmo arquivo).
+fn byte_de_teste(i: usize) -> u8 {
+    (i * 7 % 251) as u8
+}
+
+fn rede_tcp_local() -> R {
+    const PORTA: u16 = 7777;
+    const TAMANHO: usize = 200_000;
+    let ouvinte = sys::socket_inet(sys::SOCK_STREAM, 0).map_err(erro)?;
+    sys::ligar_inet(ouvinte, 0x7F00_0001, PORTA).map_err(erro)?;
+    sys::ouvir(ouvinte, 4).map_err(erro)?;
+    // Uma porta sem ninguém: o kernel responde com RST.
+    let s = sys::socket_inet(sys::SOCK_STREAM, 0).map_err(erro)?;
+    match sys::conectar_inet(s, 0x7F00_0001, PORTA + 1) {
+        Err(e) if e.0 == 111 => {}
+        r => return Err(format!("porta fechada: esperava ECONNREFUSED, veio {:?}", r.map_err(|e| e.0))),
+    }
+    let _ = sys::fechar(s);
+    // O cliente (filho): manda 200 KB, fecha a escrita e lê a resposta.
+    let filho = match sys::fork().map_err(erro)? {
+        0 => {
+            let ok = (|| -> Option<()> {
+                let s = sys::socket_inet(sys::SOCK_STREAM, 0).ok()?;
+                sys::conectar_inet(s, 0x7F00_0001, PORTA).ok()?;
+                let dados: Vec<u8> = (0..TAMANHO).map(byte_de_teste).collect();
+                sys::escrever_tudo(s, &dados).ok()?;
+                sys::desligar_socket(s, 1).ok()?;
+                let mut volta = Vec::new();
+                let mut buf = [0u8; 3000];
+                loop {
+                    match sys::ler(s, &mut buf).ok()? {
+                        0 => break,
+                        n => volta.extend_from_slice(&buf[..n]),
+                    }
+                }
+                (volta.len() == TAMANHO && volta.iter().enumerate().all(|(i, &b)| b == byte_de_teste(i) ^ 0xFF)).then_some(())
+            })();
+            sys::sair(if ok.is_some() { 0 } else { 1 });
+        }
+        pid => pid,
+    };
+    // O servidor: o poll avisa a conexão chegando; lê tudo e devolve invertido.
+    let pronto = sys::poll(&[(ouvinte, sys::POLLIN)], 3000).map_err(erro)?;
+    if pronto[0] & sys::POLLIN == 0 {
+        return Err("o poll no socket ouvindo não avisou a conexão".into());
+    }
+    let (c, ip, _) = sys::aceitar_inet(ouvinte).map_err(erro)?;
+    if ip != 0x7F00_0001 {
+        return Err(format!("accept: endereço do cliente {:#x}", ip));
+    }
+    let mut recebido = Vec::new();
+    let mut buf = [0u8; 5000];
+    loop {
+        match sys::ler(c, &mut buf).map_err(erro)? {
+            0 => break,
+            n => recebido.extend_from_slice(&buf[..n]),
+        }
+    }
+    if recebido.len() != TAMANHO || recebido.iter().enumerate().any(|(i, &b)| b != byte_de_teste(i)) {
+        return Err(format!("o servidor recebeu {} bytes (ou bytes errados)", recebido.len()));
+    }
+    let volta: Vec<u8> = recebido.iter().map(|b| b ^ 0xFF).collect();
+    sys::escrever_tudo(c, &volta).map_err(erro)?;
+    let _ = sys::fechar(c);
+    let _ = sys::fechar(ouvinte);
+    match sys::esperar(filho).map_err(erro)?.1 {
+        0 => Ok(()),
+        s => Err(format!("o cliente não recebeu a resposta certa (status {})", s)),
+    }
+}
+
+fn rede_udp_local() -> R {
+    let a = sys::socket_inet(sys::SOCK_DGRAM, 0).map_err(erro)?;
+    let b = sys::socket_inet(sys::SOCK_DGRAM, 0).map_err(erro)?;
+    let c = sys::socket_inet(sys::SOCK_DGRAM, 0).map_err(erro)?;
+    sys::ligar_inet(b, 0, 0).map_err(erro)?; // porta efêmera
+    let (_, porta_b) = sys::endereco_local_inet(b).map_err(erro)?;
+    sys::enviar_para_inet(a, b"primeiro", 0x7F00_0001, porta_b).map_err(erro)?;
+    let (_, porta_a) = sys::endereco_local_inet(a).map_err(erro)?;
+    let mut buf = [0u8; 100];
+    let (n, ip, porta) = sys::receber_de_inet(b, &mut buf).map_err(erro)?;
+    if &buf[..n] != b"primeiro" || ip != 0x7F00_0001 || porta != porta_a {
+        return Err(format!("recebeu {:?} de {:#x}:{}", core::str::from_utf8(&buf[..n]), ip, porta));
+    }
+    // "Conectado" a `a`: o que vier de `c` é descartado.
+    sys::conectar_inet(b, 0x7F00_0001, porta_a).map_err(erro)?;
+    sys::enviar_para_inet(c, b"intruso", 0x7F00_0001, porta_b).map_err(erro)?;
+    sys::enviar_para_inet(a, b"segundo", 0x7F00_0001, porta_b).map_err(erro)?;
+    let (n, _, _) = sys::receber_de_inet(b, &mut buf).map_err(erro)?;
+    if &buf[..n] != b"segundo" {
+        return Err(format!("o socket conectado recebeu {:?}", core::str::from_utf8(&buf[..n])));
+    }
+    sys::escrever(b, b"resposta").map_err(erro)?; // write num UDP conectado
+    let (n, _, _) = sys::receber_de_inet(a, &mut buf).map_err(erro)?;
+    for fd in [a, b, c] {
+        let _ = sys::fechar(fd);
+    }
+    if &buf[..n] != b"resposta" {
+        return Err("a resposta pelo write não chegou".into());
+    }
+    Ok(())
+}
+
+/// Com a placa de rede (a rede "user" do QEMU): ping no roteador e, se o
+/// rodar.sh tiver subido o servidor HTTP do lado de fora, um download.
+fn rede_placa() -> R {
+    let estado = String::from_utf8_lossy(&sys::ler_arquivo("/proc/rede").map_err(erro)?).into_owned();
+    if !estado.starts_with("placa RTL8139") {
+        return Ok(()); // sem placa: só o loopback
+    }
+    let fd = sys::socket_inet(sys::SOCK_DGRAM, sys::IPPROTO_ICMP).map_err(erro)?;
+    let mut m = vec![8u8, 0, 0, 0, 0, 0, 0, 1];
+    m.extend_from_slice(b"ferrugem");
+    sys::enviar_para_inet(fd, &m, 0x0A00_0202, 0).map_err(erro)?;
+    if sys::poll(&[(fd, sys::POLLIN)], 3000).map_err(erro)?[0] & sys::POLLIN == 0 {
+        return Err("o roteador (10.0.2.2) não respondeu ao ping".into());
+    }
+    let mut buf = [0u8; 200];
+    let (n, de, _) = sys::receber_de_inet(fd, &mut buf).map_err(erro)?;
+    let _ = sys::fechar(fd);
+    if de != 0x0A00_0202 || n != m.len() || buf[0] != 0 || &buf[8..n] != b"ferrugem" {
+        return Err(format!("resposta de eco estranha: {} bytes de {:#x}", n, de));
+    }
+    if !String::from_utf8_lossy(&sys::ler_arquivo("/proc/rede").map_err(erro)?).contains("arp 10.0.2.2 ") {
+        return Err("o roteador não entrou na tabela ARP".into());
+    }
+    let url = ulib::http::Url::ler("http://10.0.2.2:18080/padrao.bin").unwrap();
+    match ulib::http::obter(&url, ulib::http::abrir_simples, &mut |_| {}) {
+        Ok(r) => {
+            let certo = r.corpo.len() == 100_000 && r.corpo.iter().enumerate().all(|(i, &b)| b == byte_de_teste(i));
+            if r.status != 200 || !certo {
+                return Err(format!("download: estado {}, {} bytes (ou bytes errados)", r.status, r.corpo.len()));
+            }
+        }
+        Err(e) if e.contains("recusada") => {} // não há servidor do lado de fora
+        Err(e) => return Err(format!("download: {}", e)),
+    }
+    Ok(())
+}
+
 fn png_ler_e_gravar() -> R {
     use ulib::png;
     let abrir = |nome: &str| -> Result<png::Imagem, String> {
@@ -1683,7 +1823,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 61] = [
+    let testes: [(&str, fn() -> R); 64] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1745,11 +1885,17 @@ fn principal(args: &[&str]) -> i32 {
         ("componentes da interface: botão, caixa, campo, lista, diálogo", componentes_da_interface),
         ("área de texto do editor: teclado, colar, seleção pelo mouse", area_de_texto),
         ("PNG: inflate, filtros, Adam7, paleta, 16 bits; ida e volta", png_ler_e_gravar),
+        ("TCP pelo loopback: 200 KB e de volta, recusa, poll no accept", rede_tcp_local),
+        ("UDP pelo loopback: endereços, porta efêmera, socket conectado", rede_udp_local),
+        ("placa de rede: ARP, ping no roteador e um download HTTP", rede_placa),
     ];
 
+    // `teste trecho`: só os testes cujo nome contém o trecho.
+    let filtro = args.get(1).copied().unwrap_or("");
+    let testes: Vec<_> = testes.into_iter().filter(|(nome, _)| nome.contains(filtro)).collect();
     println!("Rodando {} testes do kernel...", testes.len());
     let mut falhas = 0;
-    for (nome, teste) in testes {
+    for (nome, teste) in testes.iter().copied() {
         match teste() {
             Ok(()) => println!("  \x1b[92m[ OK ]\x1b[0m {}", nome),
             Err(motivo) => {

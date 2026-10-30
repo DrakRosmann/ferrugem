@@ -9,6 +9,15 @@ cd "$(dirname "$0")/.."
 temporario=$(mktemp -d)
 trap 'rm -rf "$temporario"' EXIT
 saida="$temporario/saida.txt"
+
+# Um servidor HTTP aqui fora, que o QEMU mostra ao FerrugemOS como
+# 10.0.2.2:18080, com o arquivo que o teste da placa de rede baixa e confere.
+www="$temporario/www"
+mkdir -p "$www"
+python3 -c 'import sys; sys.stdout.buffer.write(bytes(i * 7 % 251 for i in range(100000)))' > "$www/padrao.bin"
+(cd "$www" && exec python3 -m http.server 18080 --bind 127.0.0.1) > "$temporario/http.txt" 2>&1 &
+servidor=$!
+trap 'kill $servidor 2>/dev/null; rm -rf "$temporario"' EXIT
 disco="$temporario/disco.img"
 # Os testes da libc (c/testec.c) só existem se a musl estiver instalada (`make musl`).
 comandos="teste"
@@ -46,6 +55,7 @@ mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E offset=1048576
 } | timeout 70 qemu-system-x86_64 -cpu max -smp 4 -kernel build/ferrugem.bin -initrd build/initrd.tar -m 256M \
         -drive file="$disco",format=raw,if=ide,index=0 \
         -drive file="$particionado",format=raw,if=ide,index=1 \
+        -nic user,model=rtl8139 \
         -display none -chardev stdio,id=s0,signal=off -serial chardev:s0 -no-reboot > "$saida" 2>&1
 
 sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida" | sed -n '/Rodando/,/testes /p;/Testando a libc/,/testes da libc/p'
@@ -93,6 +103,7 @@ mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super -E offset=1048576
 } | timeout 40 qemu-system-x86_64 -cpu max -smp 4 -kernel build/ferrugem.bin -append "raiz=/dev/hda" -m 256M \
         -drive file="$sistema",format=raw,if=ide,index=0 \
         -drive file="$particionado.2",format=raw,if=ide,index=1 \
+        -nic user,model=rtl8139 \
         -display none -chardev stdio,id=s0,signal=off -serial chardev:s0 -no-reboot > "$saida.2" 2>&1
 sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$saida.2" | grep -E "raiz no disco|FALHOU|testes (passaram|falharam)" | sed 's/^/  /'
 if ! grep -q "testes passaram" "$saida.2"; then
@@ -104,6 +115,13 @@ elif e2fsck -fn "$sistema" > "$temporario/fsck2.txt" 2>&1; then
 else
     echo "==> e2fsck encontrou erros no disco do sistema:"
     cat "$temporario/fsck2.txt"
+    falhou=1
+fi
+
+if grep -q "GET /padrao.bin" "$temporario/http.txt"; then
+    echo "==> rede: o FerrugemOS baixou e conferiu um arquivo do servidor HTTP aqui de fora"
+else
+    echo "==> rede: o servidor HTTP aqui de fora não recebeu o pedido do FerrugemOS"
     falhou=1
 fi
 

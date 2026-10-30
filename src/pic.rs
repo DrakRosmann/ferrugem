@@ -53,6 +53,18 @@ pub fn init() {
     }
 }
 
+/// Libera uma IRQ (a de uma placa PCI, por exemplo).
+pub fn liberar(irq: u8) {
+    unsafe {
+        if irq < 8 {
+            outb(MESTRE_DADOS, inb(MESTRE_DADOS) & !(1 << irq));
+        } else {
+            outb(ESCRAVO_DADOS, inb(ESCRAVO_DADOS) & !(1 << (irq - 8)));
+            outb(MESTRE_DADOS, inb(MESTRE_DADOS) & !(1 << 2));
+        }
+    }
+}
+
 /// Avisa o PIC que terminamos de tratar a IRQ. Sem isso, ele não entrega
 /// mais nenhuma IRQ de prioridade igual ou menor.
 pub fn fim_de_interrupcao(irq: u8) {

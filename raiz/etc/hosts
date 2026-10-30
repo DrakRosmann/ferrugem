@@ -1,0 +1,4 @@
+# /etc/hosts — nomes que não precisam do DNS
+127.0.0.1	localhost
+10.0.2.15	ferrugem
+10.0.2.2	portal

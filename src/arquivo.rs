@@ -43,6 +43,8 @@ pub enum Tipo {
     /// O lado mestre de um pseudo-terminal (o que /dev/ptmx devolve).
     PtyMestre(Vnode, tty::IdTerminal),
     Socket(Arc<crate::socket::Socket>),
+    /// Um socket de rede (TCP, UDP, ping).
+    Inet(Arc<crate::inet::SocketInet>),
     Epoll(Arc<crate::epoll::Epoll>),
 }
 
@@ -139,6 +141,7 @@ impl Arquivo {
             Tipo::Terminal(_, id) => return tty::ler(*id, buf, self.bloqueia()),
             Tipo::PtyMestre(_, id) => return tty::ler_mestre(*id, buf, self.bloqueia()),
             Tipo::Socket(s) => return s.receber(buf, self.bloqueia()).map(|(n, _)| n),
+            Tipo::Inet(s) => return s.receber(buf, self.bloqueia(), false).map(|(n, _)| n),
             Tipo::Epoll(_) => return Err(EINVAL),
             Tipo::No(no) => no,
         };
@@ -193,6 +196,7 @@ impl Arquivo {
             Tipo::Terminal(_, id) => return tty::escrever(*id, dados),
             Tipo::PtyMestre(_, id) => return tty::escrever_mestre(*id, dados),
             Tipo::Socket(s) => return s.enviar(dados, None, self.bloqueia(), true),
+            Tipo::Inet(s) => return s.enviar(dados, None, self.bloqueia(), true),
             Tipo::Epoll(_) => return Err(EINVAL),
             Tipo::No(no) => no,
         };
@@ -256,6 +260,7 @@ impl Arquivo {
             Tipo::Terminal(_, id) => if tty::pode_ler(*id) { POLLIN | POLLOUT } else { POLLOUT },
             Tipo::PtyMestre(_, id) => if tty::pode_ler_mestre(*id) { POLLIN | POLLOUT } else { POLLOUT },
             Tipo::Socket(s) => s.prontidao(),
+            Tipo::Inet(s) => s.prontidao(),
             Tipo::Epoll(e) => if e.tem_prontos() { POLLIN } else { 0 },
             Tipo::No(no) => match no.tipo() {
                 Ok(vfs::Tipo::Dispositivo(Dispositivo::Mouse)) => {
@@ -318,7 +323,7 @@ impl Drop for Arquivo {
                 Ok(vfs::Tipo::Dispositivo(Dispositivo::Teclado)) => crate::teclado::soltar(),
                 _ => {}
             },
-            Tipo::Socket(_) | Tipo::Epoll(_) => {}
+            Tipo::Socket(_) | Tipo::Inet(_) | Tipo::Epoll(_) => {}
         }
     }
 }

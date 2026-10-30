@@ -118,6 +118,16 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   abstrato; `socketpair`, `SO_PEERCRED`, `shutdown`), **memória
   compartilhada** do System V (`shmget`/`shmat`, páginas sob demanda) e
   **epoll**; `O_NONBLOCK` pelo `fcntl` em pipes, terminais e sockets.
+- **Rede:** driver da placa **RTL8139** (achada no barramento PCI; recebe e
+  envia por DMA), **Ethernet, ARP, IPv4, ICMP, UDP e TCP**. O TCP tem
+  aperto de mão em três tempos, janela, retransmissão com prazo dobrando a
+  cada tentativa, fechamento pelos dois lados e TIME_WAIT. Também há a
+  interface de **loopback** (127.0.0.1) e os sockets `AF_INET` com as
+  mesmas chamadas do Linux: `connect`, `bind`, `listen`, `accept`,
+  `sendto`, `recvfrom`, `shutdown`, `poll`, `O_NONBLOCK`/`EINPROGRESS`, e
+  os sockets de ping (`SOCK_DGRAM` + `IPPROTO_ICMP`). O estado fica em
+  `/proc/rede`. A configuração é a da rede "user" do QEMU: nós somos
+  10.0.2.15; o computador de fora, 10.0.2.2; o DNS, 10.0.2.3.
 - **Raiz no disco** (`raiz=/dev/hda` na linha de comando do kernel): o `/` vem
   de um ext2, com `/dev`, `/proc` e um `/tmp` em memória montados por cima,
   como numa distribuição Linux. Sem a opção, o `/` é o initrd na memória.
@@ -205,7 +215,12 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 
 **Modo usuário** (`usuario/`)
 - `ulib`: a biblioteca dos programas em Rust — `_start`, syscalls, `malloc` com
-  `brk`, `print!`, sinais, ambiente, usuários, SHA-256.
+  `brk`, `print!`, sinais, ambiente, usuários, SHA-256; `rede` (DNS pelo
+  `/etc/hosts` e pelo servidor do `/etc/resolv.conf`, conexões TCP por nome)
+  e `http` (URLs, inclusive relativas, e um cliente HTTP/1.1 que segue
+  redirecionamentos e entende `chunked`).
+- **Rede:** `ping`, `host` (DNS), `baixar` (como o `wget`) e `rede` (a
+  placa, os vizinhos e as conexões).
 - `init` (processo 1) roda o `/etc/rc` (que inicia os serviços) e abre um
   `login` em cada console → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
   `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`,
@@ -239,6 +254,9 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 | `src/ata.rs`, `ext2.rs` | Driver de disco e sistema de arquivos ext2 |
 | `src/tty.rs`, `teclado.rs`, `serial.rs`, `vga.rs` | Consoles, pseudo-terminais e dispositivos de entrada e saída |
 | `src/socket.rs`, `epoll.rs`, `shm.rs` | Sockets Unix, epoll, memória compartilhada |
+| `src/pci.rs`, `rtl8139.rs` | Barramento PCI e o driver da placa de rede |
+| `src/rede.rs`, `tcp.rs`, `inet.rs` | A pilha de rede: Ethernet/ARP/IP/ICMP/UDP, o TCP e os sockets `AF_INET` |
+| `usuario/src/rede.rs`, `http.rs` | DNS, conexões por nome, URLs e o cliente HTTP |
 | `src/smp.rs`, `trampolim.asm` | Várias CPUs: APIC, ACPI, acordar as outras, a trava do kernel |
 | `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
 | `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
@@ -311,7 +329,8 @@ de páginas. O `make run` usa 4 CPUs.
 2. **Hardware moderno:** IOAPIC (as IRQs ainda vêm do PIC, só para a CPU
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
-3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
+3. **Rede:** DHCP (hoje o endereço é fixo), IPv6, outra placa (virtio-net
+   ou e1000); um navegador e HTTPS (TLS) estão a caminho.
 4. **Interface gráfica:** ícones na área de trabalho, notificações,
    seleção de trechos nos campos de texto, mais programas.
 

@@ -19,7 +19,7 @@
 //! os reprograma para o modo gráfico) e os repomos na volta.
 
 use crate::erro::*;
-use crate::porta::{inb, inl, outb, outl, outw};
+use crate::porta::{inb, outb, outw};
 use crate::processo;
 use crate::spin::Mutex;
 use crate::vga;
@@ -135,25 +135,10 @@ fn ler(registrador: u16) -> u16 {
     }
 }
 
-/// Lê 32 bits do espaço de configuração PCI (barramento, dispositivo, função, registro).
-fn pci(barramento: u32, dispositivo: u32, funcao: u32, registro: u32) -> u32 {
-    let endereco = 1 << 31 | barramento << 16 | dispositivo << 11 | funcao << 8 | registro & 0xFC;
-    unsafe {
-        outl(0xCF8, endereco);
-        inl(0xCFC)
-    }
-}
-
 /// Procura a placa no barramento PCI 0 (vendedor 0x1234, dispositivo 0x1111).
 fn achar_placa() -> Option<u64> {
-    for dispositivo in 0..32 {
-        let id = pci(0, dispositivo, 0, 0);
-        if id == 0x1111_1234 {
-            let bar0 = pci(0, dispositivo, 0, 0x10);
-            return Some((bar0 & !0xF) as u64);
-        }
-    }
-    None
+    let placa = crate::pci::achar(0x1234, 0x1111)?;
+    Some((crate::pci::ler(placa, 0x10) & !0xF) as u64)
 }
 
 /// No boot (ainda no modo texto): acha a placa e guarda os registradores da VGA.
