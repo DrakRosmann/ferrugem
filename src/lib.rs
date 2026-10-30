@@ -160,6 +160,7 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
     pit::init();
     teclado::init();
     let mouse = match mouse::init() {
+        true if mouse::absoluto() => ", mouse absoluto (vmmouse)",
         true if mouse::tem_roda() => ", mouse PS/2 com roda",
         true => ", mouse PS/2",
         false => "",

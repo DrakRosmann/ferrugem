@@ -55,8 +55,8 @@ Dentro do sistema, digite `ajuda`. O teclado é ABNT2 (com acentos) e o Ctrl+C
 interrompe o programa que está rodando. Alt+F1..F4 troca de console.
 
 **Interface gráfica:** com `make run`, entre na janela do QEMU e digite
-`janelas`. Clique na janela do QEMU para ele capturar o mouse (Ctrl+Alt+G
-solta). O menu **Aplicativos** (no alto) abre terminais e programas e tem o
+`janelas`. O mouse funciona direto, sem precisar capturá-lo: o kernel usa o
+mouse absoluto que o QEMU oferece (o vmmouse). O menu **Aplicativos** (no alto) abre terminais e programas e tem o
 "Sair". As janelas são arrastadas pelo título, redimensionadas pelo canto de
 baixo, minimizadas e maximizadas pelos botões (ou com dois cliques no
 título); a barra de tarefas, embaixo, alterna entre elas, e Alt+Tab também.
@@ -134,7 +134,9 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 - **Interface gráfica:** framebuffer da placa Bochs VBE do QEMU (1024×768,
   32 bits) em `/dev/fb0`, com os `ioctl` do Linux e `mmap` direto da memória
   de vídeo; mouse PS/2 (IRQ 12) em `/dev/mouse`; captura do teclado em
-  `/dev/teclado`; a fonte 8×16 lida da própria VGA (`/dev/fonte`). Ao fechar
+  `/dev/teclado`; a fonte 8×16 lida da própria VGA (`/dev/fonte`). Numa
+  máquina virtual, o mouse é absoluto (a "porta dos fundos" do VMware, que o
+  QEMU emula): o cursor acompanha o do computador de fora. Ao fechar
   o framebuffer, o kernel repõe os registradores, a fonte e o texto do modo
   texto.
 - **Servidor de janelas** (`janelas`), em modo usuário: painel com o menu
@@ -310,8 +312,8 @@ de páginas. O `make run` usa 4 CPUs.
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica:** mouse absoluto no QEMU (sem precisar capturar o
-   cursor), ícones na área de trabalho, notificações, mais programas.
+4. **Interface gráfica:** ícones na área de trabalho, notificações,
+   seleção de trechos nos campos de texto, mais programas.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

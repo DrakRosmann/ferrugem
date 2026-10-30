@@ -1184,20 +1184,24 @@ impl Servidor {
         }
     }
 
-    /// Pacotes de 4 bytes do /dev/mouse (o 4º é a roda).
+    /// Pacotes de 8 bytes do /dev/mouse: tipo (relativo ou absoluto),
+    /// botões, x, y e a roda (veja o mouse.rs do kernel).
     fn pacotes_do_mouse(&mut self, dados: &[u8]) {
         let mut andou = false;
-        for p in dados.chunks_exact(4) {
-            if p[0] & 0xC0 != 0 {
-                continue; // estouro: pacote sem sentido
+        for p in dados.chunks_exact(8) {
+            let antes = self.mouse;
+            if p[0] == 1 {
+                // absoluto (vmmouse): de 0 a 65535 em cada eixo
+                let (x, y) = (u16::from_le_bytes([p[2], p[3]]) as i64, u16::from_le_bytes([p[4], p[5]]) as i64);
+                self.mouse = ((x * self.largura as i64 / 65536) as i32, (y * self.altura as i64 / 65536) as i32);
+            } else {
+                let (dx, dy) = (i16::from_le_bytes([p[2], p[3]]) as i32, i16::from_le_bytes([p[4], p[5]]) as i32);
+                self.mouse.0 = (self.mouse.0 + dx).clamp(0, self.largura - 1);
+                self.mouse.1 = (self.mouse.1 + dy).clamp(0, self.altura - 1);
             }
-            let dx = p[1] as i32 - if p[0] & 0x10 != 0 { 256 } else { 0 };
-            let dy = p[2] as i32 - if p[0] & 0x20 != 0 { 256 } else { 0 };
-            self.mouse.0 = (self.mouse.0 + dx).clamp(0, self.largura - 1);
-            self.mouse.1 = (self.mouse.1 - dy).clamp(0, self.altura - 1);
-            andou |= dx != 0 || dy != 0;
+            andou |= self.mouse != antes;
             // A roda vai para o programa que está debaixo do cursor.
-            let giro = p[3] as i8 as i32;
+            let giro = p[6] as i8 as i32;
             if giro != 0 {
                 let (x, y) = self.mouse;
                 if let Some(j) = self.janelas.iter().rev().find(|j| j.dentro(x, y)) {
@@ -1207,7 +1211,7 @@ impl Servidor {
                     }
                 }
             }
-            let botoes = p[0] & 3;
+            let botoes = p[1] & 3;
             let mudou = botoes ^ self.botoes;
             self.botoes = botoes;
             for (bit, numero) in [(1, 1), (2, 2)] {
