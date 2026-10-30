@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+pub mod assinatura;
 pub mod cripto;
 pub mod grafico;
 pub mod html;
@@ -33,11 +34,14 @@ pub mod cp437;
 #[path = "../../comum/lista_livre.rs"]
 mod lista_livre;
 mod memoria;
+pub mod numero;
 pub mod sha256;
+pub mod sha512;
 pub mod png;
 pub mod rede;
 pub mod sys;
 pub mod tls;
+pub mod x509;
 pub mod truetype;
 pub mod ui;
 pub mod usuarios;

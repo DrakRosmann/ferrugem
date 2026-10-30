@@ -186,9 +186,20 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   - HMAC/HKDF sobre o SHA-256.
 
   O aperto de mão segue a RFC 8446, inclusive o Finished conferido, o
-  KeyUpdate e o pedido de certificado do cliente. Falta conferir o
-  certificado do servidor: a conexão é cifrada, mas quem estiver no meio
-  do caminho poderia se passar pelo site.
+  KeyUpdate e o pedido de certificado do cliente.
+- **Certificados** (`ulib::x509`): o servidor prova quem é. Conferimos:
+  - a cadeia até uma das autoridades raiz de `/etc/ssl/certs.pem` (o
+    `make` copia as do Linux onde o sistema é compilado);
+  - as assinaturas: RSA PKCS#1 v1.5 e PSS, ECDSA P-256 e P-384, sobre
+    SHA-256/384/512 (`ulib::assinatura`, com números grandes na forma de
+    Montgomery em `ulib::numero`);
+  - as datas de validade, e se os intermediários são autoridades;
+  - o nome do site (subjectAltName, com curingas `*.exemplo.com`);
+  - a assinatura do servidor sobre a conversa (CertificateVerify).
+
+  Ainda não conferimos se um certificado foi revogado. Se o certificado não
+  confere, o navegador explica o motivo e deixa continuar mesmo assim
+  (só naquela sessão), e o `baixar` pede `-k`.
 - **PNG** (`ulib::png`): decodificador completo — o inflate do zlib (blocos
   sem compressão, Huffman fixo e dinâmico), os 5 filtros, cinza/RGB/paleta/
   alfa em 1 a 16 bits, transparência (tRNS) e entrelaçamento Adam7 — e um
@@ -239,7 +250,7 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   e `http` (URLs, inclusive relativas, e um cliente HTTP/1.1 que segue
   redirecionamentos e entende `chunked`).
 - **Rede:** `ping`, `host` (DNS), `baixar` (como o `wget`, também por
-  HTTPS) e `rede` (a placa, os vizinhos e as conexões).
+  HTTPS; `-k` não confere o certificado) e `rede` (a placa, os vizinhos e as conexões).
 - `init` (processo 1) roda o `/etc/rc` (que inicia os serviços) e abre um
   `login` em cada console → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
   `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`,
@@ -278,6 +289,7 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 | `usuario/src/rede.rs`, `http.rs` | DNS, conexões por nome, URLs e o cliente HTTP |
 | `usuario/src/html.rs`, `bin/navegador.rs` | O leitor de HTML e o navegador (diagramação e desenho) |
 | `usuario/src/tls.rs`, `cripto.rs` | TLS 1.3 e a criptografia (X25519, ChaCha20-Poly1305, AES-GCM, HKDF) |
+| `usuario/src/x509.rs`, `assinatura.rs`, `numero.rs`, `sha512.rs` | Certificados (DER, cadeias, nomes), RSA e ECDSA, números grandes |
 | `src/smp.rs`, `trampolim.asm` | Várias CPUs: APIC, ACPI, acordar as outras, a trava do kernel |
 | `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
 | `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
@@ -350,8 +362,8 @@ de páginas. O `make run` usa 4 CPUs.
 2. **Hardware moderno:** IOAPIC (as IRQs ainda vêm do PIC, só para a CPU
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
-3. **Rede:** conferir os certificados do TLS (X.509, RSA/ECDSA e as
-   autoridades), DHCP (hoje o endereço é fixo), IPv6, outra placa
+3. **Rede:** TLS 1.2 (muitos servidores ainda não falam o 1.3), revogação
+   de certificados, DHCP (hoje o endereço é fixo), IPv6, outra placa
    (virtio-net ou e1000). No navegador: CSS, formulários e JPEG.
 4. **Interface gráfica:** ícones na área de trabalho, notificações,
    seleção de trechos nos campos de texto, mais programas.

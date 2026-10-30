@@ -17,16 +17,18 @@
 //! hash de tudo o que foi dito até aquele ponto (assim, mexer em qualquer
 //! mensagem do aperto de mão estraga as chaves e o Finished não confere).
 //!
-//! **O que falta:** conferir o certificado do servidor (a cadeia até uma
-//! autoridade conhecida, o nome, a assinatura do CertificateVerify). Sem
-//! isso, a conexão é cifrada (quem só escuta não entende nada), mas quem
-//! estiver no meio do caminho pode se passar pelo site.
+//! Cifrar não basta: quem estiver no meio do caminho poderia fazer o aperto
+//! de mão no lugar do site. Por isso o servidor manda o certificado (a
+//! chave pública dele, garantida por uma autoridade: veja x509.rs) e, no
+//! CertificateVerify, assina a conversa com a chave privada correspondente.
 
 use crate::cripto::{self, Aes128};
 use crate::http::Transporte;
 use crate::rede::{self, Conexao};
 use crate::sha256::{sha256, Sha256};
 use crate::sys;
+use crate::x509::{self, Chave, Raizes};
+use crate::assinatura::{self, NomeCurva, Resumo};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -116,6 +118,8 @@ pub struct Tls {
     fechada: bool,
     /// O nome da cifra combinada (para mostrar).
     pub cifra: &'static str,
+    /// A autoridade raiz que garante o certificado (None: não foi conferido).
+    pub autoridade: Option<String>,
 }
 
 fn descricao_alerta(codigo: u8) -> &'static str {
@@ -193,7 +197,8 @@ fn ola_do_cliente(host: &str, aleatorio: &[u8; 32], sessao: &[u8; 32], publica: 
     }
     ext.extend(extensao(0x000a, &[0, 2, 0x00, 0x1d])); // supported_groups: x25519
     // signature_algorithms: os que o servidor pode usar no CertificateVerify
-    let assinaturas: [u16; 9] = [0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0807];
+    // (ECDSA P-256 e P-384, RSA-PSS; e o RSA PKCS#1, que só vale nos certificados)
+    let assinaturas: [u16; 8] = [0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601];
     let mut sa = ((assinaturas.len() * 2) as u16).to_be_bytes().to_vec();
     for a in assinaturas {
         sa.extend_from_slice(&a.to_be_bytes());
@@ -248,9 +253,49 @@ fn ler_ola_do_servidor(m: &[u8]) -> Result<(u16, [u8; 32]), String> {
     Ok((suite, chave.ok_or("TLS: o servidor não mandou a chave X25519")?))
 }
 
+/// O conteúdo do Certificate: a lista de certificados (o do site primeiro).
+fn ler_certificados(m: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let contexto = *m.first()? as usize;
+    let mut i = 1 + contexto + 3;
+    let fim = i + ((*m.get(i - 3)? as usize) << 16 | (*m.get(i - 2)? as usize) << 8 | *m.get(i - 1)? as usize);
+    let mut lista = Vec::new();
+    while i + 3 <= fim {
+        let n = (m[i] as usize) << 16 | (m[i + 1] as usize) << 8 | m[i + 2] as usize;
+        lista.push(m.get(i + 3..i + 3 + n)?.to_vec());
+        i += 3 + n;
+        let extensoes = u16::from_be_bytes(m.get(i..i + 2)?.try_into().ok()?) as usize;
+        i += 2 + extensoes;
+    }
+    Some(lista)
+}
+
+/// O CertificateVerify: o servidor assinou, com a chave do certificado, o
+/// hash da conversa até ali (com um prefixo fixo, para a assinatura não
+/// servir em outro contexto).
+fn conferir_assinatura_da_conversa(chave: &Chave, m: &[u8], conversa: &[u8; 32]) -> Result<(), String> {
+    let esquema = u16::from_be_bytes(m.get(..2).ok_or("TLS: CertificateVerify malformado")?.try_into().unwrap());
+    let n = u16::from_be_bytes(m.get(2..4).ok_or("TLS: CertificateVerify malformado")?.try_into().unwrap()) as usize;
+    let assinatura = m.get(4..4 + n).ok_or("TLS: CertificateVerify malformado")?;
+    let mut conteudo = alloc::vec![0x20u8; 64];
+    conteudo.extend_from_slice(b"TLS 1.3, server CertificateVerify\0");
+    conteudo.extend_from_slice(conversa);
+    let certo = match (esquema, chave) {
+        (0x0403, Chave::Ec { curva: NomeCurva::P256, ponto }) => assinatura::ecdsa(NomeCurva::P256, ponto, &Resumo::Sha256.calcular(&conteudo), assinatura),
+        (0x0503, Chave::Ec { curva: NomeCurva::P384, ponto }) => assinatura::ecdsa(NomeCurva::P384, ponto, &Resumo::Sha384.calcular(&conteudo), assinatura),
+        (0x0804..=0x0806, Chave::Rsa { n, e }) => {
+            let resumo = [Resumo::Sha256, Resumo::Sha384, Resumo::Sha512][(esquema - 0x0804) as usize];
+            assinatura::rsa_pss(n, e, resumo, &resumo.calcular(&conteudo), assinatura)
+        }
+        _ => return Err(format!("TLS: o servidor assinou com um esquema que não combina com a chave {} ({:#06x})", chave.descricao(), esquema)),
+    };
+    if certo { Ok(()) } else { Err(String::from("TLS: a assinatura do servidor (CertificateVerify) não confere")) }
+}
+
 impl Tls {
-    /// Conecta e faz o aperto de mão.
-    pub fn conectar(host: &str, porta: u16) -> Result<Tls, String> {
+    /// Conecta e faz o aperto de mão, conferindo o certificado com as
+    /// autoridades `raizes` (com None, não confere: só para testes, ou se o
+    /// usuário pedir).
+    pub fn conectar(host: &str, porta: u16, raizes: Option<&Raizes>) -> Result<Tls, String> {
         let mut conexao = rede::conectar(host, porta)?;
         let mut sorte = [0u8; 96];
         sys::aleatorio(&mut sorte);
@@ -268,6 +313,8 @@ impl Tls {
         let mut cifras: Option<(Cifra, Cifra, Vec<u8>, Vec<u8>, u16)> = None; // (servidor, cliente, segredos, suite)
         let mut segredo_handshake = Vec::new();
         let mut pediu_certificado = false;
+        let mut cadeia: Option<Vec<Vec<u8>>> = None;
+        let mut autoridade = None;
         loop {
             let (tipo, cabecalho, corpo) = ler_registro(&mut conexao, &mut bruto)?.ok_or("TLS: o servidor fechou a conexão no aperto de mão")?;
             let (tipo, corpo) = match (tipo, cifras.as_mut()) {
@@ -311,10 +358,28 @@ impl Tls {
                         pediu_certificado = true;
                         conversa.atualizar(&m);
                     }
+                    11 => {
+                        cadeia = Some(ler_certificados(&m[4..]).ok_or("TLS: mensagem Certificate malformada")?);
+                        conversa.atualizar(&m);
+                    }
+                    15 => {
+                        if let Some(raizes) = raizes {
+                            let cadeia = cadeia.as_deref().ok_or("TLS: CertificateVerify sem certificado")?;
+                            let conferido = x509::conferir_cadeia(cadeia, host, sys::hora_atual(), raizes)
+                                .map_err(|e| format!("certificado: {}", e))?;
+                            conferir_assinatura_da_conversa(&conferido.chave, &m[4..], &conversa.terminar())
+                                .map_err(|e| format!("certificado: {}", e))?;
+                            autoridade = Some(conferido.raiz);
+                        }
+                        conversa.atualizar(&m);
+                    }
                     20 => {
                         let Some((_, mut cliente, segredo_s, segredo_c, suite)) = cifras.take() else {
                             return Err(String::from("TLS: Finished antes do ServerHello"));
                         };
+                        if raizes.is_some() && autoridade.is_none() {
+                            return Err(String::from("TLS: o servidor não provou quem é (faltou o certificado)"));
+                        }
                         // O Finished do servidor: HMAC da conversa com uma chave
                         // que só quem tem o segredo calcula.
                         let chave = cripto::expandir_rotulo(&segredo_s, "finished", &[], 32);
@@ -350,10 +415,10 @@ impl Tls {
                             pendentes: Vec::new(),
                             fechada: false,
                             cifra: if suite == AES_128_GCM { "AES-128-GCM" } else { "ChaCha20-Poly1305" },
+                            autoridade,
                         });
                     }
-                    // EncryptedExtensions, Certificate, CertificateVerify: entram na conversa.
-                    // (Conferir o certificado é o que falta: veja o começo do arquivo.)
+                    // EncryptedExtensions: só entra na conversa.
                     _ => conversa.atualizar(&m),
                 }
             }
@@ -389,6 +454,13 @@ impl Tls {
 }
 
 impl Transporte for Tls {
+    fn seguranca(&self) -> Option<String> {
+        Some(match &self.autoridade {
+            Some(a) => format!("TLS 1.3, {}, certificado garantido por {}", self.cifra, a),
+            None => format!("TLS 1.3, {}, certificado NÃO conferido", self.cifra),
+        })
+    }
+
     fn escrever(&mut self, dados: &[u8]) -> Result<(), String> {
         for pedaco in dados.chunks(16384) {
             let registro = self.saida.cifrar(DADOS, pedaco);

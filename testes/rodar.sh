@@ -17,16 +17,39 @@ mkdir -p "$www"
 python3 -c 'import sys; sys.stdout.buffer.write(bytes(i * 7 % 251 for i in range(100000)))' > "$www/padrao.bin"
 (cd "$www" && exec python3 -m http.server 18080 --bind 127.0.0.1) > "$temporario/http.txt" 2>&1 &
 servidores=$!
-# E dois servidores HTTPS (TLS 1.3, certificado feito na hora), um para cada
-# cifra que o FerrugemOS sabe; o segundo também pede o certificado do cliente.
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj /CN=10.0.2.2 \
-    -keyout "$temporario/chave.pem" -out "$temporario/cert.pem" >/dev/null 2>&1
-for tls in "18443 TLS_CHACHA20_POLY1305_SHA256" "18444 TLS_AES_128_GCM_SHA256 -verify 1"; do
+# E três servidores HTTPS (TLS 1.3), com certificados de uma autoridade de
+# teste feita na hora (RSA). O FerrugemOS baixa a raiz dela (ca.pem) pelo
+# HTTP e confere cada cadeia:
+#   18443: ChaCha20, certificado P-256 assinado pela raiz;
+#   18444: AES-GCM, certificado RSA (o servidor assina com RSA-PSS) e pede o do cliente;
+#   18445: certificado P-384 assinado por uma autoridade intermediária P-384 (SHA-384).
+c="$temporario/certificados"
+mkdir -p "$c"
+(
+    cd "$c"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Ferrugem Teste CA" -keyout raiz.key -out raiz.pem
+    assinar() { # nome, chave da autoridade, certificado da autoridade, extensões, opções do req...
+        nome=$1 ac_cert=$2 ac_chave=$3 ext=$4
+        shift 4
+        openssl req -new -nodes "$@" -subj "/CN=$nome" -keyout "$nome.key" -out "$nome.csr"
+        openssl x509 -req -in "$nome.csr" -CA "$ac_cert" -CAkey "$ac_chave" -set_serial "$RANDOM" -days 30 -sha384 \
+            -extfile <(printf '%s\n' "$ext") -out "$nome.pem"
+    }
+    assinar site1 raiz.pem raiz.key "subjectAltName=IP:10.0.2.2" -newkey ec -pkeyopt ec_paramgen_curve:P-256
+    assinar site2 raiz.pem raiz.key "subjectAltName=IP:10.0.2.2" -newkey rsa:2048
+    assinar intermediaria raiz.pem raiz.key "basicConstraints=critical,CA:TRUE" -newkey ec -pkeyopt ec_paramgen_curve:P-384
+    assinar site3 intermediaria.pem intermediaria.key "subjectAltName=IP:10.0.2.2,DNS:*.ferrugem.teste" \
+        -newkey ec -pkeyopt ec_paramgen_curve:P-384
+    cp raiz.pem "$www/ca.pem"
+    cat site3.pem intermediaria.pem > "$www/cadeia.pem"
+) > "$temporario/certificados.txt" 2>&1
+for tls in "18443 site1 TLS_CHACHA20_POLY1305_SHA256" "18444 site2 TLS_AES_128_GCM_SHA256 -verify 1" \
+    "18445 site3 TLS_CHACHA20_POLY1305_SHA256 -cert_chain $c/intermediaria.pem"; do
     set -- $tls
-    porta=$1 cifra=$2
-    shift 2
+    porta=$1 site=$2 cifra=$3
+    shift 3
     (cd "$www" && exec openssl s_server -quiet -accept "127.0.0.1:$porta" -tls1_3 -ciphersuites "$cifra" "$@" \
-        -cert "$temporario/cert.pem" -key "$temporario/chave.pem" -WWW) >> "$temporario/https.txt" 2>&1 < /dev/null &
+        -cert "$c/$site.pem" -key "$c/$site.key" -WWW) >> "$temporario/https.txt" 2>&1 < /dev/null &
     servidores="$servidores $!"
 done
 trap 'kill $servidores 2>/dev/null; rm -rf "$temporario"' EXIT

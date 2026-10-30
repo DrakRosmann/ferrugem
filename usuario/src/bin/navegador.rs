@@ -715,7 +715,17 @@ fn pagina_de_erro(url: Url, mensagem: &str) -> Pagina {
         endereco,
         escapar(mensagem)
     );
-    if url.esquema == "https" && mensagem.contains("TLS") || mensagem.contains("curva") || mensagem.contains("1.3") {
+    if let Some(problema) = mensagem.strip_prefix("certificado: ") {
+        corpo = format!(
+            "<h1>A identidade do site não foi confirmada</h1><p><b>{}</b></p><p>{}.</p>\
+             <p>Pode ser um certificado mal configurado, ou alguém se passando pelo site. Se você continuar, a \
+             conexão será cifrada, mas não há garantia de com quem: não digite senhas nem dados pessoais.</p>\
+             <p><a href=\"sobre:aceitar?{}\">Continuar mesmo assim</a> (só nesta sessão)</p>",
+            endereco,
+            escapar(problema),
+            escapar(&url.texto())
+        );
+    } else if url.esquema == "https" && mensagem.contains("TLS") || mensagem.contains("curva") || mensagem.contains("1.3") {
         let http = format!("http{}", url.texto().get(5..).unwrap_or(""));
         corpo += &format!(
             "<p>Este navegador fala só o TLS 1.3 (com a troca de chaves X25519). Tente a \
@@ -731,7 +741,7 @@ const PAGINA_INICIAL: &str = r#"
 <h1>Navegador do FerrugemOS</h1>
 <p>Um navegador escrito do zero, como o resto do sistema: o TCP, o DNS, o HTTP e o TLS 1.3 (o HTTPS) são nossos, assim como o leitor de HTML, a diagramação e o decodificador de PNG. Ainda não há JavaScript nem folhas de estilo.</p>
 <p>Digite um endereço lá em cima, ou palavras para buscar no <b>DuckDuckGo</b>.</p>
-<p><small>As conexões HTTPS são cifradas, mas o certificado do site ainda não é conferido: quem estiver no meio do caminho poderia se passar pelo site. Não digite senhas.</small></p>
+<p><small>Nas conexões HTTPS, o certificado do site é conferido com as autoridades de <code>/etc/ssl/certs.pem</code>: a assinatura de cada certificado da cadeia, as datas e o nome do site. Só não sabemos ainda se um certificado foi revogado.</small></p>
 <h2>Para começar</h2>
 <ul>
 <li><a href="https://pt.wikipedia.org/wiki/Rust_(linguagem_de_programa%C3%A7%C3%A3o)">Wikipédia: Rust (linguagem de programação)</a></li>
@@ -762,18 +772,21 @@ struct Busca {
 }
 
 enum Resultado {
-    Resposta { status: u16, url: Url, tipo: String, corpo: Vec<u8> },
+    Resposta { status: u16, url: Url, tipo: String, corpo: Vec<u8>, seguranca: Option<String> },
     Erro(String),
 }
 
 impl Busca {
-    fn comecar(url: &Url) -> Option<Busca> {
+    /// `excecoes`: os sites cujo certificado o usuário aceitou sem conferir.
+    fn comecar(url: &Url, excecoes: &[String]) -> Option<Busca> {
         let (leitura, escrita) = sys::pipe().ok()?;
         match sys::fork() {
             Ok(0) => {
                 let _ = sys::fechar(leitura);
                 let mut ultimo = 0;
-                let r = http::obter(url, http::abrir_simples, &mut |n| {
+                let raizes = ulib::x509::Raizes::do_sistema();
+                let abrir = |u: &Url| http::abrir(u, if excecoes.contains(&u.host) { None } else { Some(&raizes) });
+                let r = http::obter(url, &abrir, &mut |n| {
                     if n - ultimo >= 16 * 1024 {
                         ultimo = n;
                         let mut m = [b'p'; 9];
@@ -784,7 +797,7 @@ impl Busca {
                 let mut saida = Vec::new();
                 match r {
                     Ok(r) => {
-                        let meta = format!("{}\n{}\n{}", r.status, r.url.texto(), r.tipo());
+                        let meta = format!("{}\n{}\n{}\n{}", r.status, r.url.texto(), r.tipo(), r.seguranca.as_deref().unwrap_or(""));
                         saida.push(b'r');
                         saida.extend_from_slice(&(meta.len() as u32).to_le_bytes());
                         saida.extend_from_slice(meta.as_bytes());
@@ -836,11 +849,12 @@ impl Busca {
             Some(b'r') if self.bruto.len() >= 5 => {
                 let n = u32::from_le_bytes(self.bruto[1..5].try_into().unwrap()) as usize;
                 let meta = String::from_utf8_lossy(&self.bruto[5..5 + n]).into_owned();
-                let mut partes = meta.splitn(3, '\n');
+                let mut partes = meta.splitn(4, '\n');
                 let status = partes.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let url = partes.next().and_then(Url::ler).unwrap_or_else(|| self.url.clone());
                 let tipo = String::from(partes.next().unwrap_or(""));
-                Resultado::Resposta { status, url, tipo, corpo: self.bruto.split_off(5 + n) }
+                let seguranca = partes.next().filter(|s| !s.is_empty()).map(String::from);
+                Resultado::Resposta { status, url, tipo, corpo: self.bruto.split_off(5 + n), seguranca }
             }
             Some(b'e') => Resultado::Erro(String::from_utf8_lossy(&self.bruto[1..]).into_owned()),
             _ => Resultado::Erro(String::from("o download terminou sem resposta")),
@@ -890,6 +904,8 @@ struct Navegador {
     rolagem_pendente: Option<i32>,
     /// Quantos refreshes seguidos (contra laços).
     refreshes: u32,
+    /// Sites cujo certificado o usuário aceitou sem conferir (nesta sessão).
+    excecoes: Vec<String>,
 }
 
 impl Navegador {
@@ -954,6 +970,14 @@ impl Navegador {
             "sobre" => {
                 let p = match url.caminho.as_str() {
                     "inicio" => pagina_interna(url.clone(), "Página inicial", PAGINA_INICIAL),
+                    c if c.starts_with("aceitar?") => {
+                        // O "Continuar mesmo assim" da página de erro de certificado.
+                        let Some(destino) = Url::ler(&c["aceitar?".len()..]) else { return };
+                        if !self.excecoes.contains(&destino.host) {
+                            self.excecoes.push(destino.host.clone());
+                        }
+                        return self.ir(destino, false);
+                    }
                     _ => pagina_de_erro(url.clone(), "Essa página interna não existe."),
                 };
                 self.mostrar(p, novo_no_historico);
@@ -977,7 +1001,7 @@ impl Navegador {
                 self.mostrar(p, novo_no_historico);
             }
             _ => {
-                self.busca = Busca::comecar(&url);
+                self.busca = Busca::comecar(&url, &self.excecoes);
                 self.busca_nova = novo_no_historico;
                 if self.busca.is_none() {
                     self.mostrar(pagina_de_erro(url, "não consegui criar o processo do download"), novo_no_historico);
@@ -1065,10 +1089,11 @@ impl Navegador {
             if let Some(r) = b.avancar() {
                 let b = self.busca.take().unwrap();
                 let pagina = match r {
-                    Resultado::Resposta { status, url, tipo, corpo } => {
+                    Resultado::Resposta { status, url, tipo, corpo, seguranca } => {
                         let mut info = tamanho_legivel(corpo.len());
-                        if url.esquema == "https" {
-                            info += " · TLS 1.3, cifrado (certificado não verificado)";
+                        if let Some(s) = seguranca {
+                            info += " · ";
+                            info += &s;
                         }
                         self.pagina_da_resposta(url, status, &tipo, corpo, info)
                     }
@@ -1102,7 +1127,7 @@ impl Navegador {
                 if let Some(i) = p.imagens.iter().position(|im| matches!(im.estado, EstadoImagem::Esperando)) {
                     let url = p.imagens[i].url.clone();
                     match url.esquema.as_str() {
-                        "http" => match Busca::comecar(&url) {
+                        "http" | "https" => match Busca::comecar(&url, &self.excecoes) {
                             Some(b) => self.busca_imagem = Some((b, i)),
                             None => p.imagens[i].estado = EstadoImagem::Falhou,
                         },
@@ -1357,6 +1382,7 @@ fn principal(args: &[&str]) -> i32 {
         ancora: None,
         rolagem_pendente: None,
         refreshes: 0,
+        excecoes: Vec::new(),
     };
     let primeira = args.get(1).and_then(|a| Navegador::interpretar_endereco(a)).or_else(|| Url::ler(INICIO)).unwrap();
     nav.ir(primeira, true);

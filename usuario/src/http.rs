@@ -186,6 +186,8 @@ pub struct Resposta {
     pub corpo: Vec<u8>,
     /// O endereço final (depois dos redirecionamentos).
     pub url: Url,
+    /// Como a conexão foi protegida (None: HTTP, sem cifra).
+    pub seguranca: Option<String>,
 }
 
 impl Resposta {
@@ -204,6 +206,10 @@ impl Resposta {
 pub trait Transporte {
     fn escrever(&mut self, dados: &[u8]) -> Result<(), String>;
     fn ler(&mut self, buf: &mut [u8]) -> Result<usize, String>;
+    /// Uma descrição da proteção da conexão, para mostrar ao usuário.
+    fn seguranca(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Transporte for rede::Conexao {
@@ -216,20 +222,26 @@ impl Transporte for rede::Conexao {
 }
 
 /// Como abrir a conexão de um endereço (um teste pode trocar).
-pub type Abrir = fn(&Url) -> Result<alloc::boxed::Box<dyn Transporte>, String>;
+pub type Abrir<'a> = &'a dyn Fn(&Url) -> Result<alloc::boxed::Box<dyn Transporte>, String>;
 
-/// TCP para http://, TLS 1.3 por cima do TCP para https://.
-pub fn abrir_simples(url: &Url) -> Result<alloc::boxed::Box<dyn Transporte>, String> {
+/// TCP para http://, TLS 1.3 por cima do TCP para https://, conferindo o
+/// certificado com as autoridades `raizes` (None: sem conferir).
+pub fn abrir(url: &Url, raizes: Option<&crate::x509::Raizes>) -> Result<alloc::boxed::Box<dyn Transporte>, String> {
     match url.esquema.as_str() {
         "http" => Ok(alloc::boxed::Box::new(rede::conectar(&url.host, url.porta)?)),
-        "https" => Ok(alloc::boxed::Box::new(crate::tls::Tls::conectar(&url.host, url.porta)?)),
+        "https" => Ok(alloc::boxed::Box::new(crate::tls::Tls::conectar(&url.host, url.porta, raizes)?)),
         e => Err(format!("esquema não suportado: {}", e)),
     }
 }
 
+/// `abrir` com as autoridades do sistema (/etc/ssl/certs.pem).
+pub fn abrir_simples(url: &Url) -> Result<alloc::boxed::Box<dyn Transporte>, String> {
+    abrir(url, Some(&crate::x509::Raizes::do_sistema()))
+}
+
 /// GET, seguindo até 8 redirecionamentos. `progresso` recebe os bytes já
 /// recebidos (para mostrar ao usuário).
-pub fn obter(url: &Url, abrir: Abrir, progresso: &mut dyn FnMut(usize)) -> Result<Resposta, String> {
+pub fn obter(url: &Url, abrir: Abrir<'_>, progresso: &mut dyn FnMut(usize)) -> Result<Resposta, String> {
     let mut url = url.clone();
     for _ in 0..8 {
         let mut c = abrir(&url)?;
@@ -257,7 +269,7 @@ pub fn obter(url: &Url, abrir: Abrir, progresso: &mut dyn FnMut(usize)) -> Resul
             }
         }
         let (status, cabecalhos, corpo) = interpretar(&bruto)?;
-        let r = Resposta { status, cabecalhos, corpo, url: url.clone() };
+        let r = Resposta { status, cabecalhos, corpo, url: url.clone(), seguranca: c.seguranca() };
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if let Some(destino) = r.cabecalho("location").and_then(|l| url.juntar(l)) {
                 url = destino;

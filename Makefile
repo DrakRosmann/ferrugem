@@ -58,6 +58,10 @@ BINARIOS_DIN += $(if $(MUSL_SO),$(BUILD)/c/ola-dinamico)
 FONTES_TT := $(wildcard /usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf \
                         /usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf \
                         /usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf)
+# As autoridades raiz para conferir os certificados HTTPS: as do sistema de
+# quem compila (Fedora/RHEL ou Debian/Ubuntu). Também não entram no repositório.
+RAIZES_TLS := $(firstword $(wildcard /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+                                     /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem))
 # Programas de terceiros, sem nenhuma modificação (`make lua`).
 LUA        := $(wildcard ferramentas/lua/lua)
 
@@ -151,6 +155,7 @@ $(INITRD): $(USUARIO_OK) $(ARQUIVOS_RAIZ) $(BINARIOS_C) $(BINARIOS_DIN) $(LUA)
 	cp $(DINAMICO)/ld-ferrugem.so $(DINAMICO)/libsaudacao.so $(RAIZ)/lib/
 	cp $(DINAMICO)/dinamico $(RAIZ)/bin/
 	$(if $(FONTES_TT),mkdir -p $(RAIZ)/usr/share/fonts && cp $(FONTES_TT) $(RAIZ)/usr/share/fonts/)
+	$(if $(RAIZES_TLS),mkdir -p $(RAIZ)/etc/ssl && cp $(RAIZES_TLS) $(RAIZ)/etc/ssl/certs.pem)
 	$(if $(MUSL_SO),cp $(MUSL_SO) $(RAIZ)/lib/ld-musl-x86_64.so.1 && cp $(BUILD)/c/ola-dinamico $(RAIZ)/bin/)
 	chmod 4755 $(RAIZ)/bin/su $(RAIZ)/bin/passwd $(RAIZ)/bin/crontab    # setuid root
 	chmod 700 $(RAIZ)/var/spool/cron

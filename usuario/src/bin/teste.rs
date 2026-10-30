@@ -1749,22 +1749,68 @@ fn rede_placa() -> R {
     if !String::from_utf8_lossy(&sys::ler_arquivo("/proc/rede").map_err(erro)?).contains("arp 10.0.2.2 ") {
         return Err("o roteador não entrou na tabela ARP".into());
     }
-    // HTTP e HTTPS (as duas cifras) dos servidores que o rodar.sh sobe.
-    // Se o de HTTP não estiver lá (rodando fora do `make teste`), pula.
-    for (i, endereco) in ["http://10.0.2.2:18080", "https://10.0.2.2:18443", "https://10.0.2.2:18444"].iter().enumerate() {
-        let url = ulib::http::Url::ler(&format!("{}/padrao.bin", endereco)).unwrap();
-        match ulib::http::obter(&url, ulib::http::abrir_simples, &mut |_| {}) {
-            Ok(r) => {
-                let certo = r.corpo.len() == 100_000 && r.corpo.iter().enumerate().all(|(i, &b)| b == byte_de_teste(i));
-                if r.status != 200 || !certo {
-                    return Err(format!("{}: estado {}, {} bytes (ou bytes errados)", endereco, r.status, r.corpo.len()));
-                }
-            }
-            Err(e) if i == 0 && e.contains("recusada") => return Ok(()), // não há servidores aqui fora
-            Err(e) => return Err(format!("{}: {}", endereco, e)),
+    // HTTP e HTTPS dos servidores que o rodar.sh sobe. Se o de HTTP não
+    // estiver lá (rodando fora do `make teste`), pula.
+    use ulib::http::{self, Url};
+    use ulib::x509::{self, Raizes};
+    let pegar = |endereco: &str, abrir: http::Abrir<'_>| -> Result<http::Resposta, String> {
+        let r = http::obter(&Url::ler(endereco).unwrap(), abrir, &mut |_| {})?;
+        if r.status != 200 {
+            return Err(format!("{}: estado {}", endereco, r.status));
+        }
+        Ok(r)
+    };
+    // A raiz da autoridade de teste que o rodar.sh criou.
+    let ca = match pegar("http://10.0.2.2:18080/ca.pem", &http::abrir_simples) {
+        Ok(r) => r.corpo,
+        Err(e) if e.contains("recusada") => return Ok(()), // não há servidores aqui fora
+        Err(e) => return Err(e),
+    };
+    let mut raizes = Raizes::vazia();
+    raizes.acrescentar_pem(&ca);
+    if raizes.quantas() != 1 {
+        return Err("não consegui ler a raiz de teste (ca.pem)".into());
+    }
+    let abrir = |u: &Url| http::abrir(u, Some(&raizes));
+    for endereco in ["http://10.0.2.2:18080", "https://10.0.2.2:18443", "https://10.0.2.2:18444", "https://10.0.2.2:18445"] {
+        let r = pegar(&format!("{}/padrao.bin", endereco), &abrir).map_err(|e| format!("{}: {}", endereco, e))?;
+        if r.corpo.len() != 100_000 || !r.corpo.iter().enumerate().all(|(i, &b)| b == byte_de_teste(i)) {
+            return Err(format!("{}: {} bytes (ou bytes errados)", endereco, r.corpo.len()));
+        }
+        let garantido = r.seguranca.as_deref().is_some_and(|s| s.contains("garantido por Ferrugem Teste CA"));
+        if endereco.starts_with("https") && !garantido {
+            return Err(format!("{}: {:?}", endereco, r.seguranca));
         }
     }
-    Ok(())
+    // Com as autoridades do sistema, a de teste é uma desconhecida.
+    match pegar("https://10.0.2.2:18443/padrao.bin", &http::abrir_simples) {
+        Err(e) if e.starts_with("certificado: ") && (e.contains("não conheço") || e.contains("não há autoridades")) => {}
+        Err(e) => return Err(format!("com as raízes do sistema: {}", e)),
+        Ok(_) => return Err("aceitou um certificado de uma autoridade desconhecida".into()),
+    }
+    // A cadeia do 18445 (site ← intermediária ← raiz), conferida aqui com
+    // outros nomes e outras datas.
+    let cadeia = x509::ler_pem(&pegar("http://10.0.2.2:18080/cadeia.pem", &abrir)?.corpo);
+    let agora = sys::hora_atual();
+    for (nome, quando, problema) in [
+        ("10.0.2.2", agora, ""),
+        ("www.ferrugem.teste", agora, ""),
+        ("ferrugem.teste", agora, "outro site"),
+        ("a.b.ferrugem.teste", agora, "outro site"),
+        ("10.0.2.3", agora, "outro site"),
+        ("10.0.2.2", agora + 60 * 86400, "venceu"),
+        ("10.0.2.2", agora - 86400, "só vale a partir"),
+    ] {
+        match (x509::conferir_cadeia(&cadeia, nome, quando, &raizes), problema) {
+            (Ok(_), "") => {}
+            (Err(e), p) if !p.is_empty() && e.contains(p) => {}
+            (r, _) => return Err(format!("cadeia para {}: {:?}", nome, r.err())),
+        }
+    }
+    match x509::conferir_cadeia(&cadeia[..1], "10.0.2.2", agora, &raizes) {
+        Err(e) if e.contains("Ferrugem Teste") || e.contains("intermediaria") => Ok(()),
+        r => Err(format!("sem a intermediária: {:?}", r.err())),
+    }
 }
 
 fn html_e_urls() -> R {
@@ -1830,6 +1876,84 @@ fn html_e_urls() -> R {
 
 fn de_hex(h: &str) -> Vec<u8> {
     (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap()).collect()
+}
+
+/// SHA-512/384, RSA (PKCS#1 v1.5 e PSS) e ECDSA (P-256, P-384), com chaves e
+/// assinaturas feitas pela biblioteca "cryptography" do Python.
+fn assinaturas() -> R {
+    use ulib::assinatura::{self, NomeCurva, Resumo};
+    use ulib::sha256::hex;
+    use ulib::sha512;
+    if hex(&sha512::sha512(b"abc")) != "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f" {
+        return Err(format!("SHA-512(\"abc\") = {}", hex(&sha512::sha512(b"abc"))));
+    }
+    if hex(&sha512::sha384(b"abc")) != "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7" {
+        return Err(format!("SHA-384(\"abc\") = {}", hex(&sha512::sha384(b"abc"))));
+    }
+    let longo: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+    if hex(&sha512::sha512(&longo)) != "5096498d96f50f9a137c4db5b8b0cd38383ad55350fb5a98805fedc31fa1262f1f0cf4d6f12d7ecd8dedd933a4c9126344fe22e937a8ad35fdeae1e876ae698b" {
+        return Err("SHA-512 de 1000 bytes".into());
+    }
+    let mensagem = b"FerrugemOS: assinado de verdade";
+    let adulterada = b"FerrugemOS: assinado de mentira";
+    let n = de_hex(concat!(
+        "a9fdd4b67da7e2520e4a5e95244d81c625fbe4aee5f5d952b60bb1697a7da4c1bdc680da0368145e51396ccc75a764a0",
+        "580c5df18b14491e0749049ca3b85ff880e97a0b248f5a32990ea5eb97a1b30747def1d8072681b98d52c81c0598ed4e",
+        "34425b0af37d2bac05c7c09d33f595ba3b4da486ea2072a66030f2108d313f3e4a31eb556a00495392e333764dbd6072",
+        "0ab94cdc55983de78899e8f8a43ffe8d534f50d4ec60a3f0bac244bbe58f69b5d43c789241b827d01f737c4dbac8a849",
+        "ed5adc3bf09902b33098d231f969a8eed27f5535e845edd647503b0b1f529e92d03322aa0cd8b8c2e0b37df8b9bde147",
+        "851626e643c8f99088efa2f9a56ebcf7",
+    ));
+    let e = [1, 0, 1];
+    let pkcs1 = de_hex(concat!(
+        "569adaee183a0a12add1a174099c48dc353403aa0553b2451b5cb72559860bf9a1d8a490b5eb1ddd3df88f1e35078902",
+        "149591724891437ffa3cbc66e9b0f5c5c0f796c38686d06c61f9c0f3c90e995cd426e2bff206155762ee900f17b2f59e",
+        "baa9dae321c39bd2170e6378ba5f9dd579a5ffa3b6cc3dd92c6688aa10464e82caa715955010f36daa8e29d917fdef23",
+        "332b911ae084955c493a505faa0271c61993dc91280f397f6c634f891279db6c1491198a40bb4d0ee9822dfb8d041fd6",
+        "c81ea13f1586d4698e65b24fc0752095a823d0658e177d126c8092d6fb1ba9874962330fb2efbcf605de05ba319d7364",
+        "5824030a88c9ea4948745e6ff2398bb2",
+    ));
+    let pss = de_hex(concat!(
+        "4deee2fc27c1dd11d650f39ccb2241cfacbe4e8b5928f54e645a833e86e190d15bb0920a82394c6101d279ce872b005b",
+        "cb4fda29ec55813ea5e62447102a760107bfe43b314e2dd3cae2c83c7b1f88b025bdc81a892aa52cb7f51de84d8b695d",
+        "bec76c5c634c5678c8898f25e75b1326becb2f5a1b56a3c8ca17cf07f427335e9a4c19b917a1b3d41f4e61083d991e3c",
+        "facd9b0bd485d2f370b7fb925f5f2713dce4f516b8cbe3cef90f5740c27a911b0338b94d8298c4c11d37d1fae370fed4",
+        "dfda0bb02cbc487949174555b446182ad36beb1a5ed5003ed9b437964bf2e9934a066746ed708c8e44b4fcbf84b56155",
+        "c6240fe7c136440807ffa2076cb8b92b",
+    ));
+    let p256 = de_hex(concat!(
+        "0469019b2bb7dba81a7ad925c55b93234511dd84358ee2dba851deb104025482fb6f46ba67296010cf5b1782b37c7175",
+        "816d9b45113482ba1f5e800b76e81128c4",
+    ));
+    let p256_sig = de_hex(concat!(
+        "304402203f362e4d2676bb76b14a39f5483d439c3186db82e261ffe91aa822a5e19cc1d902202633848726eb22ea013f",
+        "b0b3dc7ae829233b35b6b25988af9a54f841d8240987",
+    ));
+    let p384 = de_hex(concat!(
+        "04bdb18580f63947bed5752735cb3cfed1eb29cfc8ee91451732ee034ec889c31898385825299bd133504eaa1cc45221",
+        "6fc690aaf8eea3656a8980bc340910a1c46de773acb4a84e6b1ea9829851e7fc875a9c1bb2e475b92d823150a545df8a",
+        "67",
+    ));
+    let p384_sig = de_hex(concat!(
+        "3066023100fa2e1366d06a00e5ff0e530871f101b9eb2af596251fa1a1d033dbd65c448d2b4971073528bb13ad610ea9",
+        "f5da6bb535023100cbb836844c73b5571163823a7591c938a226398d2d77e72a6d31f1652e8d5cfaa2122e50c4e1d8c1",
+        "dd1ce937d7d7599f",
+    ));
+    let casos: [(&str, &dyn Fn(&[u8]) -> bool); 4] = [
+        ("RSA PKCS#1 v1.5 (SHA-256)", &|m| assinatura::rsa_pkcs1(&n, &e, Resumo::Sha256, &Resumo::Sha256.calcular(m), &pkcs1)),
+        ("RSA-PSS (SHA-384)", &|m| assinatura::rsa_pss(&n, &e, Resumo::Sha384, &Resumo::Sha384.calcular(m), &pss)),
+        ("ECDSA P-256", &|m| assinatura::ecdsa(NomeCurva::P256, &p256, &Resumo::Sha256.calcular(m), &p256_sig)),
+        ("ECDSA P-384", &|m| assinatura::ecdsa(NomeCurva::P384, &p384, &Resumo::Sha384.calcular(m), &p384_sig)),
+    ];
+    for (nome, conferir) in casos {
+        if !conferir(mensagem) {
+            return Err(format!("{}: a assinatura certa não conferiu", nome));
+        }
+        if conferir(adulterada) {
+            return Err(format!("{}: conferiu a assinatura de outra mensagem", nome));
+        }
+    }
+    Ok(())
 }
 
 /// Os vetores de teste das RFCs, para cada peça do TLS.
@@ -1957,7 +2081,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 66] = [
+    let testes: [(&str, fn() -> R); 67] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -2021,9 +2145,10 @@ fn principal(args: &[&str]) -> i32 {
         ("PNG: inflate, filtros, Adam7, paleta, 16 bits; ida e volta", png_ler_e_gravar),
         ("TCP pelo loopback: 200 KB e de volta, recusa, poll no accept", rede_tcp_local),
         ("UDP pelo loopback: endereços, porta efêmera, socket conectado", rede_udp_local),
-        ("placa de rede: ARP, ping no roteador; HTTP e HTTPS (ChaCha20 e AES-GCM)", rede_placa),
+        ("placa de rede: ARP, ping; HTTP e HTTPS (cifras, certificados e cadeias)", rede_placa),
         ("HTML tolerante (fechamentos implícitos, entidades) e URLs relativas", html_e_urls),
         ("criptografia: X25519, ChaCha20-Poly1305, AES-GCM e HKDF (vetores das RFCs)", criptografia),
+        ("assinaturas: SHA-512/384, RSA (PKCS#1 e PSS), ECDSA P-256 e P-384", assinaturas),
     ];
 
     // `teste trecho`: só os testes cujo nome contém o trecho.

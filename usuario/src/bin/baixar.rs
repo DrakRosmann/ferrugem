@@ -2,7 +2,8 @@
 //!
 //! `baixar URL` grava no arquivo com o nome do fim do endereço (ou
 //! index.html); `baixar URL -O arquivo` escolhe o nome; `-O -` escreve na
-//! saída. `-i` mostra também os cabeçalhos da resposta.
+//! saída. `-i` mostra também os cabeçalhos da resposta. `-k` não confere o
+//! certificado dos sites HTTPS (como o `curl -k`).
 
 #![no_std]
 #![no_main]
@@ -14,7 +15,7 @@ use ulib::*;
 programa!(principal);
 
 fn principal(args: &[&str]) -> i32 {
-    let (mut url, mut saida, mut cabecalhos) = (None, None, false);
+    let (mut url, mut saida, mut cabecalhos, mut conferir) = (None, None, false, true);
     let mut i = 1;
     while i < args.len() {
         match args[i] {
@@ -23,12 +24,13 @@ fn principal(args: &[&str]) -> i32 {
                 i += 1;
             }
             "-i" => cabecalhos = true,
+            "-k" => conferir = false,
             u => url = Some(u),
         }
         i += 1;
     }
     let Some(texto) = url else {
-        eprintln!("uso: baixar [-i] URL [-O arquivo]");
+        eprintln!("uso: baixar [-i] [-k] URL [-O arquivo]");
         return 2;
     };
     let texto = if texto.contains("://") { String::from(texto) } else { format!("http://{}", texto) };
@@ -41,7 +43,8 @@ fn principal(args: &[&str]) -> i32 {
         eprintln!("baixando {}", url.texto());
     }
     let inicio = sys::tempo_ms();
-    let resposta = match http::obter(&url, http::abrir_simples, &mut |_| {}) {
+    let raizes = conferir.then(ulib::x509::Raizes::do_sistema);
+    let resposta = match http::obter(&url, &|u| http::abrir(u, raizes.as_ref()), &mut |_| {}) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("baixar: {}", e);
@@ -49,6 +52,9 @@ fn principal(args: &[&str]) -> i32 {
         }
     };
     if cabecalhos {
+        if let Some(s) = &resposta.seguranca {
+            eprintln!("({})", s);
+        }
         eprintln!("HTTP {}", resposta.status);
         for (n, v) in &resposta.cabecalhos {
             eprintln!("{}: {}", n, v);
