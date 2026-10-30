@@ -451,8 +451,11 @@ pub fn acordar(canal: usize) {
 
 /// O timer de uma CPU extra: só conta o tempo do processo dela.
 pub fn contar_tique() {
-    if !smp::cpu().atual.is_null() {
+    let cpu = smp::cpu();
+    if !cpu.atual.is_null() {
         atual().tiques += 1;
+        cpu.tiques += 1;
+        cpu.tiques_ociosos += (cpu.atual == cpu.ocioso) as u64;
     }
 }
 
@@ -461,7 +464,7 @@ pub fn tique() {
     if smp::cpu().atual.is_null() {
         return;
     }
-    atual().tiques += 1;
+    contar_tique();
     acordar(CANAL_TEMPO);
     let agora = pit::milissegundos();
     for p in tabela().processos.iter_mut() {

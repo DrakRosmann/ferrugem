@@ -152,7 +152,9 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   texto com números de linha, seleção pelo mouse, área de transferência,
   Ctrl+S/O/N/A) e `imagens` (visualizador: ajustar ou tamanho real,
   anterior/próxima pelas setas, transparência sobre xadrez, "usar como papel
-  de parede"). Todos no menu Aplicativos.
+  de parede") e `monitor` (monitor do sistema: gráficos de CPU e memória,
+  uso de cada CPU pelo `/proc/stat`, processos com CPU e memória, encerrar
+  ou matar). Todos no menu Aplicativos.
 - **PNG** (`ulib::png`): decodificador completo — o inflate do zlib (blocos
   sem compressão, Huffman fixo e dinâmico), os 5 filtros, cinza/RGB/paleta/
   alfa em 1 a 16 bits, transparência (tRNS) e entrelaçamento Adam7 — e um
@@ -305,9 +307,8 @@ de páginas. O `make run` usa 4 CPUs.
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** driver virtio-net ou e1000, Ethernet, ARP, IP, ICMP, UDP, TCP, sockets.
-4. **Interface gráfica, rumo a um desktop como o XFCE:** monitor do
-   sistema, configurações (papel de parede, cor de destaque); mouse absoluto
-   no QEMU.
+4. **Interface gráfica, rumo a um desktop como o XFCE:** configurações
+   (papel de parede, cor de destaque); mouse absoluto no QEMU.
 
 Boas referências: [Writing an OS in Rust](https://os.phil-opp.com/),
 [OSDev Wiki](https://wiki.osdev.org/), o livro do [xv6](https://pdos.csail.mit.edu/6.828/2024/xv6/book-riscv-rev4.pdf)

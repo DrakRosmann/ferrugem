@@ -27,6 +27,7 @@ pub enum Global {
     Cpuinfo,
     Mounts,
     Loadavg,
+    Stat,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,11 +50,12 @@ pub enum NoProc {
     DoProcesso(Pid, Item),
 }
 
-const GLOBAIS: [(&str, Global); 6] = [
+const GLOBAIS: [(&str, Global); 7] = [
     ("cpuinfo", Global::Cpuinfo),
     ("loadavg", Global::Loadavg),
     ("meminfo", Global::Meminfo),
     ("mounts", Global::Mounts),
+    ("stat", Global::Stat),
     ("uptime", Global::Uptime),
     ("version", Global::Version),
 ];
@@ -284,6 +286,17 @@ fn global(g: Global) -> String {
             let mut t = String::new();
             for (dispositivo, ponto, tipo) in vfs::montagens() {
                 t.push_str(&format!("{} {} {} rw 0 0\n", dispositivo, ponto, tipo));
+            }
+            t
+        }
+        // Os tiques de cada CPU, como no Linux: "cpuN usuário nice sistema ocioso ...".
+        // Aqui, tudo o que não é ocioso conta como "usuário".
+        Global::Stat => {
+            let cpus: Vec<(u64, u64)> = crate::smp::todas().map(|c| (c.tiques - c.tiques_ociosos, c.tiques_ociosos)).collect();
+            let (ocupado, ocioso) = cpus.iter().fold((0, 0), |(a, b), (o, i)| (a + o, b + i));
+            let mut t = format!("cpu  {} 0 0 {} 0 0 0 0 0 0\n", ocupado, ocioso);
+            for (i, (o, ocio)) in cpus.iter().enumerate() {
+                t.push_str(&format!("cpu{} {} 0 0 {} 0 0 0 0 0 0\n", i, o, ocio));
             }
             t
         }

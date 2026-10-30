@@ -174,7 +174,11 @@ pub extern "C" fn kmain(magico: u32, endereco_info: u32) -> ! {
         panic!("não consegui carregar /bin/init (erro {})", erro);
     }
     let cpus = smp::iniciar();
-    ok(format_args!("CPUs: {} (x2APIC; uma trava para o kernel, programas em paralelo)", cpus));
+    ok(format_args!(
+        "CPUs: {} (x2APIC, timer em {} contagens a cada 10 ms; uma trava para o kernel, programas em paralelo)",
+        cpus,
+        smp::contagem_calibrada()
+    ));
     ok("processo 1 (/bin/init) criado; passando o controle ao escalonador");
     println!();
 

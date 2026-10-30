@@ -68,6 +68,9 @@ pub struct Cpu {
     pub tss: *mut gdt::Tss,
     gdt: *mut gdt::Gdt,
     segura_trava: bool,
+    /// Tiques do timer desta CPU: todos, e os passados no processo ocioso (/proc/stat).
+    pub tiques: u64,
+    pub tiques_ociosos: u64,
 }
 
 impl Cpu {
@@ -83,6 +86,8 @@ impl Cpu {
             tss: null_mut(),
             gdt: null_mut(),
             segura_trava: false,
+            tiques: 0,
+            tiques_ociosos: 0,
         }
     }
 }
@@ -201,16 +206,30 @@ fn ligar_timer() {
     escrever_msr(0x838, CONTAGEM_10MS.load(Ordering::Relaxed) as u64);
 }
 
-/// Mede quanto o timer do APIC conta em 50 ms do PIT.
+/// Mede quanto o timer do APIC conta em 10 tiques inteiros do PIT (100 ms).
+/// O relógio do PIT anda de 10 em 10 ms: para não errar em até um tique,
+/// começamos e terminamos exatamente na virada de um tique.
 fn calibrar() {
     escrever_msr(0x83E, 0x3);
     escrever_msr(0x832, 1 << 16); // mascarado: só contamos
+    let esperar_virada = || {
+        let agora = pit::milissegundos();
+        while pit::milissegundos() == agora {
+            unsafe { asm!("sti", "hlt", "cli", options(nostack)) };
+        }
+    };
+    esperar_virada();
     escrever_msr(0x838, 0xFFFF_FFFF);
     let inicio = pit::milissegundos();
-    esperar_ms(50);
+    while pit::milissegundos() < inicio + 100 {
+        esperar_virada();
+    }
     let contado = 0xFFFF_FFFF - ler_msr(0x839) as u32;
-    let ms = (pit::milissegundos() - inicio).max(1);
-    CONTAGEM_10MS.store((contado as u64 * 10 / ms) as u32, Ordering::Relaxed);
+    CONTAGEM_10MS.store(contado / 10, Ordering::Relaxed);
+}
+
+pub fn contagem_calibrada() -> u32 {
+    CONTAGEM_10MS.load(Ordering::Relaxed)
 }
 
 /// Espera com as interrupções ligadas (o relógio anda pelo PIT). Só no boot.
