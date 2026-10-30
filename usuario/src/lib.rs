@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+pub mod cripto;
 pub mod grafico;
 pub mod html;
 pub mod http;
@@ -36,6 +37,7 @@ pub mod sha256;
 pub mod png;
 pub mod rede;
 pub mod sys;
+pub mod tls;
 pub mod truetype;
 pub mod ui;
 pub mod usuarios;

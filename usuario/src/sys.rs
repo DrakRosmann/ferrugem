@@ -1207,3 +1207,15 @@ pub fn endereco_local_inet(fd: i32) -> Resultado<(u32, u16)> {
 pub fn desligar_socket(fd: i32, como: u64) -> Resultado<()> {
     conferir(unsafe { syscall(48, fd as u64, como, 0, 0) }).map(|_| ())
 }
+
+/// Bytes aleatórios do kernel (`getrandom`; a RDRAND da CPU, se houver).
+pub fn aleatorio(buf: &mut [u8]) {
+    let mut feito = 0;
+    while feito < buf.len() {
+        let r = unsafe { syscall(318, buf[feito..].as_mut_ptr() as u64, (buf.len() - feito) as u64, 0, 0) };
+        if r <= 0 {
+            break;
+        }
+        feito += r as usize;
+    }
+}

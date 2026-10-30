@@ -11,6 +11,29 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+/// Desfaz os "%XX" (e "+" vira espaço, como nos formulários).
+pub fn decodificar_porcento(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut saida = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(v) => {
+                    saida.push(v);
+                    i += 3;
+                    continue;
+                }
+                Err(_) => saida.push(b'%'),
+            },
+            b'+' => saida.push(b' '),
+            c => saida.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&saida).into_owned()
+}
+
 /// Um endereço: `esquema://host:porta/caminho?consulta#fragmento`.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Url {
@@ -192,13 +215,14 @@ impl Transporte for rede::Conexao {
     }
 }
 
-/// Abre a conexão certa para o esquema (o navegador troca isto quando tiver TLS).
+/// Como abrir a conexão de um endereço (um teste pode trocar).
 pub type Abrir = fn(&Url) -> Result<alloc::boxed::Box<dyn Transporte>, String>;
 
+/// TCP para http://, TLS 1.3 por cima do TCP para https://.
 pub fn abrir_simples(url: &Url) -> Result<alloc::boxed::Box<dyn Transporte>, String> {
     match url.esquema.as_str() {
         "http" => Ok(alloc::boxed::Box::new(rede::conectar(&url.host, url.porta)?)),
-        "https" => Err(String::from("HTTPS (conexão segura) ainda não é suportado")),
+        "https" => Ok(alloc::boxed::Box::new(crate::tls::Tls::conectar(&url.host, url.porta)?)),
         e => Err(format!("esquema não suportado: {}", e)),
     }
 }

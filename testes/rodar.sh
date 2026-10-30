@@ -16,8 +16,20 @@ www="$temporario/www"
 mkdir -p "$www"
 python3 -c 'import sys; sys.stdout.buffer.write(bytes(i * 7 % 251 for i in range(100000)))' > "$www/padrao.bin"
 (cd "$www" && exec python3 -m http.server 18080 --bind 127.0.0.1) > "$temporario/http.txt" 2>&1 &
-servidor=$!
-trap 'kill $servidor 2>/dev/null; rm -rf "$temporario"' EXIT
+servidores=$!
+# E dois servidores HTTPS (TLS 1.3, certificado feito na hora), um para cada
+# cifra que o FerrugemOS sabe; o segundo também pede o certificado do cliente.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj /CN=10.0.2.2 \
+    -keyout "$temporario/chave.pem" -out "$temporario/cert.pem" >/dev/null 2>&1
+for tls in "18443 TLS_CHACHA20_POLY1305_SHA256" "18444 TLS_AES_128_GCM_SHA256 -verify 1"; do
+    set -- $tls
+    porta=$1 cifra=$2
+    shift 2
+    (cd "$www" && exec openssl s_server -quiet -accept "127.0.0.1:$porta" -tls1_3 -ciphersuites "$cifra" "$@" \
+        -cert "$temporario/cert.pem" -key "$temporario/chave.pem" -WWW) >> "$temporario/https.txt" 2>&1 < /dev/null &
+    servidores="$servidores $!"
+done
+trap 'kill $servidores 2>/dev/null; rm -rf "$temporario"' EXIT
 disco="$temporario/disco.img"
 # Os testes da libc (c/testec.c) só existem se a musl estiver instalada (`make musl`).
 comandos="teste"

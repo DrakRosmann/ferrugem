@@ -50,6 +50,18 @@ impl Elemento {
         None
     }
 
+    /// Todos os elementos com esse nome (em qualquer nível, na ordem).
+    pub fn todos<'a>(&'a self, nome: &str, saida: &mut Vec<&'a Elemento>) {
+        for f in &self.filhos {
+            if let No::Elemento(e) = f {
+                if e.nome == nome {
+                    saida.push(e);
+                }
+                e.todos(nome, saida);
+            }
+        }
+    }
+
     /// Todo o texto de dentro, junto.
     pub fn texto(&self) -> String {
         let mut t = String::new();

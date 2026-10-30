@@ -276,6 +276,15 @@ impl Diagramador<'_, '_> {
             espaco = 0;
         }
         self.comecar_linha();
+        // Duas palavras do mesmo link: o espaço entre elas também é do link
+        // (o sublinhado fica contínuo, e o mouse em cima do espaço vale).
+        if espaco > 0 && d.link().is_some() {
+            if let Some(Desenho::Texto { largura, estilo, .. }) = self.linha.last_mut() {
+                if estilo.link == d.link() {
+                    *largura += espaco;
+                }
+            }
+        }
         d.mover(self.x + espaco, 0);
         self.x += espaco + largura;
         self.linha.push(d);
@@ -592,11 +601,27 @@ struct Pagina {
     altura: i32,
     /// Uma linha para a barra de estado ("HTTP 404", "123 KiB"...).
     info: String,
+    /// `<meta http-equiv="refresh" content="0; url=...">`: ir para lá.
+    refresh: Option<Url>,
 }
 
 impl Pagina {
     fn de_html(url: Url, texto: &str, info: String) -> Pagina {
         let raiz = html::analisar(texto);
+        // Um "refresh" rápido (até 5 s) é um redirecionamento.
+        let mut metas = Vec::new();
+        raiz.todos("meta", &mut metas);
+        let refresh = metas
+            .iter()
+            .filter(|m| m.atributo("http-equiv").is_some_and(|h| h.eq_ignore_ascii_case("refresh")))
+            .filter_map(|m| {
+                let (espera, resto) = m.atributo("content")?.split_once(';')?;
+                let espera: f32 = espera.trim().parse().ok()?;
+                let resto = resto.trim();
+                let destino = if resto.len() > 4 && resto[..4].eq_ignore_ascii_case("url=") { &resto[4..] } else { resto };
+                (espera <= 5.0).then(|| url.juntar(destino.trim_matches(['\'', '"', ' '])))?
+            })
+            .next();
         let titulo = raiz.achar("title").map(|t| t.texto().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
         Pagina {
             url,
@@ -609,6 +634,7 @@ impl Pagina {
             ancoras: Vec::new(),
             altura: 0,
             info,
+            refresh,
         }
     }
 
@@ -689,15 +715,12 @@ fn pagina_de_erro(url: Url, mensagem: &str) -> Pagina {
         endereco,
         escapar(mensagem)
     );
-    if url.esquema == "https" {
-        let http = format!("http{}", &url.texto()[5..]);
+    if url.esquema == "https" && mensagem.contains("TLS") || mensagem.contains("curva") || mensagem.contains("1.3") {
+        let http = format!("http{}", url.texto().get(5..).unwrap_or(""));
         corpo += &format!(
-            "<p>Este navegador ainda não fala HTTPS (a conexão segura, com TLS). Tente a \
-             <a href=\"{0}\">versão sem segurança</a>, se o site tiver uma, ou leia a página pelo \
-             <a href=\"http://frogfind.com/read.php?a={1}\">FrogFind</a>, que a busca por nós e a \
-             simplifica.</p>",
-            escapar(&http),
-            escapar(&url.texto())
+            "<p>Este navegador fala só o TLS 1.3 (com a troca de chaves X25519). Tente a \
+             <a href=\"{}\">versão sem segurança</a>, se o site tiver uma.</p>",
+            escapar(&http)
         );
     }
     corpo += "<p><a href=\"sobre:inicio\">Página inicial</a></p>";
@@ -706,16 +729,18 @@ fn pagina_de_erro(url: Url, mensagem: &str) -> Pagina {
 
 const PAGINA_INICIAL: &str = r#"
 <h1>Navegador do FerrugemOS</h1>
-<p>Um navegador escrito do zero, como o resto do sistema: o TCP, o DNS e o HTTP são nossos, assim como o leitor de HTML, a diagramação e o decodificador de PNG. Ainda não há JavaScript nem folhas de estilo, e as conexões seguras (HTTPS) estão a caminho.</p>
-<p>Digite um endereço lá em cima, ou palavras para buscar no <b>FrogFind</b> (um buscador que entrega páginas simples, feito para computadores antigos).</p>
+<p>Um navegador escrito do zero, como o resto do sistema: o TCP, o DNS, o HTTP e o TLS 1.3 (o HTTPS) são nossos, assim como o leitor de HTML, a diagramação e o decodificador de PNG. Ainda não há JavaScript nem folhas de estilo.</p>
+<p>Digite um endereço lá em cima, ou palavras para buscar no <b>DuckDuckGo</b>.</p>
+<p><small>As conexões HTTPS são cifradas, mas o certificado do site ainda não é conferido: quem estiver no meio do caminho poderia se passar pelo site. Não digite senhas.</small></p>
 <h2>Para começar</h2>
 <ul>
+<li><a href="https://pt.wikipedia.org/wiki/Rust_(linguagem_de_programa%C3%A7%C3%A3o)">Wikipédia: Rust (linguagem de programação)</a></li>
+<li><a href="https://lite.duckduckgo.com/lite/">DuckDuckGo Lite</a>: busca na web</li>
+<li><a href="https://text.npr.org/">text.npr.org</a>: notícias em texto puro</li>
+<li><a href="http://68k.news/">68k.news</a>: o Google Notícias em HTML simples</li>
 <li><a href="http://info.cern.ch/hypertext/WWW/TheProject.html">O primeiro site da web</a> (CERN, 1991)</li>
-<li><a href="http://frogfind.com/">FrogFind</a>: busca na web, com as páginas simplificadas</li>
-<li><a href="http://68k.news/">68k.news</a>: notícias do Google Notícias, em HTML simples</li>
-<li><a href="http://example.com/">example.com</a></li>
+<li><a href="https://example.com/">example.com</a></li>
 <li><a href="http://textfiles.com/">textfiles.com</a>: arquivos de texto da era das BBSs</li>
-<li><a href="http://neverssl.com/">neverssl.com</a></li>
 </ul>
 <h2>Atalhos</h2>
 <p><code>Ctrl+L</code> vai para o endereço, <code>Ctrl+R</code> recarrega, <code>Backspace</code> volta; <code>espaço</code>, <code>PgDn</code>, <code>PgUp</code>, as setas, <code>Home</code> e <code>End</code> rolam a página.</p>
@@ -863,6 +888,8 @@ struct Navegador {
     /// Ir para esta âncora depois da diagramação.
     ancora: Option<String>,
     rolagem_pendente: Option<i32>,
+    /// Quantos refreshes seguidos (contra laços).
+    refreshes: u32,
 }
 
 impl Navegador {
@@ -889,10 +916,18 @@ impl Navegador {
                 b => format!("%{:02X}", b),
             })
             .collect();
-        Url::ler(&format!("http://frogfind.com/?q={}", termos))
+        Url::ler(&format!("https://lite.duckduckgo.com/lite/?q={}", termos))
     }
 
     fn ir(&mut self, url: Url, novo_no_historico: bool) {
+        // Os links dos resultados do DuckDuckGo passam por um redirecionamento
+        // (que precisa de JavaScript); o destino vem no parâmetro "uddg".
+        if url.host.ends_with("duckduckgo.com") && url.caminho.starts_with("/l/") {
+            let destino = url.caminho.split(['?', '&']).find_map(|p| p.strip_prefix("uddg="));
+            if let Some(u) = destino.and_then(|d| Url::ler(&http::decodificar_porcento(d))) {
+                return self.ir(u, novo_no_historico);
+            }
+        }
         if let Some(b) = self.busca.take() {
             b.cancelar();
         }
@@ -977,7 +1012,17 @@ impl Navegador {
         }
         self.ancora = (!p.url.fragmento.is_empty()).then(|| p.url.fragmento.clone());
         self.endereco.mudar(&texto);
+        let refresh = p.refresh.clone();
         self.pagina = Some(p);
+        // O refresh substitui esta página no histórico (até 5 seguidos).
+        if let Some(destino) = refresh {
+            if self.refreshes < 5 {
+                self.refreshes += 1;
+                self.ir(destino, false);
+            }
+        } else {
+            self.refreshes = 0;
+        }
     }
 
     fn pagina_da_resposta(&self, url: Url, status: u16, tipo: &str, corpo: Vec<u8>, info: String) -> Pagina {
@@ -1021,7 +1066,10 @@ impl Navegador {
                 let b = self.busca.take().unwrap();
                 let pagina = match r {
                     Resultado::Resposta { status, url, tipo, corpo } => {
-                        let info = tamanho_legivel(corpo.len());
+                        let mut info = tamanho_legivel(corpo.len());
+                        if url.esquema == "https" {
+                            info += " · TLS 1.3, cifrado (certificado não verificado)";
+                        }
                         self.pagina_da_resposta(url, status, &tipo, corpo, info)
                     }
                     Resultado::Erro(e) => pagina_de_erro(b.url.clone(), &e),
@@ -1308,6 +1356,7 @@ fn principal(args: &[&str]) -> i32 {
         visitados: Vec::new(),
         ancora: None,
         rolagem_pendente: None,
+        refreshes: 0,
     };
     let primeira = args.get(1).and_then(|a| Navegador::interpretar_endereco(a)).or_else(|| Url::ler(INICIO)).unwrap();
     nav.ir(primeira, true);

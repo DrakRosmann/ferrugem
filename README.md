@@ -176,9 +176,19 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   tabelas simples, negrito, itálico (sintético), links (o visitado muda
   de cor) e âncoras (`#id`). O leitor de HTML é tolerante como os
   navegadores (`ulib::html`). Os downloads rodam num processo filho e a
-  janela continua respondendo. Também há histórico, barra de endereço
-  (palavras soltas viram uma busca no FrogFind) e `file://`. A página
-  inicial lista sites que ainda funcionam sem HTTPS.
+  janela continua respondendo. Também há **HTTPS** (o TLS 1.3, abaixo),
+  histórico, barra de endereço (palavras soltas viram uma busca no
+  DuckDuckGo), `<meta http-equiv="refresh">` e `file://`.
+- **TLS 1.3** (`ulib::tls`, o HTTPS), escrito do zero, com as peças em
+  `ulib::cripto` (conferidas com os vetores das RFCs):
+  - a troca de chaves X25519;
+  - as cifras ChaCha20-Poly1305 e AES-128-GCM;
+  - HMAC/HKDF sobre o SHA-256.
+
+  O aperto de mão segue a RFC 8446, inclusive o Finished conferido, o
+  KeyUpdate e o pedido de certificado do cliente. Falta conferir o
+  certificado do servidor: a conexão é cifrada, mas quem estiver no meio
+  do caminho poderia se passar pelo site.
 - **PNG** (`ulib::png`): decodificador completo — o inflate do zlib (blocos
   sem compressão, Huffman fixo e dinâmico), os 5 filtros, cinza/RGB/paleta/
   alfa em 1 a 16 bits, transparência (tRNS) e entrelaçamento Adam7 — e um
@@ -228,8 +238,8 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   `/etc/hosts` e pelo servidor do `/etc/resolv.conf`, conexões TCP por nome)
   e `http` (URLs, inclusive relativas, e um cliente HTTP/1.1 que segue
   redirecionamentos e entende `chunked`).
-- **Rede:** `ping`, `host` (DNS), `baixar` (como o `wget`) e `rede` (a
-  placa, os vizinhos e as conexões).
+- **Rede:** `ping`, `host` (DNS), `baixar` (como o `wget`, também por
+  HTTPS) e `rede` (a placa, os vizinhos e as conexões).
 - `init` (processo 1) roda o `/etc/rc` (que inicia os serviços) e abre um
   `login` em cada console → `sh`: pipes `|`, `>`, `>>`, `<`, `&`, `;`,
   `$?`, `$VARIAVEL`, `~`, aspas, comentários, scripts, `sh -c`, `export`, `cd`,
@@ -267,6 +277,7 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 | `src/rede.rs`, `tcp.rs`, `inet.rs` | A pilha de rede: Ethernet/ARP/IP/ICMP/UDP, o TCP e os sockets `AF_INET` |
 | `usuario/src/rede.rs`, `http.rs` | DNS, conexões por nome, URLs e o cliente HTTP |
 | `usuario/src/html.rs`, `bin/navegador.rs` | O leitor de HTML e o navegador (diagramação e desenho) |
+| `usuario/src/tls.rs`, `cripto.rs` | TLS 1.3 e a criptografia (X25519, ChaCha20-Poly1305, AES-GCM, HKDF) |
 | `src/smp.rs`, `trampolim.asm` | Várias CPUs: APIC, ACPI, acordar as outras, a trava do kernel |
 | `src/video.rs`, `mouse.rs`, `registro.rs` | Modo gráfico (Bochs VBE), mouse PS/2, registro do kernel (dmesg) |
 | `usuario/src/grafico.rs`, `janela.rs` | Desenho (retângulos, linhas, texto) e o lado do cliente das janelas |
@@ -339,8 +350,9 @@ de páginas. O `make run` usa 4 CPUs.
 2. **Hardware moderno:** IOAPIC (as IRQs ainda vêm do PIC, só para a CPU
    principal), trocar a trava única do kernel por travas finas (e então
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
-3. **Rede:** HTTPS (TLS 1.3) para o navegador, DHCP (hoje o endereço é
-   fixo), IPv6, outra placa (virtio-net ou e1000).
+3. **Rede:** conferir os certificados do TLS (X.509, RSA/ECDSA e as
+   autoridades), DHCP (hoje o endereço é fixo), IPv6, outra placa
+   (virtio-net ou e1000). No navegador: CSS, formulários e JPEG.
 4. **Interface gráfica:** ícones na área de trabalho, notificações,
    seleção de trechos nos campos de texto, mais programas.
 

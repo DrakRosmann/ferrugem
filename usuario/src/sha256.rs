@@ -1,4 +1,4 @@
-//! SHA-256 (FIPS 180-4), usado para guardar senhas sem guardá-las.
+//! SHA-256 (FIPS 180-4), usado para guardar senhas sem guardá-las (e no TLS).
 //!
 //! O /etc/shadow não tem a senha: tem um "sal" aleatório e o resultado de
 //! passar sal + senha pelo SHA-256 mil vezes. Para conferir uma senha,
@@ -16,18 +16,70 @@ const K: [u32; 64] = [
 ];
 
 pub fn sha256(dados: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
-    // Completa com 1 bit, zeros e o tamanho em bits, até múltiplo de 64 bytes.
-    let mut msg = alloc::vec::Vec::from(dados);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend(((dados.len() as u64) * 8).to_be_bytes());
+    let mut h = Sha256::novo();
+    h.atualizar(dados);
+    h.terminar()
+}
 
-    for bloco in msg.chunks_exact(64) {
+/// O SHA-256 aos pedaços: `atualizar` quantas vezes quiser; `terminar` não
+/// estraga o estado (o TLS tira o hash da conversa em vários pontos dela).
+#[derive(Clone)]
+pub struct Sha256 {
+    h: [u32; 8],
+    bloco: [u8; 64],
+    no_bloco: usize,
+    total: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::novo()
+    }
+}
+
+impl Sha256 {
+    pub fn novo() -> Sha256 {
+        Sha256 {
+            h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
+            bloco: [0; 64],
+            no_bloco: 0,
+            total: 0,
+        }
+    }
+
+    pub fn atualizar(&mut self, mut dados: &[u8]) {
+        self.total += dados.len() as u64;
+        while !dados.is_empty() {
+            let n = (64 - self.no_bloco).min(dados.len());
+            self.bloco[self.no_bloco..self.no_bloco + n].copy_from_slice(&dados[..n]);
+            self.no_bloco += n;
+            dados = &dados[n..];
+            if self.no_bloco == 64 {
+                let bloco = self.bloco;
+                self.comprimir(&bloco);
+                self.no_bloco = 0;
+            }
+        }
+    }
+
+    /// O hash do que entrou até agora.
+    pub fn terminar(&self) -> [u8; 32] {
+        let mut c = self.clone();
+        let bits = self.total * 8;
+        // Completa com 1 bit, zeros e o tamanho em bits, até múltiplo de 64 bytes.
+        c.atualizar(&[0x80]);
+        while c.no_bloco != 56 {
+            c.atualizar(&[0]);
+        }
+        c.atualizar(&bits.to_be_bytes());
+        let mut saida = [0u8; 32];
+        for (i, x) in c.h.iter().enumerate() {
+            saida[i * 4..i * 4 + 4].copy_from_slice(&x.to_be_bytes());
+        }
+        saida
+    }
+
+    fn comprimir(&mut self, bloco: &[u8; 64]) {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes(bloco[i * 4..i * 4 + 4].try_into().unwrap());
@@ -37,7 +89,7 @@ pub fn sha256(dados: &[u8]) -> [u8; 32] {
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
             w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
         }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = self.h;
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
@@ -47,15 +99,10 @@ pub fn sha256(dados: &[u8]) -> [u8; 32] {
             let t2 = s0.wrapping_add(maj);
             (hh, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(t1), c, b, a, t1.wrapping_add(t2));
         }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        for (x, y) in self.h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
             *x = x.wrapping_add(y);
         }
     }
-    let mut saida = [0u8; 32];
-    for (i, x) in h.iter().enumerate() {
-        saida[i * 4..i * 4 + 4].copy_from_slice(&x.to_be_bytes());
-    }
-    saida
 }
 
 pub fn hex(bytes: &[u8]) -> alloc::string::String {

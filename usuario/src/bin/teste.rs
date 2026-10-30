@@ -1749,16 +1749,20 @@ fn rede_placa() -> R {
     if !String::from_utf8_lossy(&sys::ler_arquivo("/proc/rede").map_err(erro)?).contains("arp 10.0.2.2 ") {
         return Err("o roteador não entrou na tabela ARP".into());
     }
-    let url = ulib::http::Url::ler("http://10.0.2.2:18080/padrao.bin").unwrap();
-    match ulib::http::obter(&url, ulib::http::abrir_simples, &mut |_| {}) {
-        Ok(r) => {
-            let certo = r.corpo.len() == 100_000 && r.corpo.iter().enumerate().all(|(i, &b)| b == byte_de_teste(i));
-            if r.status != 200 || !certo {
-                return Err(format!("download: estado {}, {} bytes (ou bytes errados)", r.status, r.corpo.len()));
+    // HTTP e HTTPS (as duas cifras) dos servidores que o rodar.sh sobe.
+    // Se o de HTTP não estiver lá (rodando fora do `make teste`), pula.
+    for (i, endereco) in ["http://10.0.2.2:18080", "https://10.0.2.2:18443", "https://10.0.2.2:18444"].iter().enumerate() {
+        let url = ulib::http::Url::ler(&format!("{}/padrao.bin", endereco)).unwrap();
+        match ulib::http::obter(&url, ulib::http::abrir_simples, &mut |_| {}) {
+            Ok(r) => {
+                let certo = r.corpo.len() == 100_000 && r.corpo.iter().enumerate().all(|(i, &b)| b == byte_de_teste(i));
+                if r.status != 200 || !certo {
+                    return Err(format!("{}: estado {}, {} bytes (ou bytes errados)", endereco, r.status, r.corpo.len()));
+                }
             }
+            Err(e) if i == 0 && e.contains("recusada") => return Ok(()), // não há servidores aqui fora
+            Err(e) => return Err(format!("{}: {}", endereco, e)),
         }
-        Err(e) if e.contains("recusada") => {} // não há servidor do lado de fora
-        Err(e) => return Err(format!("download: {}", e)),
     }
     Ok(())
 }
@@ -1824,6 +1828,75 @@ fn html_e_urls() -> R {
     Ok(())
 }
 
+fn de_hex(h: &str) -> Vec<u8> {
+    (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap()).collect()
+}
+
+/// Os vetores de teste das RFCs, para cada peça do TLS.
+fn criptografia() -> R {
+    use ulib::cripto;
+    use ulib::sha256::hex;
+    let confere = |nome: &str, obtido: &[u8], esperado: &str| -> R {
+        if hex(obtido) == esperado { Ok(()) } else { Err(format!("{}: {} (esperava {})", nome, hex(obtido), esperado)) }
+    };
+    // RFC 7748, 5.2 e 6.1
+    let k: [u8; 32] = de_hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4").try_into().unwrap();
+    let u: [u8; 32] = de_hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c").try_into().unwrap();
+    confere("X25519", &cripto::x25519(&k, &u), "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")?;
+    let alice: [u8; 32] = de_hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a").try_into().unwrap();
+    let bob: [u8; 32] = de_hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb").try_into().unwrap();
+    let (pa, pb) = (cripto::x25519_publica(&alice), cripto::x25519_publica(&bob));
+    confere("X25519 (pública de Alice)", &pa, "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")?;
+    confere("X25519 (pública de Bob)", &pb, "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")?;
+    let segredo = cripto::x25519(&alice, &pb);
+    confere("X25519 (segredo)", &segredo, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")?;
+    if cripto::x25519(&bob, &pa) != segredo {
+        return Err("X25519: Alice e Bob chegaram a segredos diferentes".into());
+    }
+    // RFC 8439, 2.8.2
+    let chave: [u8; 32] = (0x80..0xa0).collect::<Vec<u8>>().try_into().unwrap();
+    let nonce: [u8; 12] = de_hex("070000004041424344454647").try_into().unwrap();
+    let extra = de_hex("50515253c0c1c2c3c4c5c6c7");
+    let texto = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    let cifrado = cripto::chacha20_poly1305_cifrar(&chave, &nonce, &extra, texto);
+    confere("ChaCha20 (começo)", &cifrado[..16], "d31a8d34648e60db7b86afbc53ef7ec2")?;
+    confere("Poly1305 (etiqueta)", &cifrado[cifrado.len() - 16..], "1ae10b594f09e26a7e902ecbd0600691")?;
+    if cripto::chacha20_poly1305_decifrar(&chave, &nonce, &extra, &cifrado).as_deref() != Some(&texto[..]) {
+        return Err("ChaCha20-Poly1305: não decifrou de volta".into());
+    }
+    let mut adulterado = cifrado.clone();
+    adulterado[5] ^= 1;
+    if cripto::chacha20_poly1305_decifrar(&chave, &nonce, &extra, &adulterado).is_some() {
+        return Err("ChaCha20-Poly1305: aceitou um texto adulterado".into());
+    }
+    // A especificação do GCM (McGrew e Viega), casos 1, 2 e 3
+    let zero = cripto::Aes128::novo(&[0; 16]);
+    confere("AES-GCM (caso 1)", &zero.gcm_cifrar(&[0; 12], &[], &[]), "58e2fccefa7e3061367f1d57a4e7455a")?;
+    confere("AES-GCM (caso 2)", &zero.gcm_cifrar(&[0; 12], &[], &[0; 16]), "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")?;
+    let aes = cripto::Aes128::novo(&de_hex("feffe9928665731c6d6a8f9467308308").try_into().unwrap());
+    let iv: [u8; 12] = de_hex("cafebabefacedbaddecaf888").try_into().unwrap();
+    let p = de_hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255");
+    let c = aes.gcm_cifrar(&iv, &[], &p);
+    confere("AES-GCM (caso 3, etiqueta)", &c[c.len() - 16..], "4d5c2af327cd64a62cf35abd2ba6fab4")?;
+    if aes.gcm_decifrar(&iv, &[], &c).as_deref() != Some(&p[..]) {
+        return Err("AES-GCM: não decifrou de volta".into());
+    }
+    // RFC 5869, caso 1
+    let prk = cripto::hkdf_extrair(&de_hex("000102030405060708090a0b0c"), &[0x0b; 22]);
+    confere("HKDF (extrair)", &prk, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")?;
+    let okm = cripto::hkdf_expandir(&prk, &de_hex("f0f1f2f3f4f5f6f7f8f9"), 42);
+    confere("HKDF (expandir)", &okm, "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")?;
+    // SHA-256 aos pedaços = de uma vez
+    let mut h = ulib::sha256::Sha256::novo();
+    for parte in texto.chunks(7) {
+        h.atualizar(parte);
+    }
+    if h.terminar() != ulib::sha256::sha256(texto) {
+        return Err("SHA-256 aos pedaços deu diferente".into());
+    }
+    Ok(())
+}
+
 fn png_ler_e_gravar() -> R {
     use ulib::png;
     let abrir = |nome: &str| -> Result<png::Imagem, String> {
@@ -1884,7 +1957,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 65] = [
+    let testes: [(&str, fn() -> R); 66] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -1948,8 +2021,9 @@ fn principal(args: &[&str]) -> i32 {
         ("PNG: inflate, filtros, Adam7, paleta, 16 bits; ida e volta", png_ler_e_gravar),
         ("TCP pelo loopback: 200 KB e de volta, recusa, poll no accept", rede_tcp_local),
         ("UDP pelo loopback: endereços, porta efêmera, socket conectado", rede_udp_local),
-        ("placa de rede: ARP, ping no roteador e um download HTTP", rede_placa),
+        ("placa de rede: ARP, ping no roteador; HTTP e HTTPS (ChaCha20 e AES-GCM)", rede_placa),
         ("HTML tolerante (fechamentos implícitos, entidades) e URLs relativas", html_e_urls),
+        ("criptografia: X25519, ChaCha20-Poly1305, AES-GCM e HKDF (vetores das RFCs)", criptografia),
     ];
 
     // `teste trecho`: só os testes cujo nome contém o trecho.
