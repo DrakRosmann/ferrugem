@@ -242,7 +242,28 @@ pub fn abrir_simples(url: &Url) -> Result<alloc::boxed::Box<dyn Transporte>, Str
 /// GET, seguindo até 8 redirecionamentos. `progresso` recebe os bytes já
 /// recebidos (para mostrar ao usuário).
 pub fn obter(url: &Url, abrir: Abrir<'_>, progresso: &mut dyn FnMut(usize)) -> Result<Resposta, String> {
+    obter_com(url, abrir, None, progresso)
+}
+
+/// Os pares (nome, valor) de um formulário, como o navegador os envia
+/// ("application/x-www-form-urlencoded"): `a=1&b=dois+tr%C3%AAs`.
+pub fn codificar_formulario(pares: &[(String, String)]) -> String {
+    let codificar = |t: &str| -> String {
+        t.bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => String::from(b as char),
+                b' ' => String::from("+"),
+                b => format!("%{:02X}", b),
+            })
+            .collect()
+    };
+    pares.iter().map(|(n, v)| format!("{}={}", codificar(n), codificar(v))).collect::<Vec<_>>().join("&")
+}
+
+/// Como `obter`, mas com `envio` (um formulário já codificado) vira um POST.
+pub fn obter_com(url: &Url, abrir: Abrir<'_>, envio: Option<&[u8]>, progresso: &mut dyn FnMut(usize)) -> Result<Resposta, String> {
     let mut url = url.clone();
+    let mut envio = envio;
     for _ in 0..8 {
         let mut c = abrir(&url)?;
         let host = if (url.esquema == "http" && url.porta == 80) || (url.esquema == "https" && url.porta == 443) {
@@ -250,13 +271,22 @@ pub fn obter(url: &Url, abrir: Abrir<'_>, progresso: &mut dyn FnMut(usize)) -> R
         } else {
             format!("{}:{}", url.host, url.porta)
         };
+        let corpo = match envio {
+            Some(e) => format!("Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n", e.len()),
+            None => String::new(),
+        };
         let pedido = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Ferrugem/0.1 (FerrugemOS)\r\n\
-             Accept: text/html, text/plain, image/png, */*;q=0.5\r\nAccept-Language: pt-BR, pt, en;q=0.5\r\n\
-             Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
-            url.caminho, host
+            "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Ferrugem/0.1 (FerrugemOS)\r\n\
+             Accept: text/html, text/plain, image/png, image/jpeg, */*;q=0.5\r\nAccept-Language: pt-BR, pt, en;q=0.5\r\n\
+             Accept-Encoding: identity\r\n{}Connection: close\r\n\r\n",
+            if envio.is_some() { "POST" } else { "GET" },
+            url.caminho,
+            host,
+            corpo
         );
-        c.escrever(pedido.as_bytes())?;
+        let mut pedido = pedido.into_bytes();
+        pedido.extend_from_slice(envio.unwrap_or(&[]));
+        c.escrever(&pedido)?;
         let mut bruto = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -273,6 +303,9 @@ pub fn obter(url: &Url, abrir: Abrir<'_>, progresso: &mut dyn FnMut(usize)) -> R
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if let Some(destino) = r.cabecalho("location").and_then(|l| url.juntar(l)) {
                 url = destino;
+                if !matches!(status, 307 | 308) {
+                    envio = None; // depois de um POST, o destino é pedido com GET
+                }
                 continue;
             }
         }

@@ -79,7 +79,8 @@ pub const TEMA_ESCURO: Tema = Tema {
 
 const MARGEM: i32 = 12;
 const ESPACO: i32 = 8;
-const ALTURA: i32 = 26;
+/// A altura de botões e campos.
+pub const ALTURA: i32 = 26;
 const ALTURA_MENU: i32 = 24;
 
 #[derive(Clone, PartialEq)]
@@ -172,11 +173,13 @@ pub struct CampoTexto {
     /// Ponha true para o campo pegar o foco no próximo desenho (um atalho
     /// como o Ctrl+L do navegador).
     pub pedir_foco: bool,
+    /// Campo de senha: mostra bolinhas, e Ctrl+C/Ctrl+X não copiam.
+    pub senha: bool,
 }
 
 impl CampoTexto {
     pub fn novo(texto: &str) -> CampoTexto {
-        CampoTexto { texto: String::from(texto), cursor: texto.chars().count(), rolagem: 0, pedir_foco: false }
+        CampoTexto { texto: String::from(texto), cursor: texto.chars().count(), rolagem: 0, pedir_foco: false, senha: false }
     }
 
     /// Troca o texto (o cursor vai para o fim).
@@ -188,6 +191,11 @@ impl CampoTexto {
 
     fn byte(&self, caractere: usize) -> usize {
         self.texto.char_indices().nth(caractere).map_or(self.texto.len(), |(i, _)| i)
+    }
+
+    /// O que aparece na tela (as bolinhas, num campo de senha).
+    pub fn visivel(&self) -> String {
+        if self.senha { "•".repeat(self.texto.chars().count()) } else { self.texto.clone() }
     }
 }
 
@@ -1002,6 +1010,14 @@ impl Tela<'_> {
         self.campo_em(campo, x, y, largura, focar)
     }
 
+    /// Um campo de texto onde o programa quiser (os campos de um formulário
+    /// no navegador). Devolve (Enter apertado, está com o foco).
+    pub fn campo_solto(&mut self, campo: &mut CampoTexto, x: i32, y: i32, largura: i32) -> (bool, bool) {
+        let focar = core::mem::take(&mut campo.pedir_foco);
+        let enter = self.campo_em(campo, x, y, largura, focar);
+        (enter, self.ui.foco == Some(self.proximo_id))
+    }
+
     fn campo_em(&mut self, campo: &mut CampoTexto, x: i32, y: i32, largura: i32, focar: bool) -> bool {
         let id = self.novo_id();
         if focar {
@@ -1011,6 +1027,9 @@ impl Tela<'_> {
         let clicou_aqui = self.ui.clicou && self.mouse_em((x, y, largura, ALTURA));
         self.interagir(id, (x, y, largura, ALTURA), true);
         let largura_ate = |ui: &mut Ui, c: &CampoTexto, n: usize| -> i32 {
+            if c.senha {
+                return ui.largura_texto(&"•".repeat(n), tamanho, false);
+            }
             let fim = c.byte(n);
             ui.largura_texto(&c.texto[..fim], tamanho, false)
         };
@@ -1068,6 +1087,7 @@ impl Tela<'_> {
                 Tecla::Seta(Seta::Fim) => campo.cursor = campo.texto.chars().count(),
                 Tecla::Enter => enter = true,
                 // Sem seleção de trecho: Ctrl+C copia o campo inteiro (e Ctrl+X o recorta).
+                Tecla::Copiar | Tecla::Recortar if campo.senha => {}
                 Tecla::Copiar => self.ui.pedidos.push(Pedido::Copiar(campo.texto.clone())),
                 Tecla::Recortar => {
                     self.ui.pedidos.push(Pedido::Copiar(core::mem::take(&mut campo.texto)));
@@ -1093,7 +1113,7 @@ impl Tela<'_> {
         let antes = self.q.recorte;
         self.q.recortar(x + 3, y + 2, largura - 6, ALTURA - 4);
         let topo = y + (ALTURA - self.ui.altura_linha(tamanho)) / 2;
-        let texto = campo.texto.clone();
+        let texto = campo.visivel();
         self.escrever(x + 6 - campo.rolagem, topo, &texto, t.texto, false, tamanho);
         if focado {
             let cursor_x = x + 6 + px - campo.rolagem;

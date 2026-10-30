@@ -1813,6 +1813,74 @@ fn rede_placa() -> R {
     }
 }
 
+/// Formulários: a codificação, e um POST de verdade para um servidor no
+/// loopback (que redireciona com 303: o destino tem que vir por GET).
+fn formularios() -> R {
+    use ulib::http::{self, Url};
+    let pares = vec![(String::from("q"), String::from("rust e c++")), (String::from("nome"), String::from("José/Ana&Cia"))];
+    let dados = http::codificar_formulario(&pares);
+    if dados != "q=rust+e+c%2B%2B&nome=Jos%C3%A9%2FAna%26Cia" {
+        return Err(format!("codificação: {}", dados));
+    }
+    const PORTA: u16 = 7790;
+    let ouvinte = sys::socket_inet(sys::SOCK_STREAM, 0).map_err(erro)?;
+    sys::ligar_inet(ouvinte, 0x7F00_0001, PORTA).map_err(erro)?;
+    sys::ouvir(ouvinte, 4).map_err(erro)?;
+    let filho = match sys::fork().map_err(erro)? {
+        0 => {
+            let url = Url::ler(&format!("http://127.0.0.1:{}/enviar?x=1", PORTA)).unwrap();
+            let r = http::obter_com(&url, &http::abrir_simples, Some(dados.as_bytes()), &mut |_| {});
+            let certo = r.is_ok_and(|r| r.status == 200 && r.corpo == b"recebido" && r.url.caminho == "/pronto");
+            sys::sair(if certo { 0 } else { 1 });
+        }
+        pid => pid,
+    };
+    // Lê um pedido inteiro (cabeçalho + Content-Length bytes) de uma conexão.
+    let ler_pedido = |c: i32| -> Result<String, String> {
+        let mut pedido = Vec::new();
+        let mut buf = [0u8; 2000];
+        loop {
+            if let Some(fim) = pedido.windows(4).position(|j| j == b"\r\n\r\n") {
+                let cabeca = String::from_utf8_lossy(&pedido[..fim]).to_ascii_lowercase();
+                let n = cabeca.split("content-length:").nth(1).and_then(|r| r.lines().next()?.trim().parse().ok()).unwrap_or(0);
+                if pedido.len() >= fim + 4 + n {
+                    return Ok(String::from_utf8_lossy(&pedido).into_owned());
+                }
+            }
+            match sys::ler(c, &mut buf).map_err(erro)? {
+                0 => return Err("a conexão fechou no meio do pedido".into()),
+                n => pedido.extend_from_slice(&buf[..n]),
+            }
+        }
+    };
+    let mut pedidos = Vec::new();
+    for resposta in ["HTTP/1.1 303 See Other\r\nLocation: /pronto\r\nContent-Length: 0\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nrecebido"] {
+        if sys::poll(&[(ouvinte, sys::POLLIN)], 3000).map_err(erro)?[0] & sys::POLLIN == 0 {
+            return Err(format!("o cliente não conectou (pedidos até aqui: {:?})", pedidos));
+        }
+        let (c, _, _) = sys::aceitar_inet(ouvinte).map_err(erro)?;
+        pedidos.push(ler_pedido(c)?);
+        sys::escrever_tudo(c, resposta.as_bytes()).map_err(erro)?;
+        let _ = sys::fechar(c);
+    }
+    let _ = sys::fechar(ouvinte);
+    let (_, estado) = sys::esperar(filho).map_err(erro)?;
+    let post = &pedidos[0];
+    if !post.starts_with("POST /enviar?x=1 HTTP/1.1\r\n")
+        || !post.contains("Content-Type: application/x-www-form-urlencoded\r\n")
+        || !post.ends_with(&format!("\r\n\r\n{}", dados))
+    {
+        return Err(format!("o POST chegou assim: {:?}", post));
+    }
+    if !pedidos[1].starts_with("GET /pronto HTTP/1.1\r\n") || pedidos[1].contains("Content-Length") {
+        return Err(format!("depois do 303: {:?}", pedidos[1]));
+    }
+    if estado != 0 {
+        return Err("o cliente não recebeu a resposta certa".into());
+    }
+    Ok(())
+}
+
 fn html_e_urls() -> R {
     use ulib::html::{self, No};
     use ulib::http::Url;
@@ -2081,7 +2149,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 67] = [
+    let testes: [(&str, fn() -> R); 68] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -2147,6 +2215,7 @@ fn principal(args: &[&str]) -> i32 {
         ("UDP pelo loopback: endereços, porta efêmera, socket conectado", rede_udp_local),
         ("placa de rede: ARP, ping; HTTP e HTTPS (cifras, certificados e cadeias)", rede_placa),
         ("HTML tolerante (fechamentos implícitos, entidades) e URLs relativas", html_e_urls),
+        ("formulários: codificação, POST e o GET depois do 303", formularios),
         ("criptografia: X25519, ChaCha20-Poly1305, AES-GCM e HKDF (vetores das RFCs)", criptografia),
         ("assinaturas: SHA-512/384, RSA (PKCS#1 e PSS), ECDSA P-256 e P-384", assinaturas),
     ];

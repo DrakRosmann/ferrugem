@@ -174,8 +174,10 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   CSS, só o atributo `style` mais simples. A diagramação tem quebra de
   linha, títulos, listas aninhadas e numeradas, citações, `<pre>`,
   tabelas simples, negrito, itálico (sintético), links (o visitado muda
-  de cor) e âncoras (`#id`). O leitor de HTML é tolerante como os
-  navegadores (`ulib::html`). Os downloads rodam num processo filho e a
+  de cor) e âncoras (`#id`). Formulários de verdade: campos de texto e
+  de senha, caixas de marcar, opções, listas, botões de enviar e de
+  limpar, por GET ou POST (a busca do DuckDuckGo funciona pela própria
+  página). O leitor de HTML é tolerante como os navegadores (`ulib::html`). Os downloads rodam num processo filho e a
   janela continua respondendo. Também há **HTTPS** (o TLS 1.3, abaixo),
   histórico, barra de endereço (palavras soltas viram uma busca no
   DuckDuckGo), `<meta http-equiv="refresh">` e `file://`.
@@ -364,7 +366,7 @@ de páginas. O `make run` usa 4 CPUs.
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** TLS 1.2 (muitos servidores ainda não falam o 1.3), revogação
    de certificados, DHCP (hoje o endereço é fixo), IPv6, outra placa
-   (virtio-net ou e1000). No navegador: CSS, formulários e JPEG.
+   (virtio-net ou e1000). No navegador: CSS e JPEG.
 4. **Interface gráfica:** ícones na área de trabalho, notificações,
    seleção de trechos nos campos de texto, mais programas.
 

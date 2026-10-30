@@ -1,5 +1,6 @@
-//! navegador — um navegador web: HTML e imagens PNG (sem JavaScript, e do
-//! CSS só o atributo `style` mais simples). Rode dentro do `janelas`.
+//! navegador — um navegador web: HTML, formulários e imagens PNG (sem
+//! JavaScript, e do CSS só o atributo `style` mais simples). Rode dentro do
+//! `janelas`.
 //!
 //! O caminho de uma página:
 //!
@@ -76,8 +77,8 @@ const ESTILO_BASE: Estilo = Estilo {
 enum Desenho {
     Texto { x: i32, y: i32, largura: i32, altura: i32, texto: String, estilo: Estilo },
     Retangulo { x: i32, y: i32, largura: i32, altura: i32, cor: u32 },
-    /// Um campo ou botão de formulário (só a aparência).
-    Controle { x: i32, y: i32, largura: i32, altura: i32, texto: String, botao: bool },
+    /// Um campo ou botão de formulário (o estado fica em `Pagina::campos`).
+    Controle { x: i32, y: i32, largura: i32, altura: i32, campo: usize },
     Imagem { x: i32, y: i32, largura: i32, altura: i32, indice: usize, link: Option<usize> },
 }
 
@@ -122,6 +123,52 @@ enum EstadoImagem {
 struct ImagemPagina {
     url: Url,
     estado: EstadoImagem,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TipoCampo {
+    Texto,
+    Senha,
+    /// `<textarea>` (por enquanto, numa linha só).
+    AreaTexto,
+    Caixa,
+    Radio,
+    Lista,
+    Enviar,
+    Limpar,
+    /// Um botão que não faz nada sem JavaScript.
+    Botao,
+    Oculto,
+}
+
+impl TipoCampo {
+    fn de_texto(self) -> bool {
+        matches!(self, TipoCampo::Texto | TipoCampo::Senha | TipoCampo::AreaTexto)
+    }
+}
+
+struct Formulario {
+    acao: Url,
+    post: bool,
+}
+
+/// Um campo de formulário. O estado (o que o usuário digitou, marcou ou
+/// escolheu) fica na página e sobrevive às diagramações.
+struct Campo {
+    formulario: Option<usize>,
+    tipo: TipoCampo,
+    nome: String,
+    /// O "value" do HTML (nos campos de texto, o texto fica em `texto`).
+    valor: String,
+    /// O texto do botão, ou a dica de um campo vazio (placeholder).
+    rotulo: String,
+    texto: CampoTexto,
+    marcado: bool,
+    /// (valor, texto) de cada opção de uma lista.
+    opcoes: Vec<(String, String)>,
+    escolhida: usize,
+    /// O estado inicial (para o botão "Limpar").
+    inicial: (String, bool, usize),
 }
 
 /// Uma cor do HTML: #rgb, #rrggbb, rgb(r, g, b) ou um nome. Cores claras
@@ -219,6 +266,11 @@ struct Diagramador<'a, 'b> {
     /// As listas abertas: o próximo número (`<ol>`) ou nenhum (`<ul>`).
     listas: Vec<Option<u32>>,
     primeira_celula: bool,
+    campos: &'a mut Vec<Campo>,
+    proximo_campo: usize,
+    formularios: Vec<Formulario>,
+    /// O formulário em que estamos (o `<form>` aberto).
+    formulario: Option<usize>,
 }
 
 impl Diagramador<'_, '_> {
@@ -374,31 +426,90 @@ impl Diagramador<'_, '_> {
         }
     }
 
-    fn controle(&mut self, texto: String, largura: i32, botao: bool) {
-        let altura = 24;
-        let largura = largura.max(self.t.medir(&texto, 13, false, false) + 16);
+    /// Registra um campo (ou reaproveita o da diagramação anterior, com o
+    /// que o usuário já digitou). Os campos aparecem sempre na mesma ordem.
+    fn campo(&mut self, tipo: TipoCampo, e: &Elemento, valor: String, rotulo: String, opcoes: Vec<(String, String)>, escolhida: usize) -> usize {
+        let i = self.proximo_campo;
+        self.proximo_campo += 1;
+        if i >= self.campos.len() {
+            let marcado = e.atributo("checked").is_some();
+            let mut texto = CampoTexto::novo(if tipo.de_texto() { &valor } else { "" });
+            texto.senha = tipo == TipoCampo::Senha;
+            self.campos.push(Campo {
+                formulario: self.formulario,
+                tipo,
+                nome: e.atributo("name").unwrap_or("").into(),
+                inicial: (valor.clone(), marcado, escolhida),
+                valor,
+                rotulo,
+                texto,
+                marcado,
+                opcoes,
+                escolhida,
+            });
+        }
+        i
+    }
+
+    fn controle(&mut self, campo: usize, largura: i32, altura: i32) {
         self.espaco = self.espaco.max(4);
-        self.colocar(Desenho::Controle { x: 0, y: 0, largura, altura, texto, botao }, largura);
+        self.colocar(Desenho::Controle { x: 0, y: 0, largura, altura, campo }, largura);
         self.espaco = 4;
+    }
+
+    fn botao(&mut self, tipo: TipoCampo, e: &Elemento, valor: String, rotulo: String) {
+        let largura = self.t.medir(&rotulo, 13, false, false) + 24;
+        let i = self.campo(tipo, e, valor, rotulo, Vec::new(), 0);
+        self.controle(i, largura, ui::ALTURA);
     }
 
     fn entrada(&mut self, e: &Elemento, s: &Estilo) {
         let tipo = e.atributo("type").unwrap_or("text").to_ascii_lowercase();
-        let valor = e.atributo("value").unwrap_or("");
+        let valor = String::from(e.atributo("value").unwrap_or(""));
+        let dica = String::from(e.atributo("placeholder").unwrap_or(""));
+        let colunas = e.atributo("size").and_then(|v| v.parse::<i32>().ok()).unwrap_or(20).clamp(4, 60);
         match tipo.as_str() {
-            "hidden" => {}
-            "submit" | "button" | "reset" => {
-                let padrao = if tipo == "reset" { "Limpar" } else { "Enviar" };
-                self.controle(String::from(if valor.is_empty() { padrao } else { valor }), 0, true);
+            "hidden" => {
+                self.campo(TipoCampo::Oculto, e, valor, String::new(), Vec::new(), 0);
             }
-            "checkbox" | "radio" => self.controle(String::new(), 14, false),
             "image" => self.imagem(e, s),
+            "submit" | "reset" | "button" | "file" => {
+                let (t, padrao) = match tipo.as_str() {
+                    "submit" => (TipoCampo::Enviar, "Enviar"),
+                    "reset" => (TipoCampo::Limpar, "Limpar"),
+                    "file" => (TipoCampo::Botao, "Escolher arquivo…"), // não enviamos arquivos
+                    _ => (TipoCampo::Botao, ""),
+                };
+                let rotulo = if valor.is_empty() || tipo == "file" { String::from(padrao) } else { valor.clone() };
+                self.botao(t, e, valor, rotulo);
+            }
+            "checkbox" | "radio" => {
+                let t = if tipo == "radio" { TipoCampo::Radio } else { TipoCampo::Caixa };
+                let i = self.campo(t, e, valor, String::new(), Vec::new(), 0);
+                self.controle(i, 16, 16);
+            }
             _ => {
-                let texto = if valor.is_empty() { e.atributo("placeholder").unwrap_or("") } else { valor };
-                let colunas = e.atributo("size").and_then(|v| v.parse::<i32>().ok()).unwrap_or(20).clamp(4, 60);
-                self.controle(String::from(texto), colunas * 8, false);
+                let t = if tipo == "password" { TipoCampo::Senha } else { TipoCampo::Texto };
+                let i = self.campo(t, e, valor, dica, Vec::new(), 0);
+                self.controle(i, colunas * 8 + 12, ui::ALTURA);
             }
         }
+    }
+
+    fn lista(&mut self, e: &Elemento) {
+        let mut elementos = Vec::new();
+        e.todos("option", &mut elementos);
+        let opcoes: Vec<(String, String)> = elementos
+            .iter()
+            .map(|o| {
+                let texto = o.texto().split_whitespace().collect::<Vec<_>>().join(" ");
+                (o.atributo("value").map(String::from).unwrap_or_else(|| texto.clone()), texto)
+            })
+            .collect();
+        let escolhida = elementos.iter().position(|o| o.atributo("selected").is_some()).unwrap_or(0);
+        let largura = opcoes.iter().map(|(_, t)| self.t.medir(t, 13, false, false)).max().unwrap_or(40) + 34;
+        let i = self.campo(TipoCampo::Lista, e, String::new(), String::new(), opcoes, escolhida);
+        self.controle(i, largura.min(self.direita - self.esquerda), ui::ALTURA);
     }
 
     fn filhos(&mut self, e: &Elemento, s: &Estilo) {
@@ -431,12 +542,23 @@ impl Diagramador<'_, '_> {
             }
             "img" => return self.imagem(e, pai),
             "input" => return self.entrada(e, pai),
-            "select" => {
-                let primeira = e.achar("option").map(|o| o.texto()).unwrap_or_default();
-                return self.controle(format!("{} ▾", primeira.trim()), 0, false);
+            "select" => return self.lista(e),
+            "textarea" => {
+                let colunas = e.atributo("cols").and_then(|v| v.parse::<i32>().ok()).unwrap_or(40).clamp(10, 80);
+                let dica = String::from(e.atributo("placeholder").unwrap_or(""));
+                let i = self.campo(TipoCampo::AreaTexto, e, e.texto().trim().into(), dica, Vec::new(), 0);
+                return self.controle(i, (colunas * 7 + 12).min(self.direita - self.esquerda), ui::ALTURA);
             }
-            "textarea" => return self.controle(e.texto().trim().into(), 240, false),
-            "button" => return self.controle(e.texto().split_whitespace().collect::<Vec<_>>().join(" "), 0, true),
+            "button" => {
+                let tipo = match e.atributo("type").map(|t| t.to_ascii_lowercase()).as_deref() {
+                    Some("reset") => TipoCampo::Limpar,
+                    Some("button") => TipoCampo::Botao,
+                    _ => TipoCampo::Enviar,
+                };
+                let rotulo = e.texto().split_whitespace().collect::<Vec<_>>().join(" ");
+                let rotulo = if rotulo.is_empty() { String::from("Enviar") } else { rotulo };
+                return self.botao(tipo, e, e.atributo("value").unwrap_or("").into(), rotulo);
+            }
             "iframe" => {
                 if let Some(url) = e.atributo("src").and_then(|s| self.base.juntar(s)) {
                     self.links.push(url);
@@ -567,7 +689,15 @@ impl Diagramador<'_, '_> {
             "q" => self.texto("“", &s),
             _ => {}
         }
+        let formulario_de_fora = self.formulario;
+        if nome == "form" {
+            let acao = e.atributo("action").filter(|a| !a.trim().is_empty()).and_then(|a| self.base.juntar(a.trim()));
+            let post = e.atributo("method").is_some_and(|m| m.eq_ignore_ascii_case("post"));
+            self.formularios.push(Formulario { acao: acao.unwrap_or_else(|| self.base.clone()), post });
+            self.formulario = Some(self.formularios.len() - 1);
+        }
         self.filhos(e, &s);
+        self.formulario = formulario_de_fora;
         match nome {
             "ul" | "ol" | "dir" | "menu" => {
                 self.listas.pop();
@@ -603,6 +733,8 @@ struct Pagina {
     info: String,
     /// `<meta http-equiv="refresh" content="0; url=...">`: ir para lá.
     refresh: Option<Url>,
+    campos: Vec<Campo>,
+    formularios: Vec<Formulario>,
 }
 
 impl Pagina {
@@ -635,6 +767,8 @@ impl Pagina {
             altura: 0,
             info,
             refresh,
+            campos: Vec::new(),
+            formularios: Vec::new(),
         }
     }
 
@@ -682,6 +816,10 @@ impl Pagina {
             ancoras: Vec::new(),
             listas: Vec::new(),
             primeira_celula: true,
+            campos: &mut self.campos,
+            proximo_campo: 0,
+            formularios: Vec::new(),
+            formulario: None,
         };
         // Uma imagem sem src (a página de imagem) é a própria URL.
         if raiz.achar("img").is_some_and(|i| i.atributo("src") == Some("")) {
@@ -693,6 +831,7 @@ impl Pagina {
         self.desenhos = d.saida;
         self.links = d.links;
         self.ancoras = d.ancoras;
+        self.formularios = d.formularios;
         self.largura = largura;
         self.raiz = raiz;
     }
@@ -778,7 +917,8 @@ enum Resultado {
 
 impl Busca {
     /// `excecoes`: os sites cujo certificado o usuário aceitou sem conferir.
-    fn comecar(url: &Url, excecoes: &[String]) -> Option<Busca> {
+    /// `envio`: o corpo de um POST (um formulário).
+    fn comecar(url: &Url, excecoes: &[String], envio: Option<&[u8]>) -> Option<Busca> {
         let (leitura, escrita) = sys::pipe().ok()?;
         match sys::fork() {
             Ok(0) => {
@@ -786,7 +926,7 @@ impl Busca {
                 let mut ultimo = 0;
                 let raizes = ulib::x509::Raizes::do_sistema();
                 let abrir = |u: &Url| http::abrir(u, if excecoes.contains(&u.host) { None } else { Some(&raizes) });
-                let r = http::obter(url, &abrir, &mut |n| {
+                let r = http::obter_com(url, &abrir, envio, &mut |n| {
                     if n - ultimo >= 16 * 1024 {
                         ultimo = n;
                         let mut m = [b'p'; 9];
@@ -906,6 +1046,10 @@ struct Navegador {
     refreshes: u32,
     /// Sites cujo certificado o usuário aceitou sem conferir (nesta sessão).
     excecoes: Vec<String>,
+    /// O corpo do POST do próximo `ir` (um formulário enviado).
+    envio: Option<Vec<u8>>,
+    /// A lista (`<select>`) aberta: (campo, x, y, largura), na página.
+    lista_aberta: Option<(usize, i32, i32, i32)>,
 }
 
 impl Navegador {
@@ -944,6 +1088,8 @@ impl Navegador {
                 return self.ir(u, novo_no_historico);
             }
         }
+        let envio = self.envio.take();
+        self.lista_aberta = None;
         if let Some(b) = self.busca.take() {
             b.cancelar();
         }
@@ -954,7 +1100,7 @@ impl Navegador {
         if let Some(p) = &self.pagina {
             let mut sem = url.clone();
             sem.fragmento = p.url.fragmento.clone();
-            if sem == p.url && !url.fragmento.is_empty() && novo_no_historico {
+            if sem == p.url && !url.fragmento.is_empty() && novo_no_historico && envio.is_none() {
                 self.lembrar_rolagem();
                 self.historico.truncate(self.atual + 1);
                 self.historico.push((url.clone(), 0));
@@ -1001,7 +1147,7 @@ impl Navegador {
                 self.mostrar(p, novo_no_historico);
             }
             _ => {
-                self.busca = Busca::comecar(&url, &self.excecoes);
+                self.busca = Busca::comecar(&url, &self.excecoes, envio.as_deref());
                 self.busca_nova = novo_no_historico;
                 if self.busca.is_none() {
                     self.mostrar(pagina_de_erro(url, "não consegui criar o processo do download"), novo_no_historico);
@@ -1127,7 +1273,7 @@ impl Navegador {
                 if let Some(i) = p.imagens.iter().position(|im| matches!(im.estado, EstadoImagem::Esperando)) {
                     let url = p.imagens[i].url.clone();
                     match url.esquema.as_str() {
-                        "http" | "https" => match Busca::comecar(&url, &self.excecoes) {
+                        "http" | "https" => match Busca::comecar(&url, &self.excecoes, None) {
                             Some(b) => self.busca_imagem = Some((b, i)),
                             None => p.imagens[i].estado = EstadoImagem::Falhou,
                         },
@@ -1144,6 +1290,40 @@ impl Navegador {
                 }
             }
         }
+    }
+
+    /// Envia o formulário `f` (com o botão `botao`, que também vai junto).
+    fn enviar(&mut self, f: usize, botao: Option<usize>) {
+        let Some(p) = self.pagina.as_ref() else { return };
+        let mut pares = Vec::new();
+        for (i, c) in p.campos.iter().enumerate() {
+            if c.formulario != Some(f) || c.nome.is_empty() {
+                continue;
+            }
+            let valor = match c.tipo {
+                t if t.de_texto() => Some(c.texto.texto.clone()),
+                TipoCampo::Oculto => Some(c.valor.clone()),
+                TipoCampo::Caixa | TipoCampo::Radio if c.marcado => Some(if c.valor.is_empty() { "on".into() } else { c.valor.clone() }),
+                TipoCampo::Lista => c.opcoes.get(c.escolhida).map(|(v, _)| v.clone()),
+                TipoCampo::Enviar if Some(i) == botao => Some(c.valor.clone()),
+                _ => None,
+            };
+            if let Some(v) = valor {
+                pares.push((c.nome.clone(), v));
+            }
+        }
+        let dados = http::codificar_formulario(&pares);
+        let formulario = &p.formularios[f];
+        let mut url = formulario.acao.clone();
+        url.fragmento.clear();
+        if formulario.post {
+            self.envio = Some(dados.into_bytes());
+        } else {
+            // GET: os dados vão no endereço, no lugar da "query" que houver.
+            let caminho = url.caminho.split('?').next().unwrap_or("/").to_string();
+            url.caminho = format!("{}?{}", caminho, dados);
+        }
+        self.ir(url, true);
     }
 
     fn voltar(&mut self) {
@@ -1262,12 +1442,18 @@ impl Navegador {
         t.q.retangulo(area.x, area.y, area.largura, area.altura, COR_PAGINA);
         let mouse = area.mouse.map(|(x, y)| (x, y + self.rolagem));
         let mut link_sobre = None;
+        let mut controle_sobre = None;
         if let Some(p) = self.pagina.as_ref() {
-            if let Some((mx, my)) = mouse {
-                link_sobre = p.desenhos.iter().find_map(|d| {
+            if let Some((mx, my)) = mouse.filter(|_| self.lista_aberta.is_none()) {
+                let embaixo = p.desenhos.iter().find(|d| {
                     let (x, y, l, a) = d.caixa();
-                    (mx >= x && my >= y && mx < x + l && my < y + a).then(|| d.link()).flatten()
+                    mx >= x && my >= y && mx < x + l && my < y + a
                 });
+                link_sobre = embaixo.and_then(|d| d.link());
+                controle_sobre = match embaixo {
+                    Some(Desenho::Controle { campo, .. }) if !p.campos[*campo].tipo.de_texto() => Some(*campo),
+                    _ => None,
+                };
             }
             let (y0, y1) = (self.rolagem, self.rolagem + altura_area);
             for d in &p.desenhos {
@@ -1303,15 +1489,9 @@ impl Navegador {
                         }
                     }
                     Desenho::Retangulo { cor, .. } => t.q.retangulo(sx, sy, l, a, *cor),
-                    Desenho::Controle { texto, botao, .. } => {
-                        t.q.retangulo_arredondado(sx, sy, l, a, 0xA0A0A0);
-                        t.q.retangulo_arredondado(sx + 1, sy + 1, l - 2, a - 2, if *botao { 0xEDEDED } else { 0xFFFFFF });
-                        let antes = t.q.recorte;
-                        t.q.recortar(sx + 2, sy, l - 4, a);
-                        let cor = if *botao { COR_TEXTO } else { COR_FRACA };
-                        let tx = if *botao { sx + (l - t.medir(texto, 13, false, false)) / 2 } else { sx + 6 };
-                        t.escrever(tx, sy + 4, texto, cor, false, 13);
-                        t.q.recorte = antes;
+                    Desenho::Controle { campo, .. } => {
+                        let sobre = controle_sobre == Some(*campo);
+                        desenhar_controle(t, &p.campos[*campo], (sx, sy, l, a), sobre && area.apertado, sobre);
                     }
                     Desenho::Imagem { indice, link, .. } => match &p.imagens[*indice].estado {
                         EstadoImagem::Pronta(img) => {
@@ -1327,6 +1507,25 @@ impl Navegador {
                     },
                 }
             }
+            // A lista aberta, por cima de tudo.
+            if let Some((i, x, y, largura)) = self.lista_aberta {
+                let c = &p.campos[i];
+                let (sx, sy) = (area.x + x, area.y + y - self.rolagem);
+                let altura = c.opcoes.len() as i32 * 22 + 4;
+                t.q.retangulo(sx, sy, largura, altura, 0xFFFFFF);
+                t.q.moldura(sx, sy, largura, altura, 0x909090);
+                for (n, (_, texto)) in c.opcoes.iter().enumerate() {
+                    let oy = sy + 2 + n as i32 * 22;
+                    let sobre = area.mouse.is_some_and(|(mx, my)| {
+                        let (mx, my) = (mx + area.x, my + area.y);
+                        mx >= sx && mx < sx + largura && my >= oy && my < oy + 22
+                    });
+                    if sobre || n == c.escolhida && area.mouse.is_none() {
+                        t.q.retangulo(sx + 2, oy, largura - 4, 22, if sobre { 0xD6E4F5 } else { 0xEEEEEE });
+                    }
+                    t.escrever(sx + 8, oy + 3, texto, COR_TEXTO, n == c.escolhida, 13);
+                }
+            }
             // A barra de rolagem.
             if altura_pagina > altura_area {
                 let alca = (altura_area * altura_area / altura_pagina).max(24);
@@ -1334,14 +1533,92 @@ impl Navegador {
                 t.q.retangulo_redondo(area.x + area.largura - 8, y + 2, 5, alca - 4, 2, 0xB0B0B0);
             }
         }
+        // Os campos de texto são componentes de verdade (foco, cursor,
+        // teclado); sempre todos, na mesma ordem (o foco é pela ordem). Os
+        // que não estão inteiros à vista ficam longe, fora da tela.
+        let mut enviar = None;
+        let mut rolar_para = None;
+        if let Some(p) = self.pagina.as_mut() {
+            for d in &p.desenhos {
+                let Desenho::Controle { x, y, largura, altura, campo } = *d else { continue };
+                let c = &mut p.campos[campo];
+                if !c.tipo.de_texto() {
+                    continue;
+                }
+                let (sx, sy) = (area.x + x, area.y + y - self.rolagem);
+                let inteiro = sy >= area.y && sy + altura <= area.y + area.altura && self.lista_aberta.is_none();
+                let (enter, focado) = if inteiro { t.campo_solto(&mut c.texto, sx, sy, largura) } else { t.campo_solto(&mut c.texto, -10000, -10000, largura) };
+                if inteiro && !focado && c.texto.texto.is_empty() && !c.rotulo.is_empty() {
+                    let antes = t.q.recorte;
+                    t.q.recortar(sx + 3, sy, largura - 6, altura);
+                    t.escrever(sx + 7, sy + 5, &c.rotulo, 0x9A9A9A, false, 13);
+                    t.q.recorte = antes;
+                }
+                if focado && !inteiro {
+                    rolar_para = Some(y - altura_area / 3); // o Tab foi para um campo fora da vista
+                }
+                if enter && c.tipo != TipoCampo::AreaTexto {
+                    // Enter num campo envia o formulário (como o primeiro botão de enviar).
+                    if let Some(f) = c.formulario {
+                        let botao = p.campos.iter().position(|b| b.formulario == Some(f) && b.tipo == TipoCampo::Enviar);
+                        enviar = Some((f, botao));
+                    }
+                }
+            }
+        }
         t.q.recorte = antes;
-        // O clique num link.
+        if let Some(r) = rolar_para {
+            self.rolagem = r.max(0);
+            t.redesenhar();
+        }
+        // Os cliques: na lista aberta, num controle, num link.
         if area.clique {
-            if let (Some(i), Some(p)) = (link_sobre, self.pagina.as_ref()) {
+            if let Some((i, x, y, largura)) = self.lista_aberta.take() {
+                if let (Some((mx, my)), Some(p)) = (mouse, self.pagina.as_mut()) {
+                    let n = (my - y - 2).div_euclid(22);
+                    if mx >= x && mx < x + largura && n >= 0 && (n as usize) < p.campos[i].opcoes.len() {
+                        p.campos[i].escolhida = n as usize;
+                    }
+                }
+            } else if let (Some(i), Some(p)) = (controle_sobre, self.pagina.as_mut()) {
+                let (tipo, formulario) = (p.campos[i].tipo, p.campos[i].formulario);
+                match tipo {
+                    TipoCampo::Caixa => p.campos[i].marcado = !p.campos[i].marcado,
+                    TipoCampo::Radio => {
+                        let nome = p.campos[i].nome.clone();
+                        for c in p.campos.iter_mut().filter(|c| c.tipo == TipoCampo::Radio && c.nome == nome && c.formulario == formulario) {
+                            c.marcado = false;
+                        }
+                        p.campos[i].marcado = true;
+                    }
+                    TipoCampo::Lista => {
+                        let caixa = p.desenhos.iter().find_map(|d| match *d {
+                            Desenho::Controle { x, y, largura, altura, campo } if campo == i => Some((x, y + altura, largura)),
+                            _ => None,
+                        });
+                        if let Some((x, y, largura)) = caixa {
+                            self.lista_aberta = Some((i, x, y, largura.max(120)));
+                        }
+                    }
+                    TipoCampo::Enviar => enviar = formulario.map(|f| (f, Some(i))),
+                    TipoCampo::Limpar => {
+                        for c in p.campos.iter_mut().filter(|c| c.formulario.is_some() && c.formulario == formulario) {
+                            c.texto.mudar(&c.inicial.0);
+                            (c.marcado, c.escolhida) = (c.inicial.1, c.inicial.2);
+                        }
+                    }
+                    _ => {}
+                }
+                t.redesenhar();
+            } else if let (Some(i), Some(p)) = (link_sobre, self.pagina.as_ref()) {
                 let url = p.links[i].clone();
                 self.ir(url, true);
                 t.redesenhar();
             }
+        }
+        if let Some((f, botao)) = enviar {
+            self.enviar(f, botao);
+            t.redesenhar();
         }
         // A barra de estado.
         let y = t.q.altura - BARRA_ESTADO;
@@ -1349,6 +1626,11 @@ impl Navegador {
         t.q.retangulo(0, y, largura_janela, 1, tema.borda);
         let texto = if let (Some(i), Some(p)) = (link_sobre, self.pagina.as_ref()) {
             p.links[i].texto()
+        } else if let (Some(i), Some(p)) = (controle_sobre, self.pagina.as_ref()) {
+            match (p.campos[i].tipo, p.campos[i].formulario.and_then(|f| p.formularios.get(f))) {
+                (TipoCampo::Enviar, Some(f)) => format!("Enviar o formulário para {}", f.acao.texto()),
+                _ => String::new(),
+            }
         } else if let Some(b) = &self.busca {
             format!("Carregando {}… {}", b.url.host, if b.recebidos > 0 { tamanho_legivel(b.recebidos) } else { String::new() })
         } else if let Some((b, _)) = &self.busca_imagem {
@@ -1357,6 +1639,56 @@ impl Navegador {
             self.pagina.as_ref().map_or(String::new(), |p| p.info.clone())
         };
         t.escrever(10, y + 4, &texto, tema.texto_fraco, false, 12);
+    }
+}
+
+/// Um controle de formulário, sem interação (os campos de texto, quando
+/// estão inteiros à vista, são desenhados pelo componente da `ui`).
+fn desenhar_controle(t: &mut Tela, c: &Campo, (x, y, l, a): (i32, i32, i32, i32), apertado: bool, sobre: bool) {
+    let borda = if sobre { 0x5A7FB4 } else { 0x9A9A9A };
+    match c.tipo {
+        TipoCampo::Caixa => {
+            t.q.retangulo_redondo(x, y, l, a, 3, borda);
+            t.q.retangulo_redondo(x + 1, y + 1, l - 2, a - 2, 2, if c.marcado { COR_LINK } else { 0xFFFFFF });
+            if c.marcado {
+                t.escrever(x + 2, y, "✓", 0xFFFFFF, true, 13);
+            }
+        }
+        TipoCampo::Radio => {
+            t.q.retangulo_redondo(x, y, l, a, l / 2, borda);
+            t.q.retangulo_redondo(x + 1, y + 1, l - 2, a - 2, l / 2 - 1, 0xFFFFFF);
+            if c.marcado {
+                t.q.retangulo_redondo(x + 4, y + 4, l - 8, a - 8, l / 2 - 4, COR_LINK);
+            }
+        }
+        TipoCampo::Enviar | TipoCampo::Limpar | TipoCampo::Botao => {
+            t.q.retangulo_arredondado(x, y, l, a, borda);
+            t.q.retangulo_arredondado(x + 1, y + 1, l - 2, a - 2, if apertado { 0xD4D4D4 } else if sobre { 0xF6F6F6 } else { 0xEAEAEA });
+            let cor = if c.tipo == TipoCampo::Botao { COR_FRACA } else { COR_TEXTO };
+            let largura = t.medir(&c.rotulo, 13, false, false);
+            t.escrever(x + (l - largura) / 2, y + 5, &c.rotulo, cor, false, 13);
+        }
+        TipoCampo::Lista => {
+            t.q.retangulo_arredondado(x, y, l, a, borda);
+            t.q.retangulo_arredondado(x + 1, y + 1, l - 2, a - 2, if sobre { 0xF6F6F6 } else { 0xFFFFFF });
+            let antes = t.q.recorte;
+            t.q.recortar(x + 2, y, l - 22, a);
+            let texto = c.opcoes.get(c.escolhida).map_or("", |(_, t)| t.as_str());
+            t.escrever(x + 8, y + 5, texto, COR_TEXTO, false, 13);
+            t.q.recorte = antes;
+            t.escrever(x + l - 18, y + 4, "▾", COR_FRACA, false, 13);
+        }
+        TipoCampo::Oculto => {}
+        _ => {
+            // Um campo de texto meio fora da vista.
+            t.q.retangulo_arredondado(x, y, l, a, 0x9A9A9A);
+            t.q.retangulo_arredondado(x + 1, y + 1, l - 2, a - 2, 0xFFFFFF);
+            let antes = t.q.recorte;
+            t.q.recortar(x + 3, y, l - 6, a);
+            let (texto, cor) = if c.texto.texto.is_empty() { (c.rotulo.clone(), 0x9A9A9A) } else { (c.texto.visivel(), COR_TEXTO) };
+            t.escrever(x + 7, y + 5, &texto, cor, false, 13);
+            t.q.recorte = antes;
+        }
     }
 }
 
@@ -1383,6 +1715,8 @@ fn principal(args: &[&str]) -> i32 {
         rolagem_pendente: None,
         refreshes: 0,
         excecoes: Vec::new(),
+        envio: None,
+        lista_aberta: None,
     };
     let primeira = args.get(1).and_then(|a| Navegador::interpretar_endereco(a)).or_else(|| Url::ler(INICIO)).unwrap();
     nav.ir(primeira, true);
