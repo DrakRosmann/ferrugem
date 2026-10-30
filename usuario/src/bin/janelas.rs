@@ -540,12 +540,12 @@ impl Janela {
         }
     }
 
-    fn desenhar(&self, q: &mut Quadro, letras: &mut Letras, ativa: bool) {
+    fn desenhar(&self, q: &mut Quadro, letras: &mut Letras, ativa: bool, destaque: u32) {
         let (w, h) = (self.largura_total(), self.altura_total());
         q.retangulo(self.x + 4, self.y + 4, w, h, 0x0E2630); // sombra
         q.retangulo(self.x, self.y, w, h, COR_BORDA);
         let (cx, cy) = (self.x + BORDA, self.y + BORDA);
-        q.retangulo(cx, cy, self.largura, TITULO, if ativa { COR_ATIVA } else { COR_INATIVA });
+        q.retangulo(cx, cy, self.largura, TITULO, if ativa { destaque } else { COR_INATIVA });
         let espaco_titulo = (cx, cy, self.largura - 3 * 18 - 4, TITULO);
         com_recorte(q, espaco_titulo, |q| {
             letras.escrever(q, cx + 6, cy, TITULO, &self.titulo, COR_TEXTO, true);
@@ -593,12 +593,13 @@ const BARRA: i32 = 30;
 const ITEM_MENU: i32 = 26;
 
 /// O menu Aplicativos: (rótulo, programa). O primeiro e o último são especiais.
-const APLICATIVOS: [(&str, &str); 9] = [
+const APLICATIVOS: [(&str, &str); 10] = [
     ("Terminal", ""),
     ("Arquivos", "arquivos"),
     ("Editor de texto", "editor"),
     ("Imagens", "imagens"),
     ("Monitor do sistema", "monitor"),
+    ("Configurações", "configuracoes"),
     ("Componentes", "componentes"),
     ("Fontes", "fontes"),
     ("Pintar", "pintar"),
@@ -754,6 +755,7 @@ impl Servidor {
     }
 
     fn desenhar_area_de_trabalho(&mut self, q: &mut Quadro) {
+        let destaque = self.ajustes.destaque;
         let (largura, altura) = (self.largura, self.altura);
         let entradas = self.entradas_barra();
         let ativa = self.ativa();
@@ -774,22 +776,22 @@ impl Servidor {
             }
         }
         for (i, j) in self.janelas.iter().enumerate().filter(|(_, j)| !j.minimizada) {
-            j.desenhar(q, &mut self.letras, Some(i) == ativa);
+            j.desenhar(q, &mut self.letras, Some(i) == ativa, destaque);
         }
         if let Some((x, y, w, h)) = contorno {
-            q.moldura(x, y, w, h, COR_ATIVA);
-            q.moldura(x + 1, y + 1, w - 2, h - 2, COR_ATIVA);
+            q.moldura(x, y, w, h, destaque);
+            q.moldura(x + 1, y + 1, w - 2, h - 2, destaque);
         }
         // O painel de cima: Aplicativos, o relógio no meio e o botão do painel de controle.
         q.retangulo(0, 0, largura, PAINEL, COR_PAINEL);
         let (ax, ay, aw, ah) = self.area_aplicativos;
-        q.retangulo_redondo(ax, ay, aw, ah, 9, if self.menu_aberto { COR_ATIVA } else { 0x30353F });
+        q.retangulo_redondo(ax, ay, aw, ah, 9, if self.menu_aberto { destaque } else { 0x30353F });
         self.letras.escrever(q, ax + 10, ay, ah, "Aplicativos", COR_TEXTO, true);
         let relogio = self.texto_do_relogio();
         let w = self.letras.largura(&relogio, true);
         self.letras.escrever(q, (largura - w) / 2, 0, PAINEL, &relogio, COR_TEXTO, true);
         let (sx, sy, sw, sh) = self.area_status;
-        let fundo_status = if self.controle_aberto { COR_ATIVA } else { COR_PAINEL };
+        let fundo_status = if self.controle_aberto { destaque } else { COR_PAINEL };
         q.retangulo_redondo(sx, sy, sw, sh, 9, fundo_status);
         let mut x = sx + 10;
         if self.ajustes.noturna {
@@ -803,7 +805,7 @@ impl Servidor {
         for (i, (x, y, w, h)) in entradas {
             let j = &self.janelas[i];
             let cor = if Some(i) == ativa {
-                COR_ATIVA
+                destaque
             } else if j.minimizada {
                 0x252930
             } else {
@@ -827,7 +829,7 @@ impl Servidor {
             for (k, (rotulo, _)) in APLICATIVOS.iter().enumerate() {
                 let iy = my + 4 + k as i32 * ITEM_MENU;
                 if sobre == Some(k as i32) {
-                    q.retangulo(mx + 1, iy, mw - 2, ITEM_MENU, COR_ATIVA);
+                    q.retangulo(mx + 1, iy, mw - 2, ITEM_MENU, destaque);
                 }
                 if k == APLICATIVOS.len() - 1 {
                     q.retangulo(mx + 8, iy - 1, mw - 16, 1, 0x4C566A);
@@ -1628,6 +1630,8 @@ struct Ajustes {
     brilho: i32,
     /// O papel de parede (um PNG), ou vazio.
     fundo: String,
+    /// A cor de destaque (título da janela ativa, botões ligados...).
+    destaque: u32,
 }
 
 impl Ajustes {
@@ -1643,6 +1647,7 @@ impl Ajustes {
             cursor_grande: false,
             brilho: 100,
             fundo: String::new(),
+            destaque: COR_ATIVA,
         };
         let texto = sys::ler_arquivo(&Self::arquivo()).unwrap_or_default();
         for linha in String::from_utf8_lossy(&texto).lines() {
@@ -1655,6 +1660,7 @@ impl Ajustes {
                 "cursor_grande" => a.cursor_grande = ligado,
                 "brilho" => a.brilho = valor.trim().parse().unwrap_or(100),
                 "fundo" => a.fundo = String::from(valor.trim()),
+                "destaque" => a.destaque = u32::from_str_radix(valor.trim().trim_start_matches('#'), 16).unwrap_or(COR_ATIVA),
                 _ => {}
             }
         }
@@ -1664,8 +1670,14 @@ impl Ajustes {
 
     fn salvar(&self) {
         let texto = format!(
-            "escuro={}\nnoturna={}\nsegundos={}\ncursor_grande={}\nbrilho={}\nfundo={}\n",
-            self.escuro as u8, self.noturna as u8, self.segundos as u8, self.cursor_grande as u8, self.brilho, self.fundo
+            "escuro={}\nnoturna={}\nsegundos={}\ncursor_grande={}\nbrilho={}\nfundo={}\ndestaque=#{:06X}\n",
+            self.escuro as u8,
+            self.noturna as u8,
+            self.segundos as u8,
+            self.cursor_grande as u8,
+            self.brilho,
+            self.fundo,
+            self.destaque
         );
         let fd = sys::abrir_com_permissoes(&Self::arquivo(), sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC, 0o644);
         if let Ok(fd) = fd {
@@ -1786,8 +1798,8 @@ impl Servidor {
     }
 
     fn mandar_tema(&self, fd: i32) {
-        let tema = if self.ajustes.escuro { "tema escuro\n" } else { "tema claro\n" };
-        let _ = sys::escrever_tudo(fd, tema.as_bytes());
+        let estilo = if self.ajustes.escuro { "escuro" } else { "claro" };
+        let _ = sys::escrever_tudo(fd, format!("tema {} {:06X}\n", estilo, self.ajustes.destaque).as_bytes());
     }
 
     fn fechar_controle(&mut self) {
@@ -1988,7 +2000,7 @@ impl Servidor {
     /// Desenha o painel de controle aberto.
     fn desenhar_controle(&mut self, q: &mut Quadro) {
         let (px, py, pw, ph) = self.area_controle();
-        let destaque = COR_ATIVA;
+        let destaque = self.ajustes.destaque;
         let botoes = self.botoes_controle();
         let ligados: Vec<bool> = (0..BLOCOS.len()).map(|i| self.bloco_ligado(i)).collect();
         q.retangulo_redondo(px + 2, py + 4, pw, ph, 20, 0x0A0B0D);
@@ -2073,7 +2085,7 @@ impl Servidor {
         let data = relogio.rsplit_once("  ").map_or(relogio.as_str(), |(dia, _)| dia).to_string();
         letras.centrado(q, l / 2, a / 2 - 70, &data, PC_TEXTO_FRACO, false, 18);
         let nome = ulib::usuarios::nome_do_usuario(sys::uid());
-        q.circulo_suave(l, a - 40, 48, COR_ATIVA);
+        q.circulo_suave(l, a - 40, 48, self.ajustes.destaque);
         letras.centrado(q, l / 2, a / 2 - 20 - 15, &nome[..nome.len().min(1)].to_uppercase(), PC_TEXTO, true, 24);
         letras.centrado(q, l / 2, a / 2 + 34, &nome, PC_TEXTO, true, 16);
         let (fx, fy, fw) = (l / 2 - 140, a / 2 + 70, 280);

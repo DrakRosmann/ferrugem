@@ -13,7 +13,7 @@
 //!   servidor → cliente:  ok 12\n  tecla 97\n  seta A\n  botao 10 20 1 1\n  mover 11 21\n
 //!                        roda 11 21 -1\n  fechar\n  colar <texto>\n
 //!                        tamanho 400 300 13\n   (redimensionada: a imagem nova é o segmento 13)
-//!                        tema escuro\n  tema claro\n   (o estilo escolhido no painel de controle)
+//!                        tema escuro B7410E\n   (o estilo e a cor de destaque escolhidos)
 //!
 //! O texto da área de transferência vai numa linha só: `\\` vira `\\\\` e a
 //! quebra de linha vira `\\n`.
@@ -67,8 +67,9 @@ pub enum Evento {
     Tamanho { largura: i32, altura: i32 },
     /// A resposta de `pedir_colagem`: o texto da área de transferência.
     Colar(String),
-    /// O estilo escuro foi ligado ou desligado (no painel de controle).
-    Tema { escuro: bool },
+    /// O estilo (claro ou escuro) e a cor de destaque, escolhidos no painel
+    /// de controle ou nas configurações.
+    Tema { escuro: bool, destaque: Option<u32> },
 }
 
 /// Muda um ajuste da interface em ~/.janelas (ex.: "fundo" = o papel de
@@ -219,7 +220,11 @@ impl Janela {
                 },
                 Some("fechar") => Some(Evento::Fechar),
                 Some("colar") => Some(Evento::Colar(desescapar(linha.get(6..).unwrap_or("")))),
-                Some("tema") => Some(Evento::Tema { escuro: partes.next() == Some("escuro") }),
+                Some("tema") => {
+                    let escuro = partes.next() == Some("escuro");
+                    let destaque = partes.next().and_then(|c| u32::from_str_radix(c, 16).ok());
+                    Some(Evento::Tema { escuro, destaque })
+                }
                 Some("tamanho") => {
                     let (largura, altura, id) = (numero(), numero(), numero());
                     match sys::shmat(id) {

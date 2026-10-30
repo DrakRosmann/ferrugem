@@ -442,8 +442,15 @@ impl Ui {
             }),
             Evento::Fechar => self.sair = true,
             Evento::Tamanho { .. } => self.redesenhar = true,
-            Evento::Tema { escuro } => {
+            Evento::Tema { escuro, destaque } => {
                 self.tema = if escuro { TEMA_ESCURO } else { TEMA_CLARO };
+                if let Some(d) = destaque {
+                    self.tema.destaque = d;
+                    // o realce (item sob o mouse): um pouco do destaque sobre o fundo
+                    let (fundo, peso) = if escuro { (self.tema.campo, 64) } else { (0xFFFFFF, 40) };
+                    let canal = |c: u32, s: u32| ((c >> s & 0xFF) * peso + (fundo >> s & 0xFF) * (255 - peso)) / 255;
+                    self.tema.realce = canal(d, 16) << 16 | canal(d, 8) << 8 | canal(d, 0);
+                }
                 self.redesenhar = true;
             }
             // O texto colado vai para quem tem o foco.
@@ -607,6 +614,15 @@ impl Tela<'_> {
     /// Reserva um espaço para o programa desenhar o que quiser (em `t.q`); devolve onde.
     pub fn reservar(&mut self, largura: i32, altura: i32) -> (i32, i32) {
         self.alocar(largura, altura)
+    }
+
+    /// Uma área que o programa desenha e que pode ser clicada (miniaturas,
+    /// amostras de cor...): devolve (onde, mouse por cima, clicada).
+    pub fn clicavel(&mut self, largura: i32, altura: i32) -> ((i32, i32), bool, bool) {
+        let (x, y) = self.alocar(largura, altura);
+        let id = self.novo_id();
+        let (sobre, clicado) = self.interagir(id, (x, y, largura, altura), false);
+        ((x, y), sobre, clicado)
     }
 
     /// Uma seta que nenhum componente usou (um atalho do programa, como
