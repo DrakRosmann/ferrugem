@@ -38,7 +38,7 @@ fn ler_ajustes() -> Vec<(String, String)> {
 
 /// Uma miniatura do papel de parede (cobrindo o quadrinho, sem deformar).
 fn miniatura(caminho: &str) -> Option<Vec<u32>> {
-    let img = png::decodificar(&sys::ler_arquivo(caminho).ok()?)?;
+    let img = png::decodificar_imagem(&sys::ler_arquivo(caminho).ok()?)?;
     let (l, a) = MINIATURA;
     let (iw, ih) = (img.largura as i32, img.altura as i32);
     let escala = (l as f32 / iw as f32).max(a as f32 / ih as f32);

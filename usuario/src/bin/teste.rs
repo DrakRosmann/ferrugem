@@ -1813,6 +1813,182 @@ fn rede_placa() -> R {
     }
 }
 
+/// JPEG: baseline (4:2:0, com marcadores de reinício), progressivo e cinza,
+/// feitos pelo Pillow a partir de um degradê conhecido; os pixels decodificados
+/// têm que bater com a fórmula (o JPEG perde um pouco: há uma tolerância).
+fn jpeg() -> R {
+    let cor = |x: u32, y: u32| (x * 6, y * 10, 255 - x * 5);
+    let casos = [
+        ("baseline", false, de_hex(concat!(
+            "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504",
+            "040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affdb0043010202",
+            "02020202050303050a0706070a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+            "0a0a0a0a0a0a0a0a0a0a0a0a0a0affc00011080018002803012200021101031101ffc4001f0000010501010101010100",
+            "000000000000000102030405060708090a0bffc400b5100002010303020403050504040000017d010203000411051221",
+            "31410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a",
+            "434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a9293949596979899",
+            "9aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1",
+            "f2f3f4f5f6f7f8f9faffc4001f0100030101010101010101010000000000000102030405060708090a0bffc400b51100",
+            "020102040403040705040400010277000102031104052131061241510761711322328108144291a1b1c109233352f015",
+            "6272d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758595a63646566676869",
+            "6a737475767778797a82838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4",
+            "c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9faffdd00040003ffda000c0301000211",
+            "0311003f00fcd7d27e0a74ff0044fa7cb5d3e93f05338ff44ffc76be94d27e0a74ff0044ff00c76ba8d27e0a74ff0044",
+            "ff00c76bfd31f1038f3e3f78fc57807c4cf83dff00c4f9ab49f829d3369f5f96ba7d27e0a631fe87d3fd9afa5749f829",
+            "d3fd13ebf2d74fa4fc14e9fe89ff008ed7f0f7881c7bf1fbe7f6d700f899f07be7cd5a4fc14e9fe89f4f968afaf349f8",
+            "29d3fd13e9f2d15fc7d9ef1eff00c284bdf3faef23f133fd823ef9ffd0f4fd27e0a74ff44ebfecd74fa4fc14e9fe87ff",
+            "008ed1457efde206718ff7fde3fcb3e01cff0033f73dfec751a4fc14e9fe89f5f96ba7d27e0a74ff0044e9fecd1457f0",
+            "ff008819c63fdff78fedae01cff33f73df3a7d27e0a74c5a7d3e5a28a2bf8fb3dce31ffda12f78febbc8f3fccfea11f7",
+            "cfffd9",
+        ))),
+        ("progressivo", false, de_hex(concat!(
+            "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504",
+            "040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affdb0043010202",
+            "02020202050303050a0706070a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+            "0a0a0a0a0a0a0a0a0a0a0a0a0a0affc20011080018002803012200021101031101ffc400180001010101010000000000",
+            "0000000000000005070408ffc40017010100030000000000000000000000000007060809ffda000c0301000210031000",
+            "0001f35d3d2aa5988566b4f4ba61edb9ab5e0f2ef7d41e3312a5303db6a01e5dffc40016100003000000000000000000",
+            "0000000000000305ffda000801010001050254515145451514545151454515145451514545151454515145453fffc400",
+            "1c1100020203010100000000000000000000042100050106311323ffda0008010301013f01a0d9b8e506cdc701d9be18",
+            "7280f2539407929c04f27c30e7ffc4001d110001040301010000000000000000000021000304060105311424ffda0008",
+            "010201013f01b06fba55837dd2a76fbe8c956098f92ac131f254e98ffa3257ffc4001510010100000000000000000000",
+            "000000000032ffda0008010100063f0294a5094a5294a5094a5fffc40016100003000000000000000000000000000000",
+            "01f0ffda0008010100013f21ba2e8ba2c8ba2e8ba2e8ba2e8ba2c8ba2e8ba3ffda000c030100020003000000107940e0",
+            "703fffc4001611010101000000000000000000000000001091f1ffda0008010301013f10d34cb1ebddffc40014110100",
+            "000000000000000000000000000020ffda0008010201013f1044f931a8ffc40019100003010101000000000000000000",
+            "0000001131915171ffda0008010100013f108e435145fb095c08e444a251d88947223d88847623c88af23fffd9",
+        ))),
+        ("cinza", true, de_hex(concat!(
+            "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504",
+            "040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affc0000b080018",
+            "002801011100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400b51000020103",
+            "03020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f024336272",
+            "82090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475",
+            "767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9",
+            "cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda0008010100003f00fcd7d27e0a74ff00",
+            "44fa7cb5d3e93f05338ff44ffc76ba7d27e0a74cda7d7e5ae9f49f8298c7fa1f4ff66ba7d27e0a74ff0044fa7cb5bfa4",
+            "fc14e9fe89ff008ed751a4fc14e9fe89ff008ed74fa4fc14e9fe89f5f96ba7d27e0a74ff0044ff00c76ba7d27e0a74ff",
+            "0044fa7cb5bfa4fc14e9fe89d7fd9ae9f49f829d3fd0ff00f1daea349f829d3fd13ebf2d74fa4fc14e9fe89d3fd9ae9f",
+            "49f829d3169f4f96bfffd9",
+        ))),
+    ];
+    for (nome, cinza, dados) in casos {
+        let img = ulib::jpeg::decodificar(&dados).ok_or_else(|| format!("{}: não decodificou", nome))?;
+        if (img.largura, img.altura) != (40, 24) {
+            return Err(format!("{}: {}×{}", nome, img.largura, img.altura));
+        }
+        let (mut soma, mut maior) = (0u32, 0u32);
+        for (i, p) in img.pixels.iter().enumerate() {
+            let (r, g, b) = cor(i as u32 % 40, i as u32 / 40);
+            let esperado = if cinza {
+                let l = (r * 299 + g * 587 + b * 114 + 500) / 1000;
+                [l, l, l]
+            } else {
+                [r, g, b]
+            };
+            for (k, e) in esperado.iter().enumerate() {
+                let d = ((p >> (16 - 8 * k)) & 0xFF).abs_diff(*e);
+                soma += d;
+                maior = maior.max(d);
+            }
+        }
+        let medio = soma as f32 / (img.pixels.len() * 3) as f32;
+        if maior > 16 || medio > 3.0 {
+            return Err(format!("{}: erro médio {:.1}, maior {}", nome, medio, maior));
+        }
+    }
+    // Lixo e um JPEG cortado no meio não podem derrubar o decodificador.
+    let cortado = de_hex(concat!(
+            "ffd8ffe000104a46494600010100000100010000ffdb0043000201010101010201010102020202020403020202020504",
+            "040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affdb0043010202",
+            "02020202050303050a0706070a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+            "0a0a0a0a0a0a0a0a0a0a0a0a0a0affc20011080018002803012200021101031101ffc400180001010101010000000000",
+            "0000000000000005070408ffc40017010100030000000000000000000000000007060809ffda000c0301000210031000",
+            "0001f35d3d2aa5988566b4f4ba61edb9ab5e0f2ef7d41e3312a5303db6a01e5dffc40016100003000000000000000000",
+            "0000000000000305ffda000801010001050254515145451514545151454515145451514545151454515145453fffc400",
+            "1c1100020203010100000000000000000000042100050106311323ffda0008010301013f01a0d9b8e506cdc701d9be18",
+            "7280f2539407929c04f27c30e7ffc4001d110001040301010000000000000000000021000304060105311424ffda0008",
+            "010201013f01b06fba55837dd2a76fbe8c956098f92ac131f254e98ffa3257ffc4001510010100000000000000000000",
+            "000000000032ffda0008010100063f0294a5094a5294a5094a5fffc40016100003000000000000000000000000000000",
+            "01f0ffda0008010100013f21ba2e8ba2c8ba2e8ba2e8ba2e8ba2c8ba2e8ba3ffda000c030100020003000000107940e0",
+            "703fffc4001611010101000000000000000000000000001091f1ffda0008010301013f10d34cb1ebddffc40014110100",
+            "000000000000000000000000000020ffda0008010201013f1044f931a8ffc40019100003010101000000000000000000",
+            "0000001131915171ffda0008010100013f108e435145fb095c08e444a251d88947223d88847623c88af23fffd9",
+        ));
+    let _ = ulib::jpeg::decodificar(&cortado[..cortado.len() / 2]);
+    let _ = ulib::jpeg::decodificar(&[0xFF, 0xD8, 0xFF, 0xC0, 0, 4, 8, 0]);
+    Ok(())
+}
+
+/// CSS: seletores, especificidade, !important, var(), @media; o que não
+/// sabemos (:hover, combinador +) não pode casar.
+fn css_cascata() -> R {
+    use ulib::css::{self, Folha};
+    use ulib::html::{self, Elemento};
+    let doc = html::analisar(
+        r#"<html><body><div id="menu" class="nav escuro"><ul><li class="item">a</li></ul></div>
+        <p class="nota importante" data-x="sim">texto</p><a href="/x">link</a><span>s</span></body></html>"#,
+    );
+    let folha = Folha::ler(
+        r#"/* um comentário { com chaves } */
+        :root { --destaque: #c00; }
+        p { color: blue; margin: 0 }
+        .nota { color: green }
+        p.nota.importante { color: var(--destaque, black) }
+        #menu li { display: none }
+        .nav > ul { list-style: none }
+        div > li { color: pink }
+        a:hover { color: red }
+        p + a { color: red }
+        a:link { text-decoration: none }
+        [data-x="sim"] { font-weight: bold }
+        p { font-style: italic !important }
+        .nota { font-style: normal }
+        span { color: var(--nao-existe, #123456) }
+        @media (max-width: 600px) { p { display: none } }
+        @media screen and (min-width: 600px) { p { text-align: center } }
+        @font-face { font-family: x; src: url("x.woff") }
+        @media print { a { display: none } }
+        @supports (display: grid) { span { display: block } }"#,
+    );
+    let valor = |calc: &css::Calculado, nome: &str, prop: &str| -> Option<String> {
+        let e: &Elemento = doc.achar(nome)?;
+        let lista = calc.get(&(e as *const Elemento as usize))?;
+        lista.iter().rev().find(|(k, _)| k == prop).map(|(_, v)| v.clone())
+    };
+    let calc = css::calcular(&doc, &[&folha], 900);
+    let esperado = [
+        ("p", "color", Some("#c00")),
+        ("p", "font-style", Some("italic")),
+        ("p", "font-weight", Some("bold")),
+        ("p", "text-align", Some("center")),
+        ("p", "display", None),
+        ("li", "display", Some("none")),
+        ("li", "color", None),
+        ("ul", "list-style", Some("none")),
+        ("a", "text-decoration", Some("none")),
+        ("a", "color", None),
+        ("a", "display", None),
+        ("span", "color", Some("#123456")),
+        ("span", "display", Some("block")),
+    ];
+    for (nome, prop, certo) in esperado {
+        let obtido = valor(&calc, nome, prop);
+        if obtido.as_deref() != certo {
+            return Err(format!("{} {{ {} }}: {:?}, esperava {:?}", nome, prop, obtido, certo));
+        }
+    }
+    // Numa tela estreita, o @media (max-width: 600px) vale.
+    let estreita = css::calcular(&doc, &[&folha], 500);
+    if valor(&estreita, "p", "display").as_deref() != Some("none") || valor(&estreita, "p", "text-align").is_some() {
+        return Err("@media com a tela de 500 pixels".into());
+    }
+    if css::pixels("1.5em", 16.0) != Some(24) || css::pixels("12px", 16.0) != Some(12) || css::pixels("50%", 16.0).is_some() {
+        return Err("css::pixels".into());
+    }
+    Ok(())
+}
+
 /// Formulários: a codificação, e um POST de verdade para um servidor no
 /// loopback (que redireciona com 303: o destino tem que vir por GET).
 fn formularios() -> R {
@@ -2149,7 +2325,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 68] = [
+    let testes: [(&str, fn() -> R); 70] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -2211,11 +2387,13 @@ fn principal(args: &[&str]) -> i32 {
         ("componentes da interface: botão, caixa, campo, lista, diálogo", componentes_da_interface),
         ("área de texto do editor: teclado, colar, seleção pelo mouse", area_de_texto),
         ("PNG: inflate, filtros, Adam7, paleta, 16 bits; ida e volta", png_ler_e_gravar),
+        ("JPEG: baseline, progressivo, cinza, reinícios; dados estragados", jpeg),
         ("TCP pelo loopback: 200 KB e de volta, recusa, poll no accept", rede_tcp_local),
         ("UDP pelo loopback: endereços, porta efêmera, socket conectado", rede_udp_local),
         ("placa de rede: ARP, ping; HTTP e HTTPS (cifras, certificados e cadeias)", rede_placa),
         ("HTML tolerante (fechamentos implícitos, entidades) e URLs relativas", html_e_urls),
         ("formulários: codificação, POST e o GET depois do 303", formularios),
+        ("CSS: seletores, especificidade, !important, var() e @media", css_cascata),
         ("criptografia: X25519, ChaCha20-Poly1305, AES-GCM e HKDF (vetores das RFCs)", criptografia),
         ("assinaturas: SHA-512/384, RSA (PKCS#1 e PSS), ECDSA P-256 e P-384", assinaturas),
     ];

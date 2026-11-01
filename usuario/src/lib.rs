@@ -24,11 +24,13 @@ extern crate alloc;
 
 pub mod assinatura;
 pub mod cripto;
+pub mod css;
 pub mod grafico;
 pub mod html;
 pub mod http;
 pub mod io;
 pub mod janela;
+pub mod jpeg;
 #[path = "../../comum/cp437.rs"]
 pub mod cp437;
 #[path = "../../comum/lista_livre.rs"]

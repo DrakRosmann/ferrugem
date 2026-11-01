@@ -1,6 +1,5 @@
-//! navegador — um navegador web: HTML, formulários e imagens PNG (sem
-//! JavaScript, e do CSS só o atributo `style` mais simples). Rode dentro do
-//! `janelas`.
+//! navegador — um navegador web: HTML, CSS, formulários e imagens PNG e
+//! JPEG (sem JavaScript). Rode dentro do `janelas`.
 //!
 //! O caminho de uma página:
 //!
@@ -8,18 +7,22 @@
 //!   endereço ─▶ processo filho: DNS, TCP, HTTP ─▶ pipe ─▶ bytes da resposta
 //!                (a janela continua respondendo enquanto isso)
 //!   bytes ─▶ html::analisar ─▶ árvore de elementos
-//!   árvore ─▶ diagramação (para a largura da janela) ─▶ lista de desenhos
+//!   folhas de estilo (<style>, <link>) ─▶ css::calcular ─▶ o estilo de cada elemento
+//!   árvore + estilos ─▶ diagramação (para a largura da janela) ─▶ lista de desenhos
 //!                (palavras, retângulos, imagens, cada um no seu lugar)
 //!   desenhos ─▶ a parte visível é desenhada a cada evento
 //! ```
 //!
-//! As imagens vêm depois do texto, uma a uma; cada uma que chega refaz a
-//! diagramação. Atalhos: Ctrl+L (endereço), Ctrl+R (recarregar), Backspace
+//! As folhas de estilo e as imagens vêm depois do texto, uma a uma; cada
+//! uma que chega refaz a diagramação. Do CSS, usamos o que cabe numa
+//! diagramação de cima para baixo: display (o que mais importa: esconde os
+//! menus), cores e fundos, fontes, alinhamento, margens e listas. Atalhos: Ctrl+L (endereço), Ctrl+R (recarregar), Backspace
 //! (voltar), espaço/PgDn/PgUp/setas/Home/End (rolar).
 
 #![no_std]
 #![no_main]
 
+use ulib::css;
 use ulib::html::{self, Elemento, No};
 use ulib::http::{self, Url};
 use ulib::janela::{Janela, Seta};
@@ -59,6 +62,10 @@ struct Estilo {
     link: Option<usize>,
     /// Espaços e quebras de linha valem como estão (`<pre>`).
     pre: bool,
+    /// text-transform: 1 maiúsculas, 2 minúsculas, 3 iniciais maiúsculas.
+    transformar: u8,
+    /// Sobre um fundo escuro (do CSS): cores claras de texto valem.
+    fundo_escuro: bool,
 }
 
 const ESTILO_BASE: Estilo = Estilo {
@@ -71,6 +78,8 @@ const ESTILO_BASE: Estilo = Estilo {
     riscado: false,
     link: None,
     pre: false,
+    transformar: 0,
+    fundo_escuro: false,
 };
 
 /// Uma coisa a desenhar, já no seu lugar (coordenadas da página).
@@ -125,6 +134,47 @@ struct ImagemPagina {
     estado: EstadoImagem,
 }
 
+/// Uma folha de estilo da página (na ordem do documento: a ordem importa).
+enum FolhaPagina {
+    Pronta(css::Folha),
+    /// Um `<link rel="stylesheet">` ainda por baixar.
+    Esperando(Url),
+    Falhou,
+}
+
+/// O que se baixa depois da página: as folhas de estilo (primeiro) e as imagens.
+#[derive(Clone, Copy)]
+enum Recurso {
+    Folha(usize),
+    Imagem(usize),
+}
+
+/// As folhas de estilo de um documento: `<style>` e `<link rel="stylesheet">`.
+fn coletar_folhas(e: &Elemento, base: &Url, saida: &mut Vec<FolhaPagina>) {
+    for f in &e.filhos {
+        let No::Elemento(filho) = f else { continue };
+        let para_tela = filho.atributo("media").is_none_or(|m| css::midia_vale(&m.to_ascii_lowercase(), 900));
+        match filho.nome.as_str() {
+            "style" => {
+                if para_tela {
+                    saida.push(FolhaPagina::Pronta(css::Folha::ler(&filho.texto())));
+                }
+            }
+            "link" => {
+                let rel = filho.atributo("rel").unwrap_or("").to_ascii_lowercase();
+                let folha = rel.split_whitespace().any(|r| r == "stylesheet") && !rel.contains("alternate")
+                    || rel.contains("preload") && filho.atributo("as") == Some("style");
+                if folha && para_tela && saida.len() < 24 {
+                    if let Some(url) = filho.atributo("href").and_then(|h| base.juntar(h)) {
+                        saida.push(FolhaPagina::Esperando(url));
+                    }
+                }
+            }
+            _ => coletar_folhas(filho, base, saida),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum TipoCampo {
     Texto,
@@ -155,6 +205,9 @@ struct Formulario {
 /// Um campo de formulário. O estado (o que o usuário digitou, marcou ou
 /// escolheu) fica na página e sobrevive às diagramações.
 struct Campo {
+    /// O elemento do campo (o endereço dele na árvore): o mesmo campo em
+    /// todas as diagramações, mesmo que o CSS esconda ou mostre outros.
+    elemento: usize,
     formulario: Option<usize>,
     tipo: TipoCampo,
     nome: String,
@@ -171,11 +224,42 @@ struct Campo {
     inicial: (String, bool, usize),
 }
 
-/// Uma cor do HTML: #rgb, #rrggbb, rgb(r, g, b) ou um nome. Cores claras
-/// demais são ignoradas: como não desenhamos os fundos do CSS, um texto
-/// branco (feito para um fundo escuro) sumiria na página branca.
+/// Uma cor de texto do HTML: #rgb, #rrggbb, rgb(r, g, b) ou um nome. Cores
+/// claras demais são ignoradas: um texto branco (feito para um fundo escuro
+/// que não desenhamos) sumiria na página branca.
 fn ler_cor(texto: &str) -> Option<u32> {
+    ler_cor_bruta(texto).filter(|&c| !clara(c))
+}
+
+fn clara(cor: u32) -> bool {
+    let (r, g, b) = (cor >> 16 & 0xFF, cor >> 8 & 0xFF, cor & 0xFF);
+    r * 3 + g * 6 + b > 2000
+}
+
+fn escura(cor: u32) -> bool {
+    let (r, g, b) = (cor >> 16 & 0xFF, cor >> 8 & 0xFF, cor & 0xFF);
+    r * 3 + g * 6 + b < 1000
+}
+
+/// A cor de um `background` ("#eee url(x.png) no-repeat": a primeira coisa
+/// que for uma cor). Some(None): transparente.
+fn ler_fundo(valor: &str) -> Option<Option<u32>> {
+    if valor.contains("transparent") || valor == "none" || valor.starts_with("rgba(") && valor.trim_end_matches(')').trim().ends_with(",0") {
+        return Some(None);
+    }
+    // rgb(...) tem espaços dentro: junta antes de separar.
+    if let Some(i) = valor.find("rgb") {
+        return ler_cor_bruta(&valor[i..valor[i..].find(')').map_or(valor.len(), |f| i + f + 1)]).map(Some);
+    }
+    valor.split_whitespace().find_map(ler_cor_bruta).map(Some)
+}
+
+fn ler_cor_bruta(texto: &str) -> Option<u32> {
     let t = texto.trim().to_ascii_lowercase();
+    // light-dark(clara, escura): a página é clara.
+    if let Some(dentro) = t.strip_prefix("light-dark(") {
+        return ler_cor_bruta(dentro.split(',').next()?);
+    }
     let cor = if let Some(hexa) = t.strip_prefix('#') {
         match hexa.len() {
             3 => {
@@ -209,14 +293,48 @@ fn ler_cor(texto: &str) -> Option<u32> {
             "darkblue" => 0x00008B,
             "orange" => 0xD2691E,
             "brown" => 0x8B4513,
+            "white" => 0xFFFFFF,
+            "silver" => 0xC0C0C0,
+            "lightgray" | "lightgrey" => 0xD3D3D3,
+            "gainsboro" => 0xDCDCDC,
+            "whitesmoke" => 0xF5F5F5,
+            "yellow" => 0xFFFF00,
+            "lightyellow" => 0xFFFFE0,
+            "lightblue" => 0xADD8E6,
+            "aliceblue" => 0xF0F8FF,
+            "beige" => 0xF5F5DC,
+            "ivory" => 0xFFFFF0,
+            "darkgray" | "darkgrey" => 0xA9A9A9,
+            "dimgray" | "dimgrey" => 0x696969,
+            "darkslategray" | "darkslategrey" => 0x2F4F4F,
+            "lime" => 0x00FF00,
+            "aqua" | "cyan" => 0x00FFFF,
+            "fuchsia" | "magenta" => 0xFF00FF,
             _ => return None,
         }
     };
-    let (r, g, b) = (cor >> 16 & 0xFF, cor >> 8 & 0xFF, cor & 0xFF);
-    if r * 3 + g * 6 + b > 2000 {
-        return None;
-    }
     Some(cor)
+}
+
+/// Um font-size do CSS, nos nossos tamanhos (o 16px do CSS é o nosso 14).
+fn tamanho_css(v: &str, pai: u16) -> Option<u16> {
+    let pai_css = pai as f32 / 0.875;
+    let px = match v {
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 13.0,
+        "medium" => 16.0,
+        "large" => 18.0,
+        "x-large" => 24.0,
+        "xx-large" => 32.0,
+        "smaller" => pai_css * 0.85,
+        "larger" => pai_css * 1.2,
+        _ => match v.strip_suffix('%') {
+            Some(p) => p.trim().parse::<f32>().ok()? * pai_css / 100.0,
+            None => css::pixels(v, pai_css)? as f32,
+        },
+    };
+    Some(((px * 0.875) as u16).clamp(8, 40))
 }
 
 /// As declarações do atributo `style` (`"color: red; display: none"`).
@@ -229,10 +347,23 @@ fn estilo_inline(e: &Elemento) -> Vec<(String, String)> {
         .collect()
 }
 
-fn escondido(e: &Elemento) -> bool {
+/// Escondido pelo HTML ou pelo CSS (inclusive os truques de "só para leitores
+/// de tela": 1×1 pixel, recortado, ou jogado para fora da página).
+fn escondido(e: &Elemento, css: &[(String, String)]) -> bool {
+    let valor = |nome: &str| css.iter().rev().find(|(k, _)| k == nome).map(|(_, v)| v.as_str());
+    let longe = |nome: &str| valor(nome).and_then(|v| css::pixels(v, 16.0)).is_some_and(|p| p <= -999);
+    let minusculo = |nome: &str| valor(nome).and_then(|v| css::pixels(v, 16.0)).is_some_and(|p| p <= 1);
+    let solto = matches!(valor("position"), Some("absolute" | "fixed"));
     e.atributo("hidden").is_some()
         || e.atributo("aria-hidden") == Some("true") && e.nome != "body"
-        || estilo_inline(e).iter().any(|(k, v)| k == "display" && v.starts_with("none") || k == "visibility" && v == "hidden")
+        || valor("display") == Some("none")
+        || matches!(valor("visibility"), Some("hidden" | "collapse"))
+        || valor("font-size").is_some_and(|v| css::pixels(v, 16.0) == Some(0))
+        || longe("text-indent")
+        || solto && (longe("left") || longe("top") || valor("clip").is_some_and(|c| c.starts_with("rect(0")))
+        || solto && valor("clip-path").is_some_and(|c| c.starts_with("inset(50%"))
+        || minusculo("width") && minusculo("height") && valor("overflow") == Some("hidden")
+        || solto && valor("opacity").is_some_and(|o| o.parse::<f32>() == Ok(0.0))
 }
 
 /// Um número de um atributo de tamanho ("120", "120px"; "50%" não vale).
@@ -254,20 +385,25 @@ struct Diagramador<'a, 'b> {
     linha: Vec<Desenho>,
     /// Quantos itens da linha são marcadores (de lista): eles esperam o texto.
     marcadores: usize,
-    centro: bool,
+    /// O alinhamento das linhas: 0 esquerda, 1 centro, 2 direita.
+    alinhar: u8,
     /// A largura do espaço pendente antes da próxima palavra (0 = nenhum).
     espaco: i32,
     /// A margem vertical pendente (margens seguidas não se somam: vale a maior).
     margem: i32,
+    /// O CSS de cada elemento (pelo endereço dele).
+    estilos: &'a css::Calculado,
+    /// O fundo da página (do CSS do body).
+    fundo_pagina: Option<u32>,
     saida: Vec<Desenho>,
     links: Vec<Url>,
     imagens: &'a mut Vec<ImagemPagina>,
     ancoras: Vec<(String, i32)>,
-    /// As listas abertas: o próximo número (`<ol>`) ou nenhum (`<ul>`).
-    listas: Vec<Option<u32>>,
+    /// As listas abertas: o próximo número (`<ol>`) ou nenhum (`<ul>`), e
+    /// se os itens têm marcador (o CSS pode tirar).
+    listas: Vec<(Option<u32>, bool)>,
     primeira_celula: bool,
     campos: &'a mut Vec<Campo>,
-    proximo_campo: usize,
     formularios: Vec<Formulario>,
     /// O formulário em que estamos (o `<form>` aberto).
     formulario: Option<usize>,
@@ -292,7 +428,11 @@ impl Diagramador<'_, '_> {
             return; // só o marcador da lista: espera o texto do item
         }
         let altura = self.linha.iter().map(|d| d.caixa().3).max().unwrap_or(0);
-        let deslocamento = if self.centro { ((self.direita - self.x) / 2).max(0) } else { 0 };
+        let deslocamento = match self.alinhar {
+            1 => ((self.direita - self.x) / 2).max(0),
+            2 => (self.direita - self.x).max(0),
+            _ => 0,
+        };
         let y = self.y;
         for mut d in self.linha.drain(..) {
             let h = d.caixa().3;
@@ -344,6 +484,15 @@ impl Diagramador<'_, '_> {
     }
 
     fn palavra(&mut self, texto: String, e: &Estilo) {
+        let texto = match e.transformar {
+            1 => texto.to_uppercase(),
+            2 => texto.to_lowercase(),
+            3 => {
+                let mut c = texto.chars();
+                c.next().map_or(String::new(), |p| p.to_uppercase().chain(c).collect())
+            }
+            _ => texto,
+        };
         let largura = self.t.medir(&texto, e.tamanho, e.negrito, e.mono);
         let altura = self.altura(e);
         self.colocar(Desenho::Texto { x: 0, y: 0, largura, altura, texto, estilo: e.clone() }, largura);
@@ -427,15 +576,20 @@ impl Diagramador<'_, '_> {
     }
 
     /// Registra um campo (ou reaproveita o da diagramação anterior, com o
-    /// que o usuário já digitou). Os campos aparecem sempre na mesma ordem.
+    /// que o usuário já digitou).
     fn campo(&mut self, tipo: TipoCampo, e: &Elemento, valor: String, rotulo: String, opcoes: Vec<(String, String)>, escolhida: usize) -> usize {
-        let i = self.proximo_campo;
-        self.proximo_campo += 1;
-        if i >= self.campos.len() {
+        let elemento = e as *const Elemento as usize;
+        if let Some(i) = self.campos.iter().position(|c| c.elemento == elemento) {
+            self.campos[i].formulario = self.formulario;
+            return i;
+        }
+        let i = self.campos.len();
+        {
             let marcado = e.atributo("checked").is_some();
             let mut texto = CampoTexto::novo(if tipo.de_texto() { &valor } else { "" });
             texto.senha = tipo == TipoCampo::Senha;
             self.campos.push(Campo {
+                elemento,
                 formulario: self.formulario,
                 tipo,
                 nome: e.atributo("name").unwrap_or("").into(),
@@ -521,8 +675,17 @@ impl Diagramador<'_, '_> {
         }
     }
 
+    /// As declarações de CSS de um elemento: as das folhas e as do atributo
+    /// `style` (que vencem), na ordem em que valem.
+    fn css(&self, e: &Elemento) -> Vec<(String, String)> {
+        let mut v = self.estilos.get(&(e as *const Elemento as usize)).cloned().unwrap_or_default();
+        v.extend(estilo_inline(e));
+        v
+    }
+
     fn elemento(&mut self, e: &Elemento, pai: &Estilo) {
-        if escondido(e) {
+        let css = self.css(e);
+        if escondido(e, &css) {
             return;
         }
         let nome = e.nome.as_str();
@@ -576,7 +739,7 @@ impl Diagramador<'_, '_> {
             "pre" | "listing" | "xmp" | "plaintext" => Some((10, 10, 0)),
             "blockquote" => Some((10, 10, 28)),
             "ul" | "ol" | "dir" | "menu" => {
-                let margem = if self.listas.is_empty() { 10 } else { 0 };
+                let margem = if self.listas.iter().all(|l| !l.1) { 10 } else { 0 };
                 Some((margem, margem, 28))
             }
             "dd" => Some((0, 4, 28)),
@@ -625,47 +788,149 @@ impl Diagramador<'_, '_> {
             }
             _ => {}
         }
-        let mut centro = nome == "center" || e.atributo("align").is_some_and(|a| a.eq_ignore_ascii_case("center"));
-        for (k, v) in estilo_inline(e) {
+        let mut alinhar = match e.atributo("align").map(|a| a.to_ascii_lowercase()).as_deref() {
+            _ if nome == "center" => Some(1),
+            Some("center") => Some(1),
+            Some("right") => Some(2),
+            Some("left") => Some(0),
+            _ => None,
+        };
+        let mut fundo = None;
+        let (mut sem_marcador, mut em_linha) = (false, false);
+        let (mut margem_antes, mut margem_depois, mut preenchimento, mut margem_esquerda) = (None, None, None, 0);
+        let px = |v: &str, tamanho: u16| css::pixels(v, tamanho as f32 / 0.875);
+        for (k, v) in &css {
+            let v = v.as_str();
             match k.as_str() {
                 "color" if s.link.is_none() => {
-                    if let Some(c) = ler_cor(&v) {
+                    if let Some(c) = if s.fundo_escuro { ler_cor_bruta(v) } else { ler_cor(v) } {
                         s.cor = c;
+                    }
+                }
+                "background-color" | "background" => {
+                    if let Some(f) = ler_fundo(v) {
+                        fundo = f;
                     }
                 }
                 "font-weight" => s.negrito = v.starts_with("bold") || v.parse::<u32>().is_ok_and(|p| p >= 600),
                 "font-style" => s.italico = v.starts_with("italic") || v.starts_with("oblique"),
-                "text-align" => centro = v.starts_with("center"),
-                "font-family" if v.contains("monospace") => s.mono = true,
-                "white-space" if v.starts_with("pre") => s.pre = true,
-                "text-decoration" if v.contains("underline") => s.sublinhado = true,
-                "text-decoration" if v.contains("line-through") => s.riscado = true,
-                "display" if v == "block" || v == "flex" => {
-                    bloco.get_or_insert((0, 0, 0));
+                "font-size" => {
+                    if let Some(t) = tamanho_css(v, pai.tamanho) {
+                        s.tamanho = t;
+                    }
+                }
+                "font-family" => s.mono = v.contains("monospace") || v.contains("courier") || v.contains("consolas"),
+                "text-align" => {
+                    alinhar = Some(match v {
+                        "center" | "-webkit-center" => 1,
+                        "right" | "end" => 2,
+                        _ => 0,
+                    })
+                }
+                "white-space" => s.pre = v.starts_with("pre"),
+                "text-decoration" | "text-decoration-line" => {
+                    s.sublinhado = v.contains("underline");
+                    s.riscado = v.contains("line-through");
+                }
+                "text-transform" => {
+                    s.transformar = match v {
+                        "uppercase" => 1,
+                        "lowercase" => 2,
+                        "capitalize" => 3,
+                        _ => 0,
+                    }
+                }
+                "display" => match v {
+                    "block" | "flex" | "grid" | "list-item" | "table" | "flow-root" | "table-row" | "table-caption" => {
+                        bloco.get_or_insert((0, 0, 0));
+                        em_linha = false;
+                    }
+                    "inline" | "inline-block" | "inline-flex" | "inline-grid" | "contents" | "table-cell" | "inline-table" => {
+                        em_linha = true;
+                    }
+                    _ => {}
+                },
+                "list-style" | "list-style-type" => sem_marcador = v.contains("none"),
+                "margin-top" => margem_antes = px(v, s.tamanho),
+                "margin-bottom" => margem_depois = px(v, s.tamanho),
+                "margin-left" => margem_esquerda = px(v, s.tamanho).unwrap_or(0),
+                "padding-left" => preenchimento = px(v, s.tamanho),
+                "margin" | "padding" => {
+                    // 1 a 4 valores: cima, direita, baixo, esquerda
+                    let p: Vec<Option<i32>> = v.split_whitespace().map(|x| px(x, s.tamanho)).collect();
+                    let (cima, baixo, esquerda) = match p.len() {
+                        1 => (p[0], p[0], p[0]),
+                        2 => (p[0], p[0], p[1]),
+                        3 => (p[0], p[2], p[1]),
+                        4 => (p[0], p[2], p[3]),
+                        _ => (None, None, None),
+                    };
+                    if k == "margin" {
+                        (margem_antes, margem_depois, margem_esquerda) = (cima, baixo, esquerda.unwrap_or(0));
+                    } else {
+                        preenchimento = esquerda;
+                    }
                 }
                 _ => {}
+            }
+        }
+        if em_linha && !matches!(nome, "body" | "html" | "documento") {
+            bloco = None;
+        }
+        if let Some(b) = bloco.as_mut() {
+            if let Some(m) = margem_antes {
+                b.0 = m.clamp(0, 40);
+            }
+            if let Some(m) = margem_depois {
+                b.1 = m.clamp(0, 40);
+            }
+            if let Some(p) = preenchimento {
+                b.2 = p.clamp(0, 80);
+            }
+            b.2 += margem_esquerda.clamp(0, 80);
+        }
+        // Um fundo: o texto por cima tem que continuar legível.
+        if let Some(c) = fundo {
+            s.fundo_escuro = escura(c);
+            if s.fundo_escuro && !clara(s.cor) && s.link.is_none() {
+                s.cor = 0xEEEEEE;
+            } else if !s.fundo_escuro && clara(s.cor) {
+                s.cor = COR_TEXTO;
             }
         }
         if let Some(id) = e.atributo("id").or(if nome == "a" { e.atributo("name") } else { None }) {
             self.ancoras.push((String::from(id), self.y + self.margem));
         }
-        let (antes_esquerda, antes_centro) = (self.esquerda, self.centro);
+        let (antes_esquerda, antes_direita, antes_alinhar) = (self.esquerda, self.direita, self.alinhar);
+        let mut caixa_de_fundo = None;
         if let Some((antes, _, recuo)) = bloco {
             self.bloco(antes);
+            if let Some(cor) = fundo {
+                if matches!(nome, "body" | "html") {
+                    self.fundo_pagina = Some(cor);
+                } else if cor != 0xFFFFFF {
+                    // O retângulo entra na saída antes do conteúdo (fica embaixo dele).
+                    self.quebrar();
+                    self.y += core::mem::take(&mut self.margem);
+                    caixa_de_fundo = Some((self.saida.len(), self.y, cor));
+                    self.y += 4;
+                    self.esquerda += 6;
+                    self.direita -= 6;
+                }
+            }
             self.esquerda += recuo;
             self.x = self.x.max(self.esquerda);
-            if centro {
-                self.centro = true;
-            } else if bloco.is_some() && nome != "documento" && nome != "body" && nome != "html" {
-                // um bloco sem alinhamento próprio herda o do pai (é o que já está)
+            if let Some(a) = alinhar {
+                self.alinhar = a; // sem alinhamento próprio, herda o do pai
             }
         }
+        let marcador_da_lista = !sem_marcador && bloco.is_some();
         match nome {
-            "ul" | "dir" | "menu" => self.listas.push(None),
-            "ol" => self.listas.push(Some(e.atributo("start").and_then(|v| v.parse().ok()).unwrap_or(1))),
-            "li" => {
+            "ul" | "dir" | "menu" => self.listas.push((None, !sem_marcador)),
+            "ol" => self.listas.push((Some(e.atributo("start").and_then(|v| v.parse().ok()).unwrap_or(1)), !sem_marcador)),
+            "li" if marcador_da_lista && self.listas.last().is_none_or(|l| l.1) => {
                 let marcador = match self.listas.last_mut() {
-                    Some(Some(n)) => {
+                    Some((Some(n), _)) => {
                         *n += 1;
                         format!("{}.", *n - 1)
                     }
@@ -707,9 +972,16 @@ impl Diagramador<'_, '_> {
             _ => {}
         }
         if let Some((_, depois, _)) = bloco {
+            if let Some((i, y, cor)) = caixa_de_fundo {
+                self.quebrar();
+                self.y += core::mem::take(&mut self.margem) + 4;
+                let (x, largura) = (antes_esquerda, antes_direita - antes_esquerda);
+                self.saida.insert(i, Desenho::Retangulo { x, y, largura, altura: self.y - y, cor });
+            }
             self.bloco(depois);
             self.esquerda = antes_esquerda;
-            self.centro = antes_centro;
+            self.direita = antes_direita;
+            self.alinhar = antes_alinhar;
         }
     }
 }
@@ -735,6 +1007,11 @@ struct Pagina {
     refresh: Option<Url>,
     campos: Vec<Campo>,
     formularios: Vec<Formulario>,
+    folhas: Vec<FolhaPagina>,
+    /// O CSS calculado (e para que largura de janela); None = recalcular.
+    calculado: Option<(i32, css::Calculado)>,
+    /// A cor de fundo da página.
+    fundo: u32,
 }
 
 impl Pagina {
@@ -755,6 +1032,9 @@ impl Pagina {
             })
             .next();
         let titulo = raiz.achar("title").map(|t| t.texto().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        let base = raiz.achar("base").and_then(|b| b.atributo("href")).and_then(|h| url.juntar(h)).unwrap_or_else(|| url.clone());
+        let mut folhas = Vec::new();
+        coletar_folhas(&raiz, &base, &mut folhas);
         Pagina {
             url,
             titulo,
@@ -769,6 +1049,9 @@ impl Pagina {
             refresh,
             campos: Vec::new(),
             formularios: Vec::new(),
+            folhas,
+            calculado: None,
+            fundo: COR_PAGINA,
         }
     }
 
@@ -783,8 +1066,9 @@ impl Pagina {
     fn de_imagem(url: Url, imagem: png::Imagem, info: String) -> Pagina {
         let nome = url.caminho.rsplit('/').next().unwrap_or("").to_string();
         let titulo = format!("{} ({} × {})", nome, imagem.largura, imagem.altura);
-        let mut p = Pagina::de_html(url.clone(), "<center><img src=\"\"></center>", info);
-        // O src vazio aponta para a própria página; a imagem já está aqui.
+        let html = format!("<center><img src=\"{}\"></center>", escapar(&url.texto()).replace('"', "%22"));
+        let mut p = Pagina::de_html(url.clone(), &html, info);
+        // O src é a própria página; a imagem já está aqui.
         p.imagens.push(ImagemPagina { url, estado: EstadoImagem::Pronta(imagem) });
         p.titulo = titulo;
         p
@@ -798,6 +1082,18 @@ impl Pagina {
             .and_then(|h| self.url.juntar(h))
             .unwrap_or_else(|| self.url.clone());
         let raiz = core::mem::replace(&mut self.raiz, Elemento { nome: String::new(), atributos: Vec::new(), filhos: Vec::new() });
+        // A cascata só muda quando chega uma folha nova, ou com outra largura (@media).
+        if self.calculado.as_ref().is_none_or(|(l, _)| *l != largura) {
+            let folhas: Vec<&css::Folha> = self
+                .folhas
+                .iter()
+                .filter_map(|f| match f {
+                    FolhaPagina::Pronta(f) => Some(f),
+                    _ => None,
+                })
+                .collect();
+            self.calculado = Some((largura, css::calcular(&raiz, &folhas, largura)));
+        }
         let mut d = Diagramador {
             t,
             base,
@@ -807,7 +1103,9 @@ impl Pagina {
             x: MARGEM,
             linha: Vec::new(),
             marcadores: 0,
-            centro: false,
+            alinhar: 0,
+            estilos: &self.calculado.as_ref().unwrap().1,
+            fundo_pagina: None,
             espaco: 0,
             margem: 0,
             saida: Vec::new(),
@@ -817,14 +1115,9 @@ impl Pagina {
             listas: Vec::new(),
             primeira_celula: true,
             campos: &mut self.campos,
-            proximo_campo: 0,
             formularios: Vec::new(),
             formulario: None,
         };
-        // Uma imagem sem src (a página de imagem) é a própria URL.
-        if raiz.achar("img").is_some_and(|i| i.atributo("src") == Some("")) {
-            d.base = self.url.clone();
-        }
         d.elemento(&raiz, &ESTILO_BASE);
         d.bloco(0);
         self.altura = d.y + d.margem + 24;
@@ -832,6 +1125,7 @@ impl Pagina {
         self.links = d.links;
         self.ancoras = d.ancoras;
         self.formularios = d.formularios;
+        self.fundo = d.fundo_pagina.unwrap_or(COR_PAGINA);
         self.largura = largura;
         self.raiz = raiz;
     }
@@ -878,7 +1172,7 @@ fn pagina_de_erro(url: Url, mensagem: &str) -> Pagina {
 
 const PAGINA_INICIAL: &str = r#"
 <h1>Navegador do FerrugemOS</h1>
-<p>Um navegador escrito do zero, como o resto do sistema: o TCP, o DNS, o HTTP e o TLS 1.3 (o HTTPS) são nossos, assim como o leitor de HTML, a diagramação e o decodificador de PNG. Ainda não há JavaScript nem folhas de estilo.</p>
+<p>Um navegador escrito do zero, como o resto do sistema: o TCP, o DNS, o HTTP e o TLS 1.3 (o HTTPS) são nossos, assim como o leitor de HTML e de CSS, a diagramação e os decodificadores de PNG e JPEG. Ainda não há JavaScript, e do CSS só o que cabe numa página de cima para baixo (sem colunas lado a lado).</p>
 <p>Digite um endereço lá em cima, ou palavras para buscar no <b>DuckDuckGo</b>.</p>
 <p><small>Nas conexões HTTPS, o certificado do site é conferido com as autoridades de <code>/etc/ssl/certs.pem</code>: a assinatura de cada certificado da cadeia, as datas e o nome do site. Só não sabemos ainda se um certificado foi revogado.</small></p>
 <h2>Para começar</h2>
@@ -1035,7 +1329,8 @@ struct Navegador {
     busca: Option<Busca>,
     /// A página que está sendo baixada entra no histórico ao chegar?
     busca_nova: bool,
-    busca_imagem: Option<(Busca, usize)>,
+    /// Uma folha de estilo ou imagem sendo baixada.
+    busca_recurso: Option<(Busca, Recurso)>,
     endereco: CampoTexto,
     rolagem: i32,
     visitados: Vec<String>,
@@ -1093,7 +1388,7 @@ impl Navegador {
         if let Some(b) = self.busca.take() {
             b.cancelar();
         }
-        if let Some((b, _)) = self.busca_imagem.take() {
+        if let Some((b, _)) = self.busca_recurso.take() {
             b.cancelar();
         }
         // Só o fragmento mudou: a mesma página, outro lugar.
@@ -1134,6 +1429,8 @@ impl Navegador {
                     Ok(dados) => {
                         let tipo = if caminho.ends_with(".png") {
                             "image/png"
+                        } else if caminho.ends_with(".jpg") || caminho.ends_with(".jpeg") {
+                            "image/jpeg"
                         } else if caminho.ends_with(".html") || caminho.ends_with(".htm") {
                             "text/html"
                         } else {
@@ -1198,10 +1495,10 @@ impl Navegador {
     fn pagina_da_resposta(&self, url: Url, status: u16, tipo: &str, corpo: Vec<u8>, info: String) -> Pagina {
         let info = if status == 200 { info } else { format!("HTTP {} · {}", status, info) };
         let parece_html = corpo.iter().take(512).skip_while(|b| b.is_ascii_whitespace()).next() == Some(&b'<');
-        if tipo == "image/png" || corpo.starts_with(b"\x89PNG") {
-            return match png::decodificar(&corpo) {
+        if tipo == "image/png" || tipo == "image/jpeg" || corpo.starts_with(b"\x89PNG") || corpo.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            return match png::decodificar_imagem(&corpo) {
                 Some(img) => Pagina::de_imagem(url, img, info),
-                None => pagina_de_erro(url, "a imagem PNG está estragada"),
+                None => pagina_de_erro(url, "não consegui ler a imagem (estragada, ou um tipo de PNG/JPEG que não conheço)"),
             };
         }
         if tipo == "text/html" || tipo == "application/xhtml+xml" || tipo.is_empty() && parece_html {
@@ -1250,35 +1547,54 @@ impl Navegador {
                 self.mostrar(pagina, novo);
             }
         }
-        // As imagens, uma de cada vez.
-        if let Some((b, i)) = self.busca_imagem.as_mut() {
+        // As folhas de estilo e as imagens, uma de cada vez.
+        if let Some((b, recurso)) = self.busca_recurso.as_mut() {
             t.acordar_em(30);
             if let Some(r) = b.avancar() {
-                let i = *i;
-                self.busca_imagem = None;
+                let recurso = *recurso;
+                self.busca_recurso = None;
                 if let Some(p) = self.pagina.as_mut() {
-                    p.imagens[i].estado = match r {
-                        Resultado::Resposta { status: 200, corpo, .. } => match png::decodificar(&corpo) {
-                            Some(img) if img.largura as u64 * img.altura as u64 <= 16 << 20 => EstadoImagem::Pronta(img),
-                            _ => EstadoImagem::Falhou,
-                        },
-                        _ => EstadoImagem::Falhou,
-                    };
-                    p.largura = 0; // diagramar de novo, com o tamanho da imagem
+                    match recurso {
+                        Recurso::Folha(i) => {
+                            p.folhas[i] = match r {
+                                Resultado::Resposta { status: 200, corpo, .. } => FolhaPagina::Pronta(css::Folha::ler(&html::decodificar_bytes(&corpo))),
+                                _ => FolhaPagina::Falhou,
+                            };
+                            p.calculado = None;
+                        }
+                        Recurso::Imagem(i) => {
+                            p.imagens[i].estado = match r {
+                                Resultado::Resposta { status: 200, corpo, .. } => match png::decodificar_imagem(&corpo) {
+                                    Some(img) if img.largura as u64 * img.altura as u64 <= 16 << 20 => EstadoImagem::Pronta(img),
+                                    _ => EstadoImagem::Falhou,
+                                },
+                                _ => EstadoImagem::Falhou,
+                            };
+                        }
+                    }
+                    p.largura = 0; // diagramar de novo, com o estilo ou o tamanho da imagem
                 }
             }
         }
-        if self.busca_imagem.is_none() && self.busca.is_none() {
+        if self.busca_recurso.is_none() && self.busca.is_none() {
             if let Some(p) = self.pagina.as_mut() {
-                if let Some(i) = p.imagens.iter().position(|im| matches!(im.estado, EstadoImagem::Esperando)) {
+                let folha = p.folhas.iter().position(|f| matches!(f, FolhaPagina::Esperando(_)));
+                if let Some(i) = folha {
+                    let FolhaPagina::Esperando(url) = &p.folhas[i] else { unreachable!() };
+                    match Busca::comecar(url, &self.excecoes, None) {
+                        Some(b) => self.busca_recurso = Some((b, Recurso::Folha(i))),
+                        None => p.folhas[i] = FolhaPagina::Falhou,
+                    }
+                    t.redesenhar();
+                } else if let Some(i) = p.imagens.iter().position(|im| matches!(im.estado, EstadoImagem::Esperando)) {
                     let url = p.imagens[i].url.clone();
                     match url.esquema.as_str() {
                         "http" | "https" => match Busca::comecar(&url, &self.excecoes, None) {
-                            Some(b) => self.busca_imagem = Some((b, i)),
+                            Some(b) => self.busca_recurso = Some((b, Recurso::Imagem(i))),
                             None => p.imagens[i].estado = EstadoImagem::Falhou,
                         },
                         "file" => {
-                            p.imagens[i].estado = match sys::ler_arquivo(&url.caminho).ok().and_then(|d| png::decodificar(&d)) {
+                            p.imagens[i].estado = match sys::ler_arquivo(&url.caminho).ok().and_then(|d| png::decodificar_imagem(&d)) {
                                 Some(img) => EstadoImagem::Pronta(img),
                                 None => EstadoImagem::Falhou,
                             };
@@ -1439,13 +1755,14 @@ impl Navegador {
         // Desenha a parte visível.
         let antes = t.q.recorte;
         t.q.recortar(area.x, area.y, area.largura, area.altura);
-        t.q.retangulo(area.x, area.y, area.largura, area.altura, COR_PAGINA);
+        let fundo = self.pagina.as_ref().map_or(COR_PAGINA, |p| p.fundo);
+        t.q.retangulo(area.x, area.y, area.largura, area.altura, fundo);
         let mouse = area.mouse.map(|(x, y)| (x, y + self.rolagem));
         let mut link_sobre = None;
         let mut controle_sobre = None;
         if let Some(p) = self.pagina.as_ref() {
             if let Some((mx, my)) = mouse.filter(|_| self.lista_aberta.is_none()) {
-                let embaixo = p.desenhos.iter().find(|d| {
+                let embaixo = p.desenhos.iter().filter(|d| !matches!(d, Desenho::Retangulo { .. })).find(|d| {
                     let (x, y, l, a) = d.caixa();
                     mx >= x && my >= y && mx < x + l && my < y + a
                 });
@@ -1633,8 +1950,12 @@ impl Navegador {
             }
         } else if let Some(b) = &self.busca {
             format!("Carregando {}… {}", b.url.host, if b.recebidos > 0 { tamanho_legivel(b.recebidos) } else { String::new() })
-        } else if let Some((b, _)) = &self.busca_imagem {
-            format!("Carregando imagem {}…", b.url.caminho.rsplit('/').next().unwrap_or(""))
+        } else if let Some((b, recurso)) = &self.busca_recurso {
+            let nome = b.url.caminho.split('?').next().unwrap_or("").rsplit('/').next().unwrap_or("");
+            match recurso {
+                Recurso::Folha(_) => format!("Carregando estilo {}…", nome),
+                Recurso::Imagem(_) => format!("Carregando imagem {}…", nome),
+            }
         } else {
             self.pagina.as_ref().map_or(String::new(), |p| p.info.clone())
         };
@@ -1707,7 +2028,7 @@ fn principal(args: &[&str]) -> i32 {
         atual: 0,
         busca: None,
         busca_nova: true,
-        busca_imagem: None,
+        busca_recurso: None,
         endereco: CampoTexto::novo(""),
         rolagem: 0,
         visitados: Vec::new(),
@@ -1724,7 +2045,7 @@ fn principal(args: &[&str]) -> i32 {
     if let Some(b) = nav.busca.take() {
         b.cancelar();
     }
-    if let Some((b, _)) = nav.busca_imagem.take() {
+    if let Some((b, _)) = nav.busca_recurso.take() {
         b.cancelar();
     }
     0

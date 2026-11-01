@@ -1,11 +1,12 @@
 //! imagens — o visualizador de imagens (rode dentro do `janelas`).
 //!
 //! ```text
-//!   imagens [arquivo.png]
+//!   imagens [arquivo.png | arquivo.jpg]
 //! ```
 //!
 //! Mostra um PNG (decodificado por `ulib::png`: todos os tipos de cor,
-//! entrelaçamento e transparência, sobre um fundo xadrez). As setas (ou os
+//! entrelaçamento e transparência, sobre um fundo xadrez) ou um JPEG
+//! (`ulib::jpeg`). As setas (ou os
 //! botões) passam para a anterior e a próxima da mesma pasta; "Usar como
 //! papel de parede" põe a imagem no fundo da área de trabalho.
 
@@ -20,13 +21,13 @@ use ulib::*;
 
 programa!(principal);
 
-/// Os PNGs da pasta, em ordem alfabética.
+/// As imagens da pasta, em ordem alfabética.
 fn irmas(caminho: &str) -> Vec<String> {
     let pasta = caminho.rsplit_once('/').map_or(".", |(p, _)| if p.is_empty() { "/" } else { p });
     let mut nomes: Vec<String> = sys::listar_diretorio(pasta)
         .unwrap_or_default()
         .into_iter()
-        .filter(|e| e.nome.to_lowercase().ends_with(".png"))
+        .filter(|e| [".png", ".jpg", ".jpeg"].iter().any(|x| e.nome.to_lowercase().ends_with(x)))
         .map(|e| if pasta == "/" { format!("/{}", e.nome) } else { format!("{}/{}", pasta, e.nome) })
         .collect();
     nomes.sort();
@@ -35,7 +36,7 @@ fn irmas(caminho: &str) -> Vec<String> {
 
 fn carregar(caminho: &str) -> Result<Imagem, String> {
     let dados = sys::ler_arquivo(caminho).map_err(|e| format!("{}: {}", caminho, e))?;
-    png::decodificar(&dados).ok_or_else(|| format!("{}: não é um PNG que eu saiba ler", caminho))
+    png::decodificar_imagem(&dados).ok_or_else(|| format!("{}: não é um PNG nem um JPEG que eu saiba ler", caminho))
 }
 
 fn principal(args: &[&str]) -> i32 {

@@ -170,8 +170,11 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   claro/escuro, cor de destaque, brilho, luz noturna, segundos, cursor
   grande; tudo vale na hora, também para os programas abertos). Todos no
   menu Aplicativos.
-- **Navegador** (`navegador`): HTML e imagens PNG, sem JavaScript e, do
-  CSS, só o atributo `style` mais simples. A diagramação tem quebra de
+- **Navegador** (`navegador`): HTML, CSS, imagens PNG e JPEG, sem
+  JavaScript. Do CSS (`ulib::css`: seletores, especificidade,
+  `!important`, `@media`, `var()`), vale o que cabe numa diagramação de
+  cima para baixo: `display` (esconde os menus), cores e fundos, fontes,
+  alinhamento, margens e listas; colunas lado a lado ainda não. A diagramação tem quebra de
   linha, títulos, listas aninhadas e numeradas, citações, `<pre>`,
   tabelas simples, negrito, itálico (sintético), links (o visitado muda
   de cor) e âncoras (`#id`). Formulários de verdade: campos de texto e
@@ -207,6 +210,10 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   alfa em 1 a 16 bits, transparência (tRNS) e entrelaçamento Adam7 — e um
   codificador simples (para a captura de tela). Papéis de parede e um
   fractal em `/usr/share/imagens` (gerados por `ferramentas/imagens.py`).
+- **JPEG** (`ulib::jpeg`): baseline e progressivo, Huffman, IDCT em ponto
+  fixo, cor em meia resolução (4:2:0, 4:2:2) interpolada como no libjpeg,
+  marcadores de reinício. O visualizador de imagens, o papel de parede e o
+  navegador abrem PNG e JPEG.
 - **Painel de controle** (no estilo das configurações rápidas do GNOME):
   brilho e luz noturna (um filtro de cor aplicado pelo servidor ao copiar
   para a tela), estilo escuro (os programas com `ulib::ui` trocam de tema na
@@ -289,7 +296,8 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 | `src/pci.rs`, `rtl8139.rs` | Barramento PCI e o driver da placa de rede |
 | `src/rede.rs`, `tcp.rs`, `inet.rs` | A pilha de rede: Ethernet/ARP/IP/ICMP/UDP, o TCP e os sockets `AF_INET` |
 | `usuario/src/rede.rs`, `http.rs` | DNS, conexões por nome, URLs e o cliente HTTP |
-| `usuario/src/html.rs`, `bin/navegador.rs` | O leitor de HTML e o navegador (diagramação e desenho) |
+| `usuario/src/html.rs`, `css.rs`, `bin/navegador.rs` | Os leitores de HTML e de CSS e o navegador (diagramação e desenho) |
+| `usuario/src/jpeg.rs` | O decodificador de JPEG |
 | `usuario/src/tls.rs`, `cripto.rs` | TLS 1.3 e a criptografia (X25519, ChaCha20-Poly1305, AES-GCM, HKDF) |
 | `usuario/src/x509.rs`, `assinatura.rs`, `numero.rs`, `sha512.rs` | Certificados (DER, cadeias, nomes), RSA e ECDSA, números grandes |
 | `src/smp.rs`, `trampolim.asm` | Várias CPUs: APIC, ACPI, acordar as outras, a trava do kernel |
@@ -366,7 +374,8 @@ de páginas. O `make run` usa 4 CPUs.
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** TLS 1.2 (muitos servidores ainda não falam o 1.3), revogação
    de certificados, DHCP (hoje o endereço é fixo), IPv6, outra placa
-   (virtio-net ou e1000). No navegador: CSS e JPEG.
+   (virtio-net ou e1000). No navegador: colunas (flex, float, grid),
+   SVG e imagens WebP/GIF.
 4. **Interface gráfica:** ícones na área de trabalho, notificações,
    seleção de trechos nos campos de texto, mais programas.
 

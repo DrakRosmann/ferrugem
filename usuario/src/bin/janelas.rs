@@ -1768,7 +1768,7 @@ impl Servidor {
         if self.ajustes.fundo.is_empty() {
             return;
         }
-        let Some(img) = sys::ler_arquivo(&self.ajustes.fundo).ok().and_then(|d| ulib::png::decodificar(&d)) else {
+        let Some(img) = sys::ler_arquivo(&self.ajustes.fundo).ok().and_then(|d| ulib::png::decodificar_imagem(&d)) else {
             self.avisar(format!("Não consegui ler o papel de parede {}", self.ajustes.fundo));
             return;
         };

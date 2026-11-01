@@ -304,6 +304,11 @@ fn desfiltrar(dados: &[u8], linhas: usize, por_linha: usize, bpp: usize) -> Opti
     Some(saida)
 }
 
+/// Uma imagem PNG ou JPEG (o tipo vem dos primeiros bytes).
+pub fn decodificar_imagem(dados: &[u8]) -> Option<Imagem> {
+    if dados.starts_with(&[0xFF, 0xD8]) { crate::jpeg::decodificar(dados) } else { decodificar(dados) }
+}
+
 /// Lê um PNG: todos os tipos de cor e profundidades, e o entrelaçamento Adam7.
 pub fn decodificar(png: &[u8]) -> Option<Imagem> {
     if png.get(..8)? != b"\x89PNG\r\n\x1a\n" {
