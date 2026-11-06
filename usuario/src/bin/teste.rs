@@ -1920,71 +1920,298 @@ fn jpeg() -> R {
     Ok(())
 }
 
-/// CSS: seletores, especificidade, !important, var(), @media; o que não
-/// sabemos (:hover, combinador +) não pode casar.
+/// CSS: seletores, especificidade, !important, var(), @media e o estilo calculado.
 fn css_cascata() -> R {
-    use ulib::css::{self, Folha};
-    use ulib::html::{self, Elemento};
-    let doc = html::analisar(
-        r#"<html><body><div id="menu" class="nav escuro"><ul><li class="item">a</li></ul></div>
-        <p class="nota importante" data-x="sim">texto</p><a href="/x">link</a><span>s</span></body></html>"#,
+    use ulib::css::{self, Display, EstadoCss, Folha};
+    use ulib::dom::Dom;
+    let d = Dom::de_html(
+        r#"<html><body><div id="menu" class="nav escuro"><ul><li class="item">a</li><li>b</li></ul></div>
+        <p class="nota importante" data-x="sim">texto</p><a href="/x">link</a><span>s</span><em style="color:#010203">e</em></body></html>"#,
     );
     let folha = Folha::ler(
-        r#"/* um comentário { com chaves } */
-        :root { --destaque: #c00; }
-        p { color: blue; margin: 0 }
-        .nota { color: green }
-        p.nota.importante { color: var(--destaque, black) }
-        #menu li { display: none }
-        .nav > ul { list-style: none }
-        div > li { color: pink }
-        a:hover { color: red }
-        p + a { color: red }
-        a:link { text-decoration: none }
-        [data-x="sim"] { font-weight: bold }
-        p { font-style: italic !important }
-        .nota { font-style: normal }
-        span { color: var(--nao-existe, #123456) }
+        r#"/* comentário */ @import url("x.css");
+        :root { --cor: #123456; --tam: 2em }
+        div { color: #111111 } .nav { color: #222222 } #menu { color: #333333 } div.nav { font-weight: bold }
+        li { display: none } ul > .item { display: inline } ul > li + li { display: block; margin-top: 3px }
+        li:first-child { text-indent: 1px } li:nth-child(2) { text-indent: 2px } li:not(.item) { font-style: italic }
+        p[data-x="sim"] { text-align: center } p[data-x^="nao"] { text-align: right }
+        .importante { width: 10px !important } p { width: 20px }
+        span { color: var(--cor); margin-left: var(--tam); padding: calc(1px + 2px) var(--nada, 4px) }
+        a:hover { color: red } em { color: red }
         @media (max-width: 600px) { p { display: none } }
-        @media screen and (min-width: 600px) { p { text-align: center } }
-        @font-face { font-family: x; src: url("x.woff") }
-        @media print { a { display: none } }
-        @supports (display: grid) { span { display: block } }"#,
+        @media (min-width: 601px) { p { position: relative } }
+        .aninhado { & b { color: red } }"#,
     );
-    let valor = |calc: &css::Calculado, nome: &str, prop: &str| -> Option<String> {
-        let e: &Elemento = doc.achar(nome)?;
-        let lista = calc.get(&(e as *const Elemento as usize))?;
-        lista.iter().rev().find(|(k, _)| k == prop).map(|(_, v)| v.clone())
+    if folha.importacoes.len() != 1 {
+        return Err("@import".into());
+    }
+    let ua = Folha::ler(css::FOLHA_PADRAO);
+    let estado = |w| EstadoCss { largura: w, altura: 600, ..Default::default() };
+    let e900 = estado(900);
+    let calc = css::calcular(&d, &[&ua, &folha], &e900);
+    let el = |nome: &str, i: usize| {
+        let mut v = Vec::new();
+        d.todos(0, nome, &mut v);
+        calc.estilos[&v[i]].clone()
     };
-    let calc = css::calcular(&doc, &[&folha], 900);
-    let esperado = [
-        ("p", "color", Some("#c00")),
-        ("p", "font-style", Some("italic")),
-        ("p", "font-weight", Some("bold")),
-        ("p", "text-align", Some("center")),
-        ("p", "display", None),
-        ("li", "display", Some("none")),
-        ("li", "color", None),
-        ("ul", "list-style", Some("none")),
-        ("a", "text-decoration", Some("none")),
-        ("a", "color", None),
-        ("a", "display", None),
-        ("span", "color", Some("#123456")),
-        ("span", "display", Some("block")),
-    ];
-    for (nome, prop, certo) in esperado {
-        let obtido = valor(&calc, nome, prop);
-        if obtido.as_deref() != certo {
-            return Err(format!("{} {{ {} }}: {:?}, esperava {:?}", nome, prop, obtido, certo));
-        }
-    }
+    let verifica = |ok: bool, m: &str| -> R { if ok { Ok(()) } else { Err(m.into()) } };
+    verifica(el("div", 0).cor == 0xFF333333, "o #id vence a .classe")?;
+    verifica(el("div", 0).negrito, "div.nav")?;
+    verifica(el("li", 0).display == Display::Inline, "ul > .item")?;
+    verifica(el("li", 1).display == Display::Bloco, "li + li")?;
+    verifica(el("li", 1).italico && !el("li", 0).italico, ":not()")?;
+    verifica(el("p", 0).alinha == 1, "[atributo]")?;
+    verifica(matches!(el("p", 0).largura, css::Tam::Px(v) if v == 10.0), "!important")?;
+    verifica(el("span", 0).cor == 0xFF123456, "var()")?;
+    verifica(matches!(el("span", 0).margem[3], css::Tam::Px(v) if v == 32.0), "var() em em")?;
+    verifica(matches!(el("span", 0).preench[0], css::Tam::Px(v) if v == 3.0), "calc()")?;
+    verifica(matches!(el("span", 0).preench[1], css::Tam::Px(v) if v == 4.0), "var() com reserva")?;
+    verifica(el("a", 0).cor != 0xFFFF0000, ":hover sem o mouse")?;
+    verifica(el("em", 0).cor == 0xFF010203, "style= vence as folhas")?;
+    verifica(el("p", 0).posicao == css::Posicao::Relativa, "@media (min-width)")?;
     // Numa tela estreita, o @media (max-width: 600px) vale.
-    let estreita = css::calcular(&doc, &[&folha], 500);
-    if valor(&estreita, "p", "display").as_deref() != Some("none") || valor(&estreita, "p", "text-align").is_some() {
-        return Err("@media com a tela de 500 pixels".into());
-    }
+    let e500 = estado(500);
+    let estreita = css::calcular(&d, &[&ua, &folha], &e500);
+    let mut ps = Vec::new();
+    d.todos(0, "p", &mut ps);
+    verifica(estreita.estilos[&ps[0]].display == Display::Nenhum, "@media com a tela de 500 pixels")?;
+    // :hover com o mouse em cima.
+    let mut links = Vec::new();
+    d.todos(0, "a", &mut links);
+    let sobre = EstadoCss { largura: 900, altura: 600, sobre: links.clone(), ..Default::default() };
+    let c2 = css::calcular(&d, &[&ua, &folha], &sobre);
+    verifica(c2.estilos[&links[0]].cor == 0xFFFF0000, ":hover")?;
+    // querySelector
+    let l = css::ler_lista_seletores("ul li.item, #nada").ok_or("seletor")?;
+    let mut s = Vec::new();
+    css::selecionar(&d, &e900, 0, &l, false, &mut s);
+    verifica(s.len() == 1 && d.tem_classe(s[0], "item"), "selecionar")?;
+    verifica(css::ler_lista_seletores("a..b").is_none(), "seletor inválido")?;
+    verifica(css::ler_cor("hsl(120, 100%, 50%)") == Some(0xFF00FF00), "hsl()")?;
+    verifica(css::ler_cor("rgb(255 0 0 / 50%)") == Some(0x80FF0000), "rgb() moderno")?;
     if css::pixels("1.5em", 16.0) != Some(24) || css::pixels("12px", 16.0) != Some(12) || css::pixels("50%", 16.0).is_some() {
         return Err("css::pixels".into());
+    }
+    Ok(())
+}
+
+/// Diagramação: caixas, margens, flex, grid, float, posição e tabelas (as
+/// contas conferidas com um navegador de verdade: veja testes/css).
+fn css_diagramacao() -> R {
+    use ulib::caixas::{Hospede, Medidor, Motor};
+    use ulib::css::{self, EstadoCss, Folha};
+    use ulib::dom::{Dom, NoId};
+    struct M;
+    impl Medidor for M {
+        fn largura(&mut self, t: &str, tam: u16, _: bool, _: bool) -> i32 {
+            t.chars().count() as i32 * tam as i32 / 2
+        }
+        fn metricas(&mut self, tam: u16, _: bool) -> (i32, i32) {
+            (tam as i32, tam as i32 * 3 / 2)
+        }
+    }
+    struct H;
+    impl Hospede for H {
+        fn imagem(&mut self, _: &str) -> (usize, Option<(i32, i32)>) {
+            (0, Some((100, 50)))
+        }
+        fn controle(&mut self, _: NoId) -> (i32, i32) {
+            (100, 26)
+        }
+    }
+    let d = Dom::de_html(
+        r#"<style>body{margin:0} div{box-sizing:border-box}
+        #m1{height:20px;margin-bottom:30px} #m2{height:20px;margin-top:10px}
+        #w{width:50%;height:10px;margin:0 auto}
+        #f{display:flex;width:400px;justify-content:space-between} #f1,#f2{width:50px;height:20px}
+        #fx{display:flex;width:400px} #a1{flex:1;height:5px} #a2{flex:3;height:5px}
+        #g{display:grid;width:600px;grid-template-columns:100px 1fr 2fr;gap:10px} #g div{height:20px} #g2{grid-column:span 2}
+        #c{width:400px} #fe{float:left;width:100px;height:50px} #fd{float:right;width:100px;height:30px} #cl{clear:both;height:10px}
+        #r{position:relative;width:200px;height:100px} #ab{position:absolute;right:0;bottom:0;width:40px;height:40px}
+        table{width:400px;border-spacing:0} td{padding:0;height:20px} #img{width:200px}
+        </style><div id=m1></div><div id=m2></div><div id=w></div>
+        <div id=f><div id=f1></div><div id=f2></div></div><div id=fx><div id=a1></div><div id=a2></div></div>
+        <div id=g><div id=g1></div><div id=g2></div><div id=g3></div></div>
+        <div id=c><div id=fe></div><div id=fd></div><div id=cl></div></div>
+        <div id=r><div id=ab></div></div>
+        <table><tr><td id=c1></td><td id=c2></td></tr></table><img id=img src=x.png>"#,
+    );
+    let ua = Folha::ler(css::FOLHA_PADRAO);
+    let mut est = Vec::new();
+    d.todos(0, "style", &mut est);
+    let folha = Folha::ler(&d.texto(est[0]));
+    let estado = EstadoCss { largura: 800, altura: 600, ..Default::default() };
+    let c = css::calcular(&d, &[&ua, &folha], &estado);
+    let (mut m, mut h) = (M, H);
+    let base = |s: &str| Some(String::from(s));
+    let l = Motor::novo(&d, &c, &mut m, &mut h, &base, 800, 600).diagramar();
+    let caixa = |id: &str| d.por_id(0, id).and_then(|n| l.retangulos.get(&n).copied());
+    for (id, certo) in [
+        ("m1", (0, 0, 800, 20)),
+        ("m2", (0, 50, 800, 20)), // as margens se juntam: vale a maior
+        ("w", (200, 70, 400, 10)),
+        ("f2", (350, 80, 50, 20)),
+        ("a1", (0, 100, 100, 5)),
+        ("a2", (100, 100, 300, 5)),
+        ("g2", (110, 105, 490, 20)),
+        ("g3", (0, 135, 100, 20)),
+        ("fd", (300, 155, 100, 30)),
+        ("cl", (0, 205, 400, 10)),
+        ("ab", (160, 275, 40, 40)),
+        ("c2", (200, 315, 200, 20)),
+    ] {
+        let obtido = caixa(id);
+        if obtido != Some(certo) {
+            return Err(format!("{}: {:?}, esperava {:?}", id, obtido, certo));
+        }
+    }
+    match caixa("img") {
+        Some((_, _, 200, 100)) => Ok(()),
+        o => Err(format!("a imagem mantém a proporção: {:?}", o)),
+    }
+}
+
+/// O motor de JavaScript: a linguagem e os objetos embutidos (a bateria de
+/// verdade, comparada com o node, está em testes/js).
+fn js_motor() -> R {
+    use ulib::js::{self, Valor, Vm};
+    let casos: &[(&str, &str)] = &[
+        ("1 + 2 * 3", "7"),
+        ("[1,2,3].map(x => x * 2).join()", "2,4,6"),
+        ("let [a, , b = 5, ...c] = [1, 2, undefined, 4]; `${a} ${b} ${c}`", "1 5 4"),
+        ("class A { #p = 1; get p() { return this.#p; } } class B extends A { constructor() { super(); this.q = 2; } } new B().p + new B().q", "3"),
+        ("function* g() { yield 1; yield* [2, 3]; } [...g()].join()", "1,2,3"),
+        ("try { null.x } catch (e) { e.name }", "TypeError"),
+        ("function f() { try { return 'a' } finally { globalThis.fim = 'b' } } f() + fim", "ab"),
+        ("'a1b22'.replace(/\\d+/g, m => m.length)", "a1b2"),
+        ("JSON.stringify({a: [1, {b: null}], c: 'é\\n'})", "{\"a\":[1,{\"b\":null}],\"c\":\"é\\n\"}"),
+        ("JSON.parse('{\"x\":[1,2]}').x[1]", "2"),
+        ("new Date(Date.UTC(2026, 10, 6)).toISOString()", "2026-11-06T00:00:00.000Z"),
+        ("Math.sqrt(2).toFixed(6) + (0.1 + 0.2)", "1.4142140.30000000000000004"),
+        ("new Map([[1, 'x']]).get(1) + new Set([1, 1]).size", "x1"),
+        ("(255).toString(16) + (1.005).toFixed(2)", "ff1.00"),
+        ("typeof Symbol.iterator + typeof null + typeof undefined", "symbolobjectundefined"),
+    ];
+    let mut vm = Vm::novo();
+    for (fonte, certo) in casos {
+        match vm.avaliar(fonte) {
+            Ok(v) => {
+                let t = js::nativos::formatar_console(&mut vm, &[v]);
+                if t != *certo {
+                    return Err(format!("{}: {:?}, esperava {:?}", fonte, t, certo));
+                }
+            }
+            Err(e) => return Err(format!("{}: {}", fonte, vm.descrever_erro(e))),
+        }
+    }
+    // Promessas e funções assíncronas: a fila de microtarefas.
+    vm.avaliar("globalThis.r = []; (async () => { r.push(await 1); r.push(await Promise.resolve(2)); })(); r.push(0);").map_err(|e| vm.descrever_erro(e))?;
+    js::rodar_microtarefas(&mut vm);
+    let v = vm.avaliar("r.join()").map_err(|e| vm.descrever_erro(e))?;
+    if js::nativos::formatar_console(&mut vm, &[v]) != "0,1,2" {
+        return Err("async/await".into());
+    }
+    // O coletor de lixo: muito lixo, e os vivos continuam vivos.
+    let v = vm.avaliar("var vivo = {x: [1, 2]}; var s = 0; for (var i = 0; i < 400000; i++) { var o = {a: [i]}; s += o.a[0] & 1; } s + vivo.x[1]").map_err(|e| vm.descrever_erro(e))?;
+    if v != Valor::Int(200002) {
+        return Err(format!("coletor de lixo: {:?}", v));
+    }
+    // Uma recursão infinita é um erro, não um crash.
+    let v = vm.avaliar("try { (function f() { f(); })(); 'não' } catch (e) { e.name }").map_err(|e| vm.descrever_erro(e))?;
+    if js::nativos::formatar_console(&mut vm, &[v]) != "RangeError" {
+        return Err("recursão infinita".into());
+    }
+    Ok(())
+}
+
+/// A ponte com o DOM: um hospedeiro falso, sem janela.
+fn js_dom() -> R {
+    use ulib::css::{EstadoCss, Estilo};
+    use ulib::dom::{Dom, NoId};
+    use ulib::web::{Hospedeiro, Web};
+    extern crate alloc;
+    struct F {
+        d: Dom,
+        e: EstadoCss,
+        log: Vec<String>,
+    }
+    impl Hospedeiro for F {
+        fn dom(&mut self) -> &mut Dom { &mut self.d }
+        fn estado_css(&mut self) -> &EstadoCss { &self.e }
+        fn valor_campo(&mut self, _: NoId) -> Option<String> { None }
+        fn definir_valor_campo(&mut self, _: NoId, _: &str) {}
+        fn marcado(&mut self, _: NoId) -> bool { false }
+        fn definir_marcado(&mut self, _: NoId, _: bool) {}
+        fn indice_selecionado(&mut self, _: NoId) -> i32 { -1 }
+        fn definir_indice(&mut self, _: NoId, _: i32) {}
+        fn retangulo(&mut self, _: NoId) -> Option<(i32, i32, i32, i32)> { Some((1, 2, 3, 4)) }
+        fn estilo(&mut self, _: NoId) -> Option<alloc::rc::Rc<Estilo>> { None }
+        fn janela(&mut self) -> (i32, i32) { (800, 600) }
+        fn altura_documento(&mut self) -> i32 { 600 }
+        fn rolagem(&mut self) -> i32 { 0 }
+        fn rolar_para(&mut self, _: i32) {}
+        fn url(&mut self) -> String { String::from("http://exemplo.com/a/b?q=1#x") }
+        fn navegar(&mut self, _: &str, _: bool) {}
+        fn mudar_endereco(&mut self, _: &str, _: bool) {}
+        fn voltar(&mut self, _: i32) {}
+        fn focar(&mut self, _: Option<NoId>) {}
+        fn foco(&mut self) -> Option<NoId> { None }
+        fn acao_clique(&mut self, _: NoId) {}
+        fn enviar_formulario(&mut self, _: NoId) {}
+        fn limpar_formulario(&mut self, _: NoId) {}
+        fn pedir(&mut self, _: u32, _: &str, _: &str, _: &[(String, String)], _: Option<Vec<u8>>, _: bool) {}
+        fn cancelar_pedido(&mut self, _: u32) {}
+        fn pedir_imagem(&mut self, _: &str) {}
+        fn tamanho_imagem(&mut self, _: &str) -> Option<(i32, i32)> { None }
+        fn avisar(&mut self, _: &str) {}
+        fn console(&mut self, _: u8, t: &str) { self.log.push(t.into()); }
+        fn cookies(&mut self) -> String { String::new() }
+        fn definir_cookie(&mut self, _: &str) {}
+        fn ler_armazenamento(&mut self) -> String { String::new() }
+        fn gravar_armazenamento(&mut self, _: &str) {}
+        fn mudou_titulo(&mut self) {}
+    }
+    let mut f = F { d: Dom::de_html("<!doctype html><title>t</title><body><div id=a class='x y'><p>um</p><p>dois</p></div></body>"), e: EstadoCss::default(), log: Vec::new() };
+    let mut w = Web::novo(&mut f, sys::tempo_ms);
+    w.rodar_script(&mut f, ulib::dom::NADA, r#"
+        var a = document.getElementById('a'), r = [];
+        r.push(a.children.length, a.querySelectorAll('p').length, a.className, a.classList.contains('y'));
+        a.classList.add('z'); r.push(a.getAttribute('class'));
+        var n = document.createElement('span'); n.textContent = 'três'; a.appendChild(n); r.push(a.lastChild.tagName, a.textContent);
+        a.innerHTML = '<b id=c>x</b>'; r.push(document.querySelector('#a > b').id, a.innerHTML);
+        a.style.backgroundColor = 'red'; r.push(a.getAttribute('style'), a.style.backgroundColor);
+        a.dataset.fooBar = '1'; r.push(a.getAttribute('data-foo-bar'), a.dataset.fooBar);
+        var ev = []; a.addEventListener('click', e => { ev.push('a:' + e.eventPhase); });
+        document.addEventListener('click', e => { ev.push('doc'); e.preventDefault(); });
+        document.querySelector('#c').addEventListener('click', function (e) { ev.push(this.id); });
+        document.querySelector('#c').click(); r.push(ev.join());
+        r.push(location.pathname, location.search, new URL('../x?y=1', location.href).href, new URLSearchParams('a=1&b=2').get('b'));
+        r.push(document.title, typeof window.setTimeout, this === window);
+        globalThis.ordem = []; setTimeout(() => ordem.push('t'), 0); Promise.resolve().then(() => ordem.push('m')); ordem.push('s');
+        console.log(r.join('|'));
+    "#);
+    if w.erros() != 0 {
+        return Err(format!("erros de JS: {:?}", f.log));
+    }
+    let certo = "2|2|x y|true|x y z|SPAN|umdoistrês|c|<b id=\"c\">x</b>|background-color: red;|red|1|1|c,a:3,doc|/a/b|?q=1|http://exemplo.com/x?y=1|2|t|function|true";
+    if f.log.first().map(String::as_str) != Some(certo) {
+        return Err(format!("{:?}", f.log));
+    }
+    sys::dormir_ms(5).ok();
+    w.passo(&mut f);
+    w.rodar_script(&mut f, ulib::dom::NADA, "console.log(ordem.join())");
+    if f.log.get(1).map(String::as_str) != Some("s,m,t") {
+        return Err(format!("timers e microtarefas: {:?}", f.log));
+    }
+    // Os eventos chegam de fora (o que o navegador faz num clique).
+    w.rodar_script(&mut f, ulib::dom::NADA, "globalThis.c = 0; document.body.onclick = e => { c++; return false; };");
+    let body = f.d.body();
+    if w.disparar(&mut f, body, "click", true, true, &[("clientX", 7.0)]) {
+        return Err("`return false` não cancelou".into());
+    }
+    w.rodar_script(&mut f, ulib::dom::NADA, "console.log(c)");
+    if f.log.get(2).map(String::as_str) != Some("1") {
+        return Err(format!("onclick: {:?}", f.log));
     }
     Ok(())
 }
@@ -2325,7 +2552,7 @@ fn principal(args: &[&str]) -> i32 {
         print!("euid={} uid={}", sys::euid(), sys::uid());
         return 0;
     }
-    let testes: [(&str, fn() -> R); 70] = [
+    let testes: [(&str, fn() -> R); 73] = [
         ("fork, exit e wait", fork_exit_wait),
         ("pipe entre dois processos", pipe_entre_processos),
         ("heap do programa (4 MiB + 5000 Strings)", heap_grande),
@@ -2394,6 +2621,9 @@ fn principal(args: &[&str]) -> i32 {
         ("HTML tolerante (fechamentos implícitos, entidades) e URLs relativas", html_e_urls),
         ("formulários: codificação, POST e o GET depois do 303", formularios),
         ("CSS: seletores, especificidade, !important, var() e @media", css_cascata),
+        ("CSS: caixas, margens, flex, grid, float, posição e tabelas", css_diagramacao),
+        ("JavaScript: a linguagem, promessas, coletor de lixo", js_motor),
+        ("JavaScript: DOM, eventos, timers e URL", js_dom),
         ("criptografia: X25519, ChaCha20-Poly1305, AES-GCM e HKDF (vetores das RFCs)", criptografia),
         ("assinaturas: SHA-512/384, RSA (PKCS#1 e PSS), ECDSA P-256 e P-384", assinaturas),
     ];

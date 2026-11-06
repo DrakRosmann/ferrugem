@@ -170,20 +170,48 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
   claro/escuro, cor de destaque, brilho, luz noturna, segundos, cursor
   grande; tudo vale na hora, também para os programas abertos). Todos no
   menu Aplicativos.
-- **Navegador** (`navegador`): HTML, CSS, imagens PNG e JPEG, sem
-  JavaScript. Do CSS (`ulib::css`: seletores, especificidade,
-  `!important`, `@media`, `var()`), vale o que cabe numa diagramação de
-  cima para baixo: `display` (esconde os menus), cores e fundos, fontes,
-  alinhamento, margens e listas; colunas lado a lado ainda não. A diagramação tem quebra de
-  linha, títulos, listas aninhadas e numeradas, citações, `<pre>`,
-  tabelas simples, negrito, itálico (sintético), links (o visitado muda
-  de cor) e âncoras (`#id`). Formulários de verdade: campos de texto e
-  de senha, caixas de marcar, opções, listas, botões de enviar e de
-  limpar, por GET ou POST (a busca do DuckDuckGo funciona pela própria
-  página). O leitor de HTML é tolerante como os navegadores (`ulib::html`). Os downloads rodam num processo filho e a
-  janela continua respondendo. Também há **HTTPS** (o TLS 1.3, abaixo),
-  histórico, barra de endereço (palavras soltas viram uma busca no
-  DuckDuckGo), `<meta http-equiv="refresh">` e `file://`.
+- **Navegador** (`navegador`): HTML, CSS, JavaScript, imagens PNG e JPEG,
+  formulários (GET e POST), cookies, HTTPS (o TLS 1.3, abaixo), histórico,
+  barra de endereço (palavras soltas viram uma busca no DuckDuckGo) e
+  `file://`. Os downloads rodam em processos filhos e a janela continua
+  respondendo. Há uma demonstração em `file:///usr/share/exemplos/demo.html`,
+  e o console de uma página fica em `sobre:console`.
+  - **CSS** (`ulib::css`, `ulib::caixas`): a cascata completa (origem,
+    `!important`, especificidade), seletores (`+`, `~`, `:not()`, `:is()`,
+    `:has()`, `:nth-child()`, `:hover`, `:focus`, `::before`, `::after`),
+    `var()`, `calc()`, `@media`, `@import`, CSS aninhado. A diagramação: modelo
+    de caixas com margens que se juntam, linhas de texto, `float`, `position`
+    (`relative`, `absolute`, `fixed`), `flexbox`, `grid` (`fr`, `repeat`,
+    `minmax`, áreas), tabelas (`colspan`, `rowspan`, `border-collapse`),
+    `inline-block`, `z-index`, `overflow: hidden`, `opacity`, `transform`
+    (só deslocamento). O desenho: cores com transparência, bordas, cantos
+    redondos, sombras, gradientes lineares, imagens de fundo.
+  - **JavaScript** (`ulib::js`), escrito do zero: léxico, leitor, compilador
+    para bytecode e máquina virtual, com coletor de lixo (marcar e varrer).
+    Variáveis capturadas moram em "caixas"; as outras, na pilha. A linguagem
+    até o ES2022: classes (campos e membros privados), `async`/`await`,
+    geradores (também assíncronos), desestruturação, `?.`, `??`, templates,
+    `Proxy`, `Reflect`, `Symbol`, `Map`, `Set`, arrays tipados, `JSON`, `Date`
+    e expressões regulares próprias (retrocesso, com limite de passos). Fora
+    do navegador: `js arquivo.js`, ou `js` sozinho para um REPL.
+  - **A ponte com a página** (`ulib::web`, `web_prelude.js`): o DOM, eventos
+    (captura e borbulha), `setTimeout`, `requestAnimationFrame`, `fetch`,
+    `XMLHttpRequest`, `localStorage`, `URL`, `FormData`, `getComputedStyle`,
+    `history.pushState`. Um script não trava a janela para sempre: é cortado
+    depois de 8 s. Da segurança: política de mesma origem (com
+    `Access-Control-Allow-Origin`; os pedidos que exigiriam *preflight* nem
+    saem), cookies com `HttpOnly`, `Secure` e domínio conferidos, e uma página
+    da web não abre `file:` nem `sobre:`. O botão `JS` da barra desliga tudo.
+  - **Conferido com os de verdade** (`testes/banco/comparar.sh`, no Linux): a
+    saída de `testes/js/*.js` é igual à do node; a caixa de cada elemento de
+    `testes/css/*.html`, à do Chrome (com 1 pixel de folga), e as APIs do DOM
+    (`testes/js/dom.html`) também.
+  - **O que ainda não há:** módulos (`import`), `canvas`, SVG, WebP/GIF,
+    `@font-face`, transições e animações, iframes, rolagem dentro de
+    elementos (`overflow: auto` mostra tudo), `position: sticky` (fica no
+    fluxo), `MutationObserver` (existe, mas não avisa), comentários no DOM,
+    BigInt (vira número comum), `with`. Sites grandes com muito JavaScript
+    são lentos no QEMU (sem aceleração) e podem não desenhar como deveriam.
 - **TLS 1.3** (`ulib::tls`, o HTTPS), escrito do zero, com as peças em
   `ulib::cripto` (conferidas com os vetores das RFCs):
   - a troca de chaves X25519;
@@ -296,7 +324,9 @@ travar, Ctrl+Alt+Backspace derruba a interface gráfica.
 | `src/pci.rs`, `rtl8139.rs` | Barramento PCI e o driver da placa de rede |
 | `src/rede.rs`, `tcp.rs`, `inet.rs` | A pilha de rede: Ethernet/ARP/IP/ICMP/UDP, o TCP e os sockets `AF_INET` |
 | `usuario/src/rede.rs`, `http.rs` | DNS, conexões por nome, URLs e o cliente HTTP |
-| `usuario/src/html.rs`, `css.rs`, `bin/navegador.rs` | Os leitores de HTML e de CSS e o navegador (diagramação e desenho) |
+| `usuario/src/html.rs`, `dom.rs`, `css.rs`, `caixas.rs`, `bin/navegador.rs` | O HTML, o DOM, a cascata do CSS, a diagramação e o navegador |
+| `usuario/src/js/`, `web.rs`, `web_prelude.js` | O motor de JavaScript e a ponte dele com a página |
+| `testes/js`, `testes/css`, `testes/banco` | Páginas e scripts de teste, e a comparação com o node e o Chrome |
 | `usuario/src/jpeg.rs` | O decodificador de JPEG |
 | `usuario/src/tls.rs`, `cripto.rs` | TLS 1.3 e a criptografia (X25519, ChaCha20-Poly1305, AES-GCM, HKDF) |
 | `usuario/src/x509.rs`, `assinatura.rs`, `numero.rs`, `sha512.rs` | Certificados (DER, cadeias, nomes), RSA e ECDSA, números grandes |
@@ -374,8 +404,8 @@ de páginas. O `make run` usa 4 CPUs.
    threads do mesmo processo em paralelo, com *TLB shootdown*), boot UEFI.
 3. **Rede:** TLS 1.2 (muitos servidores ainda não falam o 1.3), revogação
    de certificados, DHCP (hoje o endereço é fixo), IPv6, outra placa
-   (virtio-net ou e1000). No navegador: colunas (flex, float, grid),
-   SVG e imagens WebP/GIF.
+   (virtio-net ou e1000). No navegador: SVG, `canvas`, imagens WebP/GIF,
+   módulos de JavaScript, animações de CSS e `@font-face`.
 4. **Interface gráfica:** ícones na área de trabalho, notificações,
    seleção de trechos nos campos de texto, mais programas.
 

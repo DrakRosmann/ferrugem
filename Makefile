@@ -71,7 +71,7 @@ FLAGS_KERNEL := -C relocation-model=static -C code-model=small
 FLAGS_USUARIO := -C linker=ld.lld -C relocation-model=static -C link-arg=-T$(CURDIR)/usuario/usuario.ld
 
 RUST_SRC    := $(wildcard src/*.rs) $(wildcard comum/*.rs) Cargo.toml
-USUARIO_SRC := $(wildcard usuario/src/*.rs usuario/src/bin/*.rs) $(wildcard comum/*.rs) \
+USUARIO_SRC := $(wildcard usuario/src/*.rs usuario/src/js/*.rs usuario/src/bin/*.rs) $(wildcard comum/*.rs) \
                usuario/Cargo.toml usuario/usuario.ld
 ARQUIVOS_RAIZ := $(shell find raiz -type f)
 

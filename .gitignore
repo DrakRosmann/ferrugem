@@ -7,3 +7,6 @@ Cargo.lock
 /ferramentas/fontes
 /ferramentas/lua
 /sistema.img
+testes/banco/target
+testes/banco/src/http.rs
+testes/banco/Cargo.lock

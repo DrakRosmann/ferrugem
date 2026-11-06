@@ -262,8 +262,24 @@ pub fn codificar_formulario(pares: &[(String, String)]) -> String {
 
 /// Como `obter`, mas com `envio` (um formulário já codificado) vira um POST.
 pub fn obter_com(url: &Url, abrir: Abrir<'_>, envio: Option<&[u8]>, progresso: &mut dyn FnMut(usize)) -> Result<Resposta, String> {
+    let tipo = [(String::from("Content-Type"), String::from("application/x-www-form-urlencoded"))];
+    let p = Pedido { metodo: if envio.is_some() { "POST" } else { "GET" }, cabecalhos: if envio.is_some() { &tipo } else { &[] }, corpo: envio };
+    obter_pedido(url, abrir, &p, progresso)
+}
+
+/// Um pedido HTTP qualquer (`fetch`, `XMLHttpRequest`, formulários).
+pub struct Pedido<'a> {
+    pub metodo: &'a str,
+    pub cabecalhos: &'a [(String, String)],
+    pub corpo: Option<&'a [u8]>,
+}
+
+/// Faz o pedido, seguindo até 8 redirecionamentos.
+pub fn obter_pedido(url: &Url, abrir: Abrir<'_>, pedido: &Pedido, progresso: &mut dyn FnMut(usize)) -> Result<Resposta, String> {
+    let host_original = url.host.clone();
     let mut url = url.clone();
-    let mut envio = envio;
+    let mut metodo = String::from(pedido.metodo);
+    let mut corpo_env = pedido.corpo;
     for _ in 0..8 {
         let mut c = abrir(&url)?;
         let host = if (url.esquema == "http" && url.porta == 80) || (url.esquema == "https" && url.porta == 443) {
@@ -271,22 +287,37 @@ pub fn obter_com(url: &Url, abrir: Abrir<'_>, envio: Option<&[u8]>, progresso: &
         } else {
             format!("{}:{}", url.host, url.porta)
         };
-        let corpo = match envio {
-            Some(e) => format!("Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n", e.len()),
-            None => String::new(),
-        };
-        let pedido = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Ferrugem/0.1 (FerrugemOS)\r\n\
-             Accept: text/html, text/plain, image/png, image/jpeg, */*;q=0.5\r\nAccept-Language: pt-BR, pt, en;q=0.5\r\n\
+        let mut extra = String::new();
+        let tem = |nome: &str| pedido.cabecalhos.iter().any(|(k, _)| k.eq_ignore_ascii_case(nome));
+        for (k, v) in pedido.cabecalhos {
+            // Um redirecionamento para outro site não leva as credenciais.
+            let sensivel = k.eq_ignore_ascii_case("cookie") || k.eq_ignore_ascii_case("authorization");
+            if sensivel && url.host != host_original {
+                continue;
+            }
+            // Quebras de linha num cabeçalho inventariam outro pedido.
+            if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+                continue;
+            }
+            extra.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        if let Some(e) = corpo_env {
+            extra.push_str(&format!("Content-Length: {}\r\n", e.len()));
+        }
+        let aceita = if tem("accept") { "" } else { "Accept: text/html, text/plain, image/png, image/jpeg, */*;q=0.5\r\n" };
+        let texto = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Ferrugem/0.2 (FerrugemOS)\r\n\
+             {}Accept-Language: pt-BR, pt, en;q=0.5\r\n\
              Accept-Encoding: identity\r\n{}Connection: close\r\n\r\n",
-            if envio.is_some() { "POST" } else { "GET" },
+            metodo,
             url.caminho,
             host,
-            corpo
+            aceita,
+            extra
         );
-        let mut pedido = pedido.into_bytes();
-        pedido.extend_from_slice(envio.unwrap_or(&[]));
-        c.escrever(&pedido)?;
+        let mut bytes = texto.into_bytes();
+        bytes.extend_from_slice(corpo_env.unwrap_or(&[]));
+        c.escrever(&bytes)?;
         let mut bruto = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -304,7 +335,8 @@ pub fn obter_com(url: &Url, abrir: Abrir<'_>, envio: Option<&[u8]>, progresso: &
             if let Some(destino) = r.cabecalho("location").and_then(|l| url.juntar(l)) {
                 url = destino;
                 if !matches!(status, 307 | 308) {
-                    envio = None; // depois de um POST, o destino é pedido com GET
+                    corpo_env = None; // depois de um POST, o destino é pedido com GET
+                    metodo = String::from("GET");
                 }
                 continue;
             }

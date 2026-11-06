@@ -17,6 +17,8 @@ pub struct Quadro<'a> {
     pub largura: i32,
     pub altura: i32,
     pub recorte: (i32, i32, i32, i32),
+    /// A opacidade de tudo o que passa por `misturar` (255 = normal).
+    pub opacidade: u8,
 }
 
 /// A fonte 8×16 que o kernel leu da VGA (`/dev/fonte`), no code page 437.
@@ -42,7 +44,7 @@ impl Fonte {
 
 impl<'a> Quadro<'a> {
     pub fn novo(pixels: &'a mut [u32], largura: i32, altura: i32) -> Quadro<'a> {
-        Quadro { pixels, largura, altura, recorte: (0, 0, largura, altura) }
+        Quadro { pixels, largura, altura, recorte: (0, 0, largura, altura), opacidade: 255 }
     }
 
     /// Daqui em diante, só desenha dentro deste retângulo (e dentro da imagem).
@@ -200,6 +202,208 @@ impl<'a> Quadro<'a> {
         }
     }
 
+    /// Um retângulo de cor 0xAARRGGBB (com transparência).
+    pub fn retangulo_alfa(&mut self, x: i32, y: i32, largura: i32, altura: i32, cor: u32) {
+        let (rx, ry, rl, ra) = self.recorte;
+        let (x0, y0) = (x.max(rx), y.max(ry));
+        let (x1, y1) = ((x + largura).min(rx + rl), (y + altura).min(ry + ra));
+        let a = (cor >> 24) * self.opacidade as u32 / 255;
+        if a == 0 || x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let rgb = cor & 0xFFFFFF;
+        for py in y0..y1 {
+            let i = (py * self.largura + x0) as usize;
+            let linha = &mut self.pixels[i..i + (x1 - x0) as usize];
+            if a == 255 {
+                linha.fill(rgb);
+            } else {
+                for p in linha.iter_mut() {
+                    let f = *p;
+                    let c = |d: u32| (((rgb >> d) & 0xFF) * a + ((f >> d) & 0xFF) * (255 - a)) / 255;
+                    *p = c(16) << 16 | c(8) << 8 | c(0);
+                }
+            }
+        }
+    }
+
+    /// Quantos pixels pular em cada lado da linha `dy` de um canto de raio `r`.
+    fn recuo_canto(r: i32, dy: i32) -> i32 {
+        // dy: a distância (em linhas) até a borda de cima do canto.
+        if r <= 0 || dy >= r {
+            return 0;
+        }
+        let d = r - dy;
+        let mut x = r;
+        while x > 0 && x * x + d * d > r * r {
+            x -= 1;
+        }
+        r - x
+    }
+
+    /// Retângulo de cantos redondos (cada canto com seu raio), com transparência.
+    pub fn redondo_alfa(&mut self, x: i32, y: i32, l: i32, a: i32, raios: [i32; 4], cor: u32) {
+        let [te, td, bd, be] = raios;
+        for dy in 0..a {
+            let (re, rd) = if dy < a / 2 {
+                (Self::recuo_canto(te, dy), Self::recuo_canto(td, dy))
+            } else {
+                (Self::recuo_canto(be, a - 1 - dy), Self::recuo_canto(bd, a - 1 - dy))
+            };
+            self.retangulo_alfa(x + re, y + dy, l - re - rd, 1, cor);
+        }
+    }
+
+    /// As bordas de uma caixa. `estilos`: 1 sólida, 2 tracejada, 3 pontilhada, 4 dupla.
+    #[allow(clippy::too_many_arguments)]
+    pub fn borda_caixa(&mut self, x: i32, y: i32, l: i32, a: i32, raios: [i32; 4], larguras: [i32; 4], cores: [u32; 4], estilos: [u8; 4]) {
+        let [c, d, b, e] = larguras;
+        if raios != [0; 4] {
+            // Linha a linha: o que está entre o contorno de fora e o de dentro.
+            let int = |r: i32, m: i32| (r - m).max(0);
+            let [te, td, bd, be] = raios;
+            let cor = cores[0];
+            for dy in 0..a {
+                let (re, rd) = if dy < a / 2 {
+                    (Self::recuo_canto(te, dy), Self::recuo_canto(td, dy))
+                } else {
+                    (Self::recuo_canto(be, a - 1 - dy), Self::recuo_canto(bd, a - 1 - dy))
+                };
+                let (ini, fim) = (x + re, x + l - rd);
+                if dy < c || dy >= a - b {
+                    self.retangulo_alfa(ini, y + dy, fim - ini, 1, cor);
+                    continue;
+                }
+                let idy = dy - c;
+                let ia = a - c - b;
+                let (ie, id) = if idy < ia / 2 {
+                    (Self::recuo_canto(int(te, e), idy), Self::recuo_canto(int(td, d), idy))
+                } else {
+                    (Self::recuo_canto(int(be, e), ia - 1 - idy), Self::recuo_canto(int(bd, d), ia - 1 - idy))
+                };
+                let (d0, d1) = (x + e + ie, x + l - d - id);
+                self.retangulo_alfa(ini, y + dy, d0 - ini, 1, cor);
+                self.retangulo_alfa(d1, y + dy, fim - d1, 1, cor);
+            }
+            return;
+        }
+        let tracos = |q: &mut Self, x: i32, y: i32, w: i32, h: i32, cor: u32, estilo: u8| {
+            let horizontal = w >= h;
+            let (passo, cheio) = match estilo {
+                2 => (h.min(w).max(1) * 5, h.min(w).max(1) * 3),
+                3 => (h.min(w).max(1) * 2, h.min(w).max(1)),
+                _ => (0, 0),
+            };
+            if passo == 0 {
+                return q.retangulo_alfa(x, y, w, h, cor);
+            }
+            let total = if horizontal { w } else { h };
+            let mut p = 0;
+            while p < total {
+                if horizontal {
+                    q.retangulo_alfa(x + p, y, cheio.min(total - p), h, cor);
+                } else {
+                    q.retangulo_alfa(x, y + p, w, cheio.min(total - p), cor);
+                }
+                p += passo;
+            }
+        };
+        if c > 0 {
+            tracos(self, x, y, l, c, cores[0], estilos[0]);
+        }
+        if b > 0 {
+            tracos(self, x, y + a - b, l, b, cores[2], estilos[2]);
+        }
+        if e > 0 {
+            tracos(self, x, y + c, e, a - c - b, cores[3], estilos[3]);
+        }
+        if d > 0 {
+            tracos(self, x + l - d, y + c, d, a - c - b, cores[1], estilos[1]);
+        }
+    }
+
+    /// Um gradiente linear (`angulo` em graus, como no CSS; paradas de 0 a 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gradiente(&mut self, x: i32, y: i32, l: i32, a: i32, angulo: f32, paradas: &[(f32, u32)]) {
+        if l <= 0 || a <= 0 || paradas.is_empty() {
+            return;
+        }
+        let cor_em = |t: f32| -> u32 {
+            let t = t.clamp(0.0, 1.0);
+            let mut ant = paradas[0];
+            if t <= ant.0 {
+                return ant.1;
+            }
+            for p in paradas {
+                if t <= p.0 {
+                    let k = if p.0 > ant.0 { (t - ant.0) / (p.0 - ant.0) } else { 1.0 };
+                    let m = |d: u32| {
+                        let (u, v) = (((ant.1 >> d) & 0xFF) as f32, ((p.1 >> d) & 0xFF) as f32);
+                        ((u + (v - u) * k) as u32) << d
+                    };
+                    return m(24) | m(16) | m(8) | m(0);
+                }
+                ant = *p;
+            }
+            ant.1
+        };
+        let graus = crate::mat::fmod(angulo as f64, 360.0);
+        let graus = if graus < 0.0 { graus + 360.0 } else { graus };
+        if graus == 180.0 || graus == 0.0 {
+            for dy in 0..a {
+                let t = (dy as f32 + 0.5) / a as f32;
+                let t = if graus == 0.0 { 1.0 - t } else { t };
+                self.retangulo_alfa(x, y + dy, l, 1, cor_em(t));
+            }
+            return;
+        }
+        if graus == 90.0 || graus == 270.0 {
+            for dx in 0..l {
+                let t = (dx as f32 + 0.5) / l as f32;
+                let t = if graus == 270.0 { 1.0 - t } else { t };
+                self.retangulo_alfa(x + dx, y, 1, a, cor_em(t));
+            }
+            return;
+        }
+        // Outros ângulos: uma tabela de 64 tons (pixel a pixel, em soft-float, é caro).
+        let rad = graus * crate::mat::PI / 180.0;
+        let (sn, cs) = (crate::mat::sin(rad) as f32, crate::mat::cos(rad) as f32);
+        let comp = (l as f32 * sn).abs() + (a as f32 * cs).abs();
+        let tons: alloc::vec::Vec<u32> = (0..64).map(|i| cor_em(i as f32 / 63.0)).collect();
+        // Fixo em 1/65536: t(dx, dy) = base + dx * px + dy * py.
+        let px = (sn / comp * 63.0 * 65536.0) as i32;
+        let py = (-cs / comp * 63.0 * 65536.0) as i32;
+        let centro = 31.5 * 65536.0;
+        let base = (centro - (l as f32 / 2.0) * (px as f32) - (a as f32 / 2.0) * (py as f32)) as i32;
+        let (rx, ry, rl, ra) = self.recorte;
+        for dy in (ry - y).max(0)..(ry + ra - y).min(a) {
+            for dx in (rx - x).max(0)..(rx + rl - x).min(l) {
+                let t = (base + dx * px + dy * py) >> 16;
+                let c = tons[t.clamp(0, 63) as usize];
+                self.misturar(x + dx, y + dy, c & 0xFFFFFF, (c >> 24) as u8);
+            }
+        }
+    }
+
+    /// Uma sombra: camadas cada vez maiores e mais transparentes.
+    pub fn sombra(&mut self, x: i32, y: i32, l: i32, a: i32, raios: [i32; 4], borrao: i32, cor: u32) {
+        let alfa = cor >> 24;
+        if alfa == 0 {
+            return;
+        }
+        let rgb = cor & 0xFFFFFF;
+        let passos = (borrao / 2).clamp(0, 8);
+        if passos == 0 {
+            return self.redondo_alfa(x, y, l, a, raios, cor);
+        }
+        let cada = (alfa / (passos as u32 + 1)).max(1);
+        for i in (0..=passos).rev() {
+            let e = i * borrao / (2 * passos) - borrao / 4;
+            let r = raios.map(|v| (v + e).max(0));
+            self.redondo_alfa(x - e, y - e, l + 2 * e, a + 2 * e, r, cada << 24 | rgb);
+        }
+    }
+
     /// Escurece a imagem inteira (o fundo atrás de uma caixa de diálogo).
     pub fn escurecer(&mut self, alfa: u8) {
         for y in 0..self.altura {
@@ -264,6 +468,7 @@ impl<'a> Quadro<'a> {
 
     /// Mistura `cor` no pixel com a opacidade `alfa` (0 = nada, 255 = cor inteira).
     pub fn misturar(&mut self, x: i32, y: i32, cor: u32, alfa: u8) {
+        let alfa = if self.opacidade == 255 { alfa } else { (alfa as u32 * self.opacidade as u32 / 255) as u8 };
         if !self.dentro(x, y) || alfa == 0 {
             return;
         }

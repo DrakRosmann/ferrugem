@@ -575,6 +575,15 @@ impl Ui {
         }
     }
 
+    /// (quanto sobe da linha de base, altura da linha) de uma fonte.
+    pub fn metricas_fonte(&mut self, tamanho: u16, mono: bool) -> (i32, i32) {
+        let f = if mono { self.mono.as_mut() } else { self.normal.as_mut() };
+        match f {
+            Some(f) => f.metricas(tamanho),
+            None => (ALTURA_LETRA * 3 / 4, ALTURA_LETRA),
+        }
+    }
+
     /// (largura de cada letra, altura da linha) da fonte monoespaçada.
     pub fn medidas_mono(&mut self, tamanho: u16) -> (i32, i32) {
         match self.mono.as_mut() {
@@ -801,6 +810,29 @@ impl Tela<'_> {
         } else {
             self.ui.largura_texto(texto, tamanho, negrito)
         }
+    }
+
+    /// (quanto sobe da linha de base, altura da linha) nesse tamanho.
+    pub fn metricas_texto(&mut self, tamanho: u16, mono: bool) -> (i32, i32) {
+        self.ui.metricas_fonte(tamanho, mono)
+    }
+
+    /// As teclas que nenhum componente pegou neste desenho (para os eventos
+    /// de teclado de uma página).
+    pub fn teclas_pendentes(&self) -> &[Tecla] {
+        &self.ui.teclas
+    }
+
+    /// Tira uma tecla pendente (a página pediu `preventDefault`).
+    pub fn consumir_tecla(&mut self, i: usize) {
+        if i < self.ui.teclas.len() {
+            self.ui.teclas.remove(i);
+        }
+    }
+
+    /// O botão do mouse está apertado?
+    pub fn apertou(&self) -> bool {
+        self.ui.apertado
     }
 
     /// A altura de uma linha de texto nesse tamanho.

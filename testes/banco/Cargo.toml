@@ -1,0 +1,10 @@
+[package]
+name = "banco"
+version = "0.1.0"
+edition = "2024"
+[[bin]]
+name = "js"
+path = "src/main.rs"
+[profile.release]
+opt-level = 3
+debug = 1

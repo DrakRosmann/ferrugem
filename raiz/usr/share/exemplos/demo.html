@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Demonstração: CSS e JavaScript</title>
+<style>
+:root { --destaque: #b7410e; --fundo: #fdf6ee; }
+* { box-sizing: border-box }
+body { margin: 0; font-family: sans-serif; color: #2a2a2a; background: var(--fundo); line-height: 1.4 }
+header { background: linear-gradient(90deg, #7a2b07, var(--destaque)); color: white; padding: 14px 20px; display: flex; justify-content: space-between; align-items: center }
+header h1 { margin: 0; font-size: 22px }
+nav a { color: #ffe9d6; margin-left: 14px; text-decoration: none }
+nav a:hover { text-decoration: underline; color: white }
+main { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; padding: 16px 20px; max-width: 960px; margin: 0 auto }
+.cartao { background: white; border: 1px solid #e6d8c8; border-radius: 10px; padding: 14px; box-shadow: 0 2px 6px rgba(0,0,0,.15) }
+.cartao h2 { margin: 0 0 8px; font-size: 16px; color: var(--destaque) }
+.linha { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+button { background: var(--destaque); color: white; border: 0; border-radius: 6px; padding: 6px 14px; cursor: pointer }
+button:hover { background: #8f3209 }
+ul.tarefas { list-style: none; padding: 0; margin: 8px 0 0 }
+ul.tarefas li { padding: 5px 8px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between }
+ul.tarefas li.feita span { text-decoration: line-through; color: #999 }
+.barra { height: 12px; background: #eee; border-radius: 6px; overflow: hidden; margin-top: 8px }
+.barra div { height: 100%; width: 0; background: var(--destaque) }
+table { border-collapse: collapse; width: 100%; font-size: 13px }
+th { background: #f3e7da; text-align: left } th, td { border: 1px solid #e0d0bf; padding: 4px 6px }
+tr:nth-child(even) td { background: #fbf6f0 }
+.flutua { float: right; width: 70px; height: 50px; margin: 0 0 6px 10px; background: #f3e7da; border-radius: 6px; text-align: center; line-height: 50px; font-size: 12px }
+.selo { position: absolute; top: -8px; right: -8px; background: #1a5fb4; color: white; font-size: 11px; padding: 2px 7px; border-radius: 9px }
+#relogio { font-family: monospace; font-size: 18px }
+</style></head><body>
+<header><h1>Ferrugem: CSS e JavaScript</h1><nav><a href="#contador">Contador</a><a href="#tarefas">Tarefas</a><a href="sobre:inicio">Início</a></nav></header>
+<main>
+<div>
+  <div class="cartao" id="contador" style="position:relative;margin-bottom:16px"><span class="selo">JS</span>
+    <h2>Contador</h2>
+    <div class="flutua">float</div>
+    <p>Eventos, DOM e estilo mudando na hora. Cliques: <b id="n">0</b></p>
+    <div class="linha"><button id="mais">Somar 1</button><button id="zerar">Zerar</button></div>
+    <div class="barra"><div id="progresso"></div></div>
+  </div>
+  <div class="cartao" id="tarefas">
+    <h2>Tarefas</h2>
+    <form id="nova" class="linha"><input id="txt" placeholder="Nova tarefa" size="24"><button>Acrescentar</button></form>
+    <ul class="tarefas" id="lista"></ul>
+  </div>
+</div>
+<aside>
+  <div class="cartao" style="margin-bottom:16px"><h2>Relógio</h2><div id="relogio">--:--:--</div><p style="font-size:12px;margin:6px 0 0">setInterval, Date e padStart.</p></div>
+  <div class="cartao"><h2>Motor</h2><table><tr><th>Teste</th><th>Valor</th></tr><tbody id="tab"></tbody></table></div>
+</aside>
+</main>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+let n = 0;
+const atualizar = () => { $("#n").textContent = n; $("#progresso").style.width = Math.min(n * 10, 100) + "%"; };
+$("#mais").addEventListener("click", () => { n++; atualizar(); });
+$("#zerar").onclick = () => { n = 0; atualizar(); };
+class Tarefas {
+  #itens = [];
+  add(t) { this.#itens.push({ t, feita: false }); this.desenhar(); }
+  desenhar() {
+    const l = $("#lista"); l.innerHTML = "";
+    this.#itens.forEach((it, i) => {
+      const li = document.createElement("li");
+      if (it.feita) li.classList.add("feita");
+      const s = document.createElement("span"); s.textContent = it.t;
+      const b = document.createElement("a"); b.href = "#"; b.textContent = it.feita ? "desfazer" : "feita";
+      b.onclick = e => { e.preventDefault(); it.feita = !it.feita; this.desenhar(); };
+      li.append(s, b); l.appendChild(li);
+    });
+  }
+}
+const tarefas = new Tarefas();
+["Escrever um kernel", "Escrever um navegador", "Escrever um motor de JS"].forEach(t => tarefas.add(t));
+$("#nova").addEventListener("submit", e => { e.preventDefault(); const c = $("#txt"); if (c.value.trim()) tarefas.add(c.value.trim()); c.value = ""; });
+const hora = () => { const d = new Date(); $("#relogio").textContent = [d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()].map(x => String(x).padStart(2, "0")).join(":"); };
+hora(); setInterval(hora, 1000);
+function* fib() { let [a, b] = [0, 1]; for (;;) { yield a; [a, b] = [b, a + b]; } }
+const pegar = (g, k) => { const r = []; for (const x of g) { if (r.length >= k) break; r.push(x); } return r; };
+const linhas = { "Fibonacci": pegar(fib(), 8).join(" "), "Regex": "2026-11-06".replace(/(\d+)-(\d+)-(\d+)/, "$3/$2/$1"), "JSON": JSON.stringify({ a: [1, 2] }), "Map": new Map([["x", 1]]).get("x"), "Math.sqrt(2)": Math.sqrt(2).toFixed(5) };
+for (const [k, v] of Object.entries(linhas)) { const tr = document.createElement("tr"); tr.innerHTML = `<td>${k}</td><td>${v}</td>`; $("#tab").appendChild(tr); }
+(async () => { const v = await new Promise(ok => setTimeout(() => ok("ok"), 50)); const tr = document.createElement("tr"); tr.innerHTML = `<td>async/await</td><td>${v}</td>`; $("#tab").appendChild(tr); })();
+</script>
+</body></html>
